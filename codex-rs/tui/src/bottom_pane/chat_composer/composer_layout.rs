@@ -41,6 +41,11 @@ impl ChatComposer {
         area: Rect,
         options: ComposerRenderOptions<'_>,
     ) -> ComposerLayout {
+        // Status and hint rows share the pet's vertical extent with the draft.
+        let area = Rect {
+            width: area.width.saturating_sub(options.textarea_right_reserve),
+            ..area
+        };
         let footer_hint_height = self.footer_hint_height(area.width, options);
         // Preserve input and hints before allocating the persistent status row.
         let status_height = self.status_surface_height(options).min(
@@ -108,7 +113,7 @@ impl ChatComposer {
             /*top*/ 1 + voice_rows,
             LIVE_PREFIX_COLS,
             /*bottom*/ 1,
-            /*right*/ 1u16.saturating_add(options.textarea_right_reserve),
+            /*right*/ 1,
         ));
         let remote_images_height = self
             .attachments
@@ -172,10 +177,10 @@ impl ChatComposer {
         width: u16,
         options: ComposerRenderOptions<'_>,
     ) -> u16 {
+        let width = width.saturating_sub(options.textarea_right_reserve);
         let footer_hint_height = self.footer_hint_height(width, options);
         const COLS_WITH_MARGIN: u16 = LIVE_PREFIX_COLS + 1;
-        let inner_width =
-            width.saturating_sub(COLS_WITH_MARGIN.saturating_add(options.textarea_right_reserve));
+        let inner_width = width.saturating_sub(COLS_WITH_MARGIN);
         let remote_images_height: u16 = self
             .attachments
             .remote_image_lines()
@@ -183,7 +188,8 @@ impl ChatComposer {
             .try_into()
             .unwrap_or(u16::MAX);
         let remote_images_separator = u16::from(remote_images_height > 0);
-        self.prompt_suggestion_lines(inner_width, options)
+        let height = self
+            .prompt_suggestion_lines(inner_width, options)
             .map_or_else(
                 || self.draft.textarea.desired_height(inner_width),
                 |lines| u16::try_from(lines.len()).unwrap_or(u16::MAX),
@@ -209,6 +215,7 @@ impl ChatComposer {
                 self.popups
                     .active
                     .required_height(width, footer_hint_height)
-            }
+            };
+        height.max(options.minimum_height)
     }
 }

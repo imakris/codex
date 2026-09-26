@@ -140,7 +140,6 @@ impl ChatWidget {
             );
         }
 
-        let active_cell_right_reserve = self.ambient_pet_wrap_reserved_cols();
         let active_cell_renderable = match &self.transcript.active_cell {
             Some(cell) => RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
                 child: cell.as_ref(),
@@ -150,7 +149,6 @@ impl ChatWidget {
                 } else {
                     1
                 },
-                right: active_cell_right_reserve,
                 // Externally backed transcript cells can also change viewport height without an
                 // active-cell revision. Spinner cells remain safe because their indicator width
                 // is stable and their display lines are still rebuilt on every frame.
@@ -179,7 +177,6 @@ impl ChatWidget {
                 RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
                     child: cell.as_ref(),
                     top: 1,
-                    right: active_cell_right_reserve,
                     persistent_layout: None,
                 })),
             );
@@ -191,7 +188,6 @@ impl ChatWidget {
                 RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
                     child: cell,
                     top: 1,
-                    right: active_cell_right_reserve,
                     persistent_layout: None,
                 })),
             );
@@ -250,6 +246,13 @@ impl ChatWidget {
                     working_tip,
                     warning_count: self.warning_display_state.count,
                     textarea_right_reserve: right_reserve,
+                    minimum_height: if right_reserve > 0 {
+                        self.ambient_pet
+                            .as_ref()
+                            .map_or(0, crate::pets::AmbientPet::required_height)
+                    } else {
+                        0
+                    },
                     separate_status_line: command_popup_placement
                         != crate::bottom_pane::CommandPopupPlacement::AboveComposer,
                     command_popup_placement,
@@ -310,7 +313,6 @@ impl ChatWidget {
 struct TranscriptAreaRenderable<'a> {
     child: &'a dyn HistoryCell,
     top: u16,
-    right: u16,
     persistent_layout: Option<PersistentActiveCellLayout<'a>>,
 }
 
@@ -349,7 +351,7 @@ impl Renderable for TranscriptAreaRenderable<'_> {
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        let child_width = width.saturating_sub(self.right).max(1);
+        let child_width = width.max(1);
         let desired_height = if let Some((cache, mut layout)) = self.layout(child_width) {
             if let Some(height) = layout.desired_height {
                 height
@@ -394,12 +396,7 @@ impl TranscriptAreaRenderable<'_> {
     fn child_area(&self, area: Rect) -> Rect {
         let y = area.y.saturating_add(self.top);
         let height = area.height.saturating_sub(self.top);
-        Rect::new(
-            area.x,
-            y,
-            area.width.saturating_sub(self.right).max(1),
-            height,
-        )
+        Rect::new(area.x, y, area.width.max(1), height)
     }
 }
 

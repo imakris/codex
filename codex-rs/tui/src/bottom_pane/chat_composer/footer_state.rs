@@ -68,6 +68,8 @@ pub(crate) struct ComposerRenderOptions<'a> {
     pub(crate) working_tip: Option<&'a crate::turn_tip::TurnTip>,
     pub(crate) warning_count: usize,
     pub(crate) textarea_right_reserve: u16,
+    /// Keep an adjacent image inside the composer allocation, including short drafts.
+    pub(crate) minimum_height: u16,
     /// Keep configured status below the composer while hints occupy the final row.
     pub(crate) separate_status_line: bool,
     pub(crate) command_popup_placement: CommandPopupPlacement,

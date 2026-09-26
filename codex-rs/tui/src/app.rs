@@ -1122,7 +1122,7 @@ impl App {
                     }
                     self.chat_widget.pre_draw_tick();
                     self.refresh_agents_overview_usage(app_server, tui.frame_requester());
-                    let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
+                    self.render_chat_widget_frame(tui, screen_size)?;
                     if tui.is_owned_screen()
                         && self.transcript_view.history
                             != crate::pager_overlay::TranscriptHistoryState::Failed
@@ -1135,20 +1135,6 @@ impl App {
                     {
                         tui.discard_pending_input_before_interactive_screen()?;
                         self.startup_pending_protected_request = false;
-                    }
-                    if self.chat_widget.ambient_pet_image_enabled() {
-                        let ambient_pet_area = Rect::new(
-                            /*x*/ 0,
-                            /*y*/ 0,
-                            screen_size.width,
-                            screen_size.height,
-                        );
-                        if let Err(err) = tui.draw_ambient_pet_image(
-                            self.chat_widget
-                                .ambient_pet_draw(ambient_pet_area, rendered_area.bottom()),
-                        ) {
-                            self.handle_ambient_pet_image_render_error(tui, err)?;
-                        }
                     }
                     if let Some(request) = self.chat_widget.pet_picker_preview_draw() {
                         if let Err(err) = tui.draw_pet_picker_preview_image(Some(request)) {
@@ -1182,7 +1168,35 @@ impl App {
         Ok(())
     }
 
+    /// Render a complete chat frame for both draw events and immediate event-handler paints.
     fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui, screen_size: Size) -> Result<Rect> {
+        tui.with_synchronized_update(screen_size, |tui| -> Result<Rect> {
+            let rendered_area = self.render_chat_widget_text_frame(tui, screen_size)?;
+            if self.chat_widget.ambient_pet_image_enabled() {
+                let ambient_pet_area = Rect::new(
+                    /*x*/ 0,
+                    rendered_area.y,
+                    screen_size.width,
+                    screen_size.height.saturating_sub(rendered_area.y),
+                );
+                if let Err(err) = tui.draw_ambient_pet_image(
+                    self.chat_widget
+                        .ambient_pet_draw(ambient_pet_area, rendered_area.bottom()),
+                ) {
+                    self.handle_ambient_pet_image_render_error(tui, err)?;
+                }
+            }
+            Ok(rendered_area)
+        })?
+    }
+
+    fn render_chat_widget_text_frame(
+        &mut self,
+        tui: &mut tui::Tui,
+        screen_size: Size,
+    ) -> Result<Rect> {
+        // Clear at the old coordinates before history/reflow can move transcript text there.
+        tui.clear_ambient_pet_before_frame(screen_size)?;
         self.sync_thread_title_progress();
         self.chat_widget
             .set_sparkle_terminal_focus(tui.is_terminal_focused());

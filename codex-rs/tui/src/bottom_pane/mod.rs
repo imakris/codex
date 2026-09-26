@@ -2318,6 +2318,7 @@ impl BottomPane {
             let composer: RenderableItem<'_> = if let Some(questions) = question_editor {
                 RenderableItem::Borrowed(questions.as_ref())
             } else if options.textarea_right_reserve == 0
+                && options.minimum_height == 0
                 && options.warning_count == 0
                 && options.footer.is_none()
                 && !options.separate_status_line
