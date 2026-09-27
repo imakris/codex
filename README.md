@@ -1,3 +1,65 @@
+# Codex CLI pet layout fork
+
+This is an unofficial fork of [OpenAI Codex CLI](https://github.com/openai/codex)
+that keeps transcript history and streaming responses at the full terminal width
+when a pet is enabled. The pet occupies space beside the typing area (composer)
+and its footer, instead of reserving columns alongside the entire conversation.
+SIXEL sprite cleanup, text drawing, and replacement sprite output share one
+synchronized update to avoid displaying a cleared sprite between frames.
+
+The layout changes adapt [makoto-soracom's work](https://github.com/makoto-soracom/codex/tree/makoto/pet-flicker-25004)
+to current upstream Codex. See [pet layout details and attribution](PET_LAYOUT.md).
+
+## Install or update this fork
+
+Install Node.js and npm, then run the command for your platform. These packages
+include prebuilt binaries: no compiler, local build, or npm account is needed.
+
+**Windows x64:**
+
+```powershell
+npm install -g https://github.com/imakris/codex/releases/latest/download/codex-pet-win32-x64.tgz
+```
+
+**Linux x64:**
+
+```sh
+npm install -g https://github.com/imakris/codex/releases/latest/download/codex-pet-linux-x64.tgz
+```
+
+Start the fork with:
+
+```sh
+codex-pet
+```
+
+Repeat the same installation command to update to the latest published release.
+The separate `codex-pet` command can coexist with official `codex`; both use
+normal Codex configuration and authentication. Packages are hosted on
+[GitHub Releases](https://github.com/imakris/codex/releases/latest), using adapted
+upstream npm packaging infrastructure. They are not published to npmjs.com.
+
+## Automatic synchronization and releases
+
+The [GitHub Actions workflow](https://github.com/imakris/codex/actions/workflows/pet-release.yml)
+runs daily at **07:17 UTC**, on branch pushes, and on manual dispatch. It merges
+upstream changes, builds Windows x64 and Linux x64 packages, runs twelve selected
+pet regression tests on each platform, and checks a fresh npm installation before
+publishing a release. Conflicts or failed checks leave the previous release
+available. Unchanged source with a matching release skips builds.
+
+This happens on GitHub without your computer running. Installed copies do not
+update themselves; rerun the installation command to update. See
+[installation and maintenance details](PET_MAINTENANCE.md) for the download-only
+Python installer, release checks, and troubleshooting.
+
+---
+
+## Original upstream README
+
+The original README follows in full. Its installation commands install official
+OpenAI Codex; use the commands above to install this fork.
+
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
