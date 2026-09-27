@@ -86,3 +86,12 @@ Offline promotion/rollback fixtures can be run with:
 `python -m unittest discover -s scripts -p pet_maintenance_tests.py -v`.
 They use real local Git repositories and synthetic executables; installation
 must also complete a real native build/test/publication run before scheduling.
+
+## Upstream test compatibility
+
+Upstream commit `8f195c93d7` introduced a blank-session regression test calling
+`start_fresh_session_with_summary_hint`, after upstream `449d42ced9` had renamed
+that method to `start_fresh_session`. The first real maintenance trial rejected
+the candidate at test compilation and preserved the previous publication.
+This fork updates that single test call to the renamed method with identical
+arguments and assertions; it does not skip the test or restore the removed API.
