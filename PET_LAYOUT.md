@@ -35,6 +35,11 @@ end that outer update early. Cursor-position queries remain outside the update,
 and failed draws still release it. This avoids showing an erased sprite between
 frames while preserving full-width text.
 
+## Installation
+
+Prebuilt Windows x64 and Linux x64 packages are available through GitHub
+Releases. See [installation and automatic maintenance](PET_MAINTENANCE.md).
+
 ## Verification
 
 The changed TUI tests cover history/stream widths, composer-only reservation,

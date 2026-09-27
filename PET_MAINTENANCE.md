@@ -1,97 +1,91 @@
-# Daily Windows maintenance for the pet fork
+# Install and update the pet fork
 
-`scripts/pet_maintenance.py` follows upstream `main` while preserving the
-`pet-composer-layout` patch. It uses the existing Git, Python 3.11+, Rust,
-`just`, `cargo-nextest`, Visual Studio 2026/MSVC v145 and `queued-build` tools.
-No GitHub Actions workflow, model calls, or outbound issue/comment messages
-are involved.
+The [Pet fork sync and release workflow](https://github.com/imakris/codex/actions/workflows/pet-release.yml)
+merges upstream `openai/codex:main`, builds Windows x64 and Linux x64 packages,
+and publishes verified builds to [GitHub Releases](https://github.com/imakris/codex/releases).
+It runs daily at 07:17 UTC, after pushes to `pet-composer-layout`, and on manual
+dispatch. It does not require this computer to be switched on.
 
-## Run and launch
+## Install without compiling
 
-Install a reviewed copy of the runner outside the checkout, alongside a local
-JSON configuration. The installed runner does not replace itself with fetched
-code. One dedicated checkout and Cargo target directory retain their paths
-across attempts; do not share that target with other checkouts.
+With Node.js/npm installed, run the command for your platform. Run the same
+command again to update to the latest successfully published release.
 
-Example configuration (adjust the username and tool locations):
+Windows x64:
 
-```json
-{
-  "checkout": "C:/Users/imak/.local/share/codex-pet-maintenance/checkout",
-  "state_dir": "C:/Users/imak/.local/state/codex-pet-maintenance",
-  "target_dir": "C:/Users/imak/.local/share/codex-pet-maintenance/target",
-  "artifacts_dir": "C:/Users/imak/.local/share/codex-pet-maintenance/releases",
-  "fork_url": "https://github.com/imakris/codex.git",
-  "upstream_url": "https://github.com/openai/codex.git",
-  "branch": "pet-composer-layout",
-  "queued_build": "C:/Users/imak/.local/bin/queued-build.cmd",
-  "vcvars": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Auxiliary/Build/vcvarsall.bat",
-  "path_prefix": [
-    "C:/Users/imak/.cargo/bin",
-    "C:/Users/imak/.local/share/codex-pet-maintenance/tools",
-    "C:/Users/imak/AppData/Local/Programs/cmake-4.4.2-windows-x86_64/bin"
-  ],
-  "slots": 4
-}
+```powershell
+npm install -g https://github.com/imakris/codex/releases/latest/download/codex-pet-win32-x64.tgz
+codex-pet
 ```
 
-Run `python pet_maintenance.py --config config.json run` for an immediate
-attempt, `status` for its result/report directory, or `launch -- <arguments>`
-to start the last successfully published executable. The normal user wrapper
-should invoke this `launch` action, which reads the atomic `current.json`
-pointer. Existing running processes keep their immutable executable.
+Linux x64:
 
-Register the installed runner with Windows Task Scheduler using `pythonw.exe`,
-the `run` action, and an absolute config path: daily at **09:00 local time**,
-current user, interactive logon, limited privileges, StartWhenAvailable,
-IgnoreNew, no idle condition and no execution timeout. The user must be logged
-in; a missed run starts when Windows can run it. The file lock also prevents
-scheduled and manual runs from overlapping. Scheduler registration is a local
-installation operation, not performed by the runner.
+```sh
+npm install -g https://github.com/imakris/codex/releases/latest/download/codex-pet-linux-x64.tgz
+codex-pet
+```
 
-## Verification and publication
+These are self-contained `@imakris/codex-pet` npm tarballs hosted on GitHub;
+there is no npm registry publication or npm account requirement. They install
+the `codex-pet` command alongside an existing official `codex` installation.
+Both use normal Codex configuration and authentication. The original npm
+launcher and packaging helpers are reused, with a bundled-only native payload
+and fork package identity. The fork launcher does not advertise the official
+npm updater. Windows binaries are not signed by OpenAI.
 
-Each attempt fetches exact fork/upstream commits, merges into the dedicated
-checkout detached from any user branch, and records those revisions. A conflict
-stops before compilation. All build/test compilation uses `queued-build`
-with the same CPU width as Cargo. Pending reboot indicators are recorded and
-are informational; an incomplete/unlaunchable VS 2026 installation fails the gate.
+Alternatively, download `pet_install.py` from the release and use Python 3.11+:
 
-The job builds the native CLI, verifies that every name in `REQUIRED_TESTS`
-exists and is selected/nonignored, runs that explicit set through `just test`
-with `--no-tests=fail`, and checks the resulting executable's `--version`.
-These gates cover full transcript width, streaming and history reflow,
-composer height, notification visibility, sprite cleanup, resizing, and
-synchronized frame ordering/error release. This is a focused regression gate,
-not a claim that the entire upstream test suite passes: the initial Windows
-validation reproduced fourteen unrelated failures on untouched upstream.
-A renamed or removed required test blocks the update until reviewed.
+```sh
+python pet_install.py install
+python pet_install.py launch
+python pet_install.py update
+python pet_install.py status
+```
 
-Only a clean, unchanged candidate can publish. The executable is copied into
-an immutable commit/attempt directory with its SHA256 and source manifest.
-The remote fork tip must still match the one fetched before verification; the
-push is normal, never forced. Only after that push succeeds does an atomic
-manifest replacement select the new executable. If that final local write
-fails, the remote has a tested commit and the previous executable remains
-selected; the next run can retry. Matching source commits and a verified
-published executable make subsequent runs a no-op.
+The Python installer selects the platform, downloads assets from an immutable
+release tag, verifies SHA256 checksums, checks package resources and runs a
+version/help smoke check. It installs into immutable directories and atomically
+selects the verified executable. Failed downloads or checks preserve the
+previous executable. `--install-dir` and `--state-dir` can integrate an existing
+launcher reading `current.json`. Installed applications do not update by
+themselves; rerun an update command or schedule the download-only updater.
 
-Logs, selected test names, source SHAs, status and failure diffs/files live in
-`state_dir/runs/<attempt>`. A failed candidate is archived before the next run
-resets the automation-owned checkout. The job refuses to reset a checkout
-without its matching ownership marker. Previous releases/reports are retained;
-manage their disk usage after reviewing which versions you still need.
+## Synchronization and publication
 
-Offline promotion/rollback fixtures can be run with:
-`python -m unittest discover -s scripts -p pet_maintenance_tests.py -v`.
-They use real local Git repositories and synthetic executables; installation
-must also complete a real native build/test/publication run before scheduling.
+One workflow run captures the fork and upstream commits and prepares an
+unpublished merge candidate. A conflict stops before builds. The exact candidate
+is transferred to both builders using a Git bundle. Each builder checks the
+required pet regression test inventory, runs all twelve tests through `just test`,
+builds the canonical native package, and smoke-tests a fresh npm installation.
 
-## Upstream test compatibility
+The payload includes the code-mode host, ripgrep, Windows sandbox helpers, or
+the Linux bubblewrap and patched zsh resources. Linux bubblewrap is finalized
+and hashed before the CLI build, following upstream's package integrity contract.
+Build dependencies and checksum-verified V8 artifacts reuse upstream tooling.
 
-Upstream commit `8f195c93d7` introduced a blank-session regression test calling
-`start_fresh_session_with_summary_hint`, after upstream `449d42ced9` had renamed
-that method to `start_fresh_session`. The first real maintenance trial rejected
-the candidate at test compilation and preserved the previous publication.
-This fork updates that single test call to the renamed method with identical
-arguments and assertions; it does not skip the test or restore the removed API.
+Only after both platforms pass does the final job check that the fork has not
+changed, push normally without forcing, upload the complete assets to a draft,
+and publish it as the latest release. A build failure leaves the branch and
+previous release intact. A publication failure can leave a verified branch
+advance or draft; it does not replace the latest successful release. A later
+run retries. Unchanged source with a matching published release skips builds.
+Release metadata records the source and upstream commits; checksums cover the
+packages, metadata and downloadable installer.
+
+GitHub's hosted job queue and workflow concurrency serialize release attempts;
+each isolated build declares four Cargo/CMake/native jobs. Local compilation
+still uses the machine's real `queued-build` command. The hosted Windows job
+uses the Visual Studio 2026 image and checks MSVC 14.51. Original OpenAI release
+workflows depend on private runner groups, signing services and registry trust;
+the fork's small workflow uses standard hosted runners and its repository token.
+All synchronization/build/publication happens in one workflow, so it does not
+depend on token-generated pushes triggering another workflow.
+
+The gate covers the pet changes and package delivery, not the entire upstream
+test suite. Required test renames/removals need review. Logs and failed steps
+are visible in GitHub Actions. A scheduled time is not a guaranteed delivery
+time. Check Actions if automatic releases stop.
+
+Tooling checks: `python -m unittest discover -s scripts -p 'test_pet_*.py'`.
+The previous local merge/build runner has been replaced by this workflow and
+download-only installation; any retained installed copy is for rollback.
