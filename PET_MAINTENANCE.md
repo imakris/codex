@@ -77,9 +77,45 @@ each isolated build declares four Cargo/CMake/native jobs. Local compilation
 still uses the machine's real `queued-build` command. The hosted Windows job
 uses the Visual Studio 2026 image and checks MSVC 14.51. Original OpenAI release
 workflows depend on private runner groups, signing services and registry trust;
-the fork's small workflow uses standard hosted runners and its repository token.
+the fork's small workflow uses standard hosted runners. Source promotion uses
+the dedicated `PET_SYNC_TOKEN`; release API requests use `GITHUB_TOKEN`.
 All synchronization/build/publication happens in one workflow, so it does not
 depend on token-generated pushes triggering another workflow.
+
+## Synchronization credentials
+
+Upstream merges can change files in `.github/workflows`. GitHub's built-in
+`GITHUB_TOKEN` cannot push those changes even with `contents: write`. The publish
+job's checkout uses a dedicated fine-grained personal access token stored in the
+repository Actions secret `PET_SYNC_TOKEN`:
+
+1. In [GitHub's fine-grained token settings](https://github.com/settings/personal-access-tokens),
+   create a token with resource owner **imakris** and select only **imakris/codex**.
+2. Grant repository permissions **Contents: Read and write** and
+   **Workflows: Read and write**. Choose an expiration date and plan to rotate the
+   token before it expires.
+3. Save the token as **PET_SYNC_TOKEN** under
+   [repository Settings > Secrets and variables > Actions](https://github.com/imakris/codex/settings/secrets/actions).
+   Keep the token value out of source files, logs, and chat.
+
+Only the publish checkout receives this token for the source push. Preparation,
+builders, and release API requests retain the built-in repository token.
+GitHub documents the [workflow-file permission requirement](https://docs.github.com/en/rest/repos/contents#create-or-update-file-contents)
+and [additional credential options](https://docs.github.com/en/actions/tutorials/authenticate-with-github_token#granting-additional-permissions).
+
+Unlike `GITHUB_TOKEN`, a personal access token's pushes trigger matching push
+workflows. Advancing the branch therefore queues another pet release run.
+Workflow concurrency starts it after the active release attempt finishes; if
+the source still matches the published release, it skips builds. New upstream
+commits can make that follow-up run prepare and verify another candidate.
+
+To rotate credentials, create a replacement token with the same repository
+selection and permissions, update `PET_SYNC_TOKEN`, and revoke the superseded
+token once any publishing job using it has finished. After setup, rotation, or
+a permissions failure, start a fresh manual run from `pet-composer-layout`.
+A run that reaches source promotion checks the credential; an unchanged-source
+run that skips builds does not. Missing, expired, or revoked credentials stop
+source promotion and leave the latest successful release available.
 
 The gate covers the pet changes and package delivery, not the entire upstream
 test suite. Required test renames/removals need review. Logs and failed steps

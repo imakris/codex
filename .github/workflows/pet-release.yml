@@ -178,6 +178,8 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.base }}
           fetch-depth: 0
+          # Upstream workflow changes require Workflows write, unavailable to github.token.
+          token: ${{ secrets.PET_SYNC_TOKEN }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: pet-candidate
