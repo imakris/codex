@@ -1,6 +1,7 @@
 """Failure and source identity checks for hosted pet releases."""
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -18,6 +19,45 @@ class ReleaseTests(unittest.TestCase):
                          "version": "0.0.0-pet.1.1", "repository": "imakris/codex",
                          "tag": "pet-v0.0.0-pet.1.1-" + "b" * 40, "assets": pet_release.ASSETS}
         (self.directory / "candidate.json").write_text(json.dumps(self.metadata))
+
+    def test_prepare_build_decision_for_release_cadence(self):
+        candidate = self.metadata["base"]
+        matching = {"tag_name": "pet-v0.0.0-pet.1.1-" + candidate}
+        different = {"tag_name": self.metadata["tag"]}
+        cases = [
+            ("schedule", matching, "true"),
+            ("push", matching, "false"),
+            ("workflow_dispatch", matching, "false"),
+            ("schedule", different, "true"),
+            ("push", different, "true"),
+            ("workflow_dispatch", different, "true"),
+            ("schedule", None, "true"),
+            ("push", None, "true"),
+            ("workflow_dispatch", None, "true"),
+        ]
+        for index, (event, latest, expected_build) in enumerate(cases):
+            with self.subTest(event=event, latest=latest):
+                output = self.directory / f"output-{index}.txt"
+                environment = {
+                    "GITHUB_EVENT_NAME": event,
+                    "GITHUB_OUTPUT": str(output),
+                    "GITHUB_RUN_NUMBER": "5",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_REPOSITORY": "imakris/codex",
+                }
+                commands = [None, candidate, None, None, self.metadata["upstream"],
+                            None, None, None, candidate]
+                with patch.dict(os.environ, environment), \
+                        patch.object(pet_release, "run", side_effect=commands), \
+                        patch.object(pet_release, "api", return_value=latest):
+                    pet_release.prepare(self.directory / f"candidate-{index}")
+                actual = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                self.assertEqual(actual, {
+                    "base": candidate,
+                    "commit": candidate,
+                    "version": "0.0.0-pet.5.1",
+                    "build": expected_build,
+                })
 
     def test_missing_platform_prevents_any_publication(self):
         with patch.object(pet_release, "run") as run:

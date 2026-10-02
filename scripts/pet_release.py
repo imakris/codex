@@ -78,8 +78,9 @@ def prepare(directory):
     run("git", "merge", "--no-edit", upstream)
     candidate = run("git", "rev-parse", "HEAD", capture=True)
     latest = api("releases/latest")
-    # Our tags bind the full source commit. Unchanged daily runs do no compilation.
+    # The commit-bound tag lets push/manual runs avoid publishing the same source twice.
     unchanged = latest is not None and latest["tag_name"].endswith("-" + candidate)
+    skip_build = unchanged and os.environ.get("GITHUB_EVENT_NAME") != "schedule"
     version = f"0.0.0-pet.{os.environ['GITHUB_RUN_NUMBER']}.{os.environ['GITHUB_RUN_ATTEMPT']}"
     metadata = {"base": base, "commit": candidate, "upstream": upstream,
                 "version": version, "repository": os.environ["GITHUB_REPOSITORY"],
@@ -91,7 +92,7 @@ def prepare(directory):
             "refs/heads/pet-candidate", "^" + base)
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write(f"base={base}\ncommit={candidate}\nversion={version}\n")
-        output.write(f"build={'false' if unchanged else 'true'}\n")
+        output.write(f"build={'false' if skip_build else 'true'}\n")
 
 
 def restore(directory):
