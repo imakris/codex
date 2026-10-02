@@ -140,6 +140,47 @@ mod tests {
     use ratatui::text::Line;
 
     #[test]
+    fn synchronized_frame_keeps_clear_text_and_sprite_in_one_update() {
+        let mut output = Vec::new();
+        super::synchronized_output(&mut output, /*already_synchronized*/ false, |writer| {
+            writer.write_all(b"clear")?;
+            super::synchronized_output(
+                writer,
+                /*already_synchronized*/ true,
+                |writer| writer.write_all(b"text"),
+            )??;
+            super::synchronized_output(
+                writer,
+                /*already_synchronized*/ true,
+                |writer| writer.write_all(b"sprite"),
+            )?
+        })
+        .unwrap()
+        .unwrap();
+
+        pretty_assertions::assert_eq!(output, b"\x1b[?2026hcleartextsprite\x1b[?2026l");
+    }
+
+    #[test]
+    fn synchronized_frame_finishes_after_draw_error() {
+        let mut output = Vec::new();
+        let result = super::synchronized_output(
+            &mut output,
+            /*already_synchronized*/ false,
+            |writer| {
+                writer.write_all(b"clear")?;
+                super::synchronized_output(writer, /*already_synchronized*/ true, |_writer| {
+                    Err::<(), _>(std::io::Error::other("image write failed"))
+                })?
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.unwrap_err().to_string(), "image write failed");
+        pretty_assertions::assert_eq!(output, b"\x1b[?2026hclear\x1b[?2026l");
+    }
+
+    #[test]
     fn unfocused_notification_condition_is_suppressed_when_focused() {
         assert!(!should_emit_notification(
             NotificationCondition::Unfocused,
@@ -659,6 +700,9 @@ pub struct Tui {
     pub(crate) terminal: Terminal,
     pending_history_lines: Vec<PendingHistoryLines>,
     clear_thread_switch_on_draw: bool,
+    synchronized_update_active: bool,
+    // Some(None) records a completed cursor preflight that needs no viewport adjustment.
+    prepared_viewport_area: Option<Option<Rect>>,
     screen_size: ScreenSizePolicy,
     ambient_pet_image_state: crate::pets::PetImageRenderState,
     pet_picker_preview_image_state: crate::pets::PetImageRenderState,
@@ -689,6 +733,18 @@ pub struct Tui {
 struct PendingHistoryLines {
     lines: Vec<HyperlinkLine>,
     wrap_policy: HistoryLineWrapPolicy,
+}
+
+fn synchronized_output<W: Write, T>(
+    writer: &mut W,
+    already_synchronized: bool,
+    operation: impl FnOnce(&mut W) -> T,
+) -> Result<T> {
+    if already_synchronized {
+        Ok(operation(writer))
+    } else {
+        writer.sync_update(operation)
+    }
 }
 
 fn clear_for_viewport_change<B>(terminal: &mut CustomTerminal<B>, new_area: Rect) -> Result<()>
@@ -736,6 +792,8 @@ impl Tui {
             terminal,
             pending_history_lines: vec![],
             clear_thread_switch_on_draw: false,
+            synchronized_update_active: false,
+            prepared_viewport_area: None,
             screen_size: ScreenSizePolicy::default(),
             ambient_pet_image_state: crate::pets::PetImageRenderState::default(),
             pet_picker_preview_image_state: crate::pets::PetImageRenderState::default(),
@@ -1262,6 +1320,28 @@ impl Tui {
         Ok(())
     }
 
+    /// Commit text and ambient image updates together without nested end markers.
+    pub(crate) fn with_synchronized_update<T>(
+        &mut self,
+        screen_size: Size,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> Result<T> {
+        ensure_virtual_terminal_processing()?;
+        let already_synchronized = self.synchronized_update_active;
+        if !already_synchronized && self.owned_screen {
+            // `draw` needs a cursor query on resize. Keep that query before Begin,
+            // just as the standalone draw path does.
+            self.prepared_viewport_area = Some(self.pending_viewport_area(screen_size)?);
+        }
+        self.synchronized_update_active = true;
+        let result = synchronized_output(&mut stdout(), already_synchronized, |_| operation(self));
+        self.synchronized_update_active = already_synchronized;
+        if !already_synchronized {
+            self.prepared_viewport_area = None;
+        }
+        result
+    }
+
     pub fn draw(
         &mut self,
         height: u16,
@@ -1277,11 +1357,14 @@ impl Tui {
 
         // Precompute any viewport updates that need a cursor-position query before entering
         // the synchronized update, to avoid racing with the event reader.
-        let mut pending_viewport_area = self.pending_viewport_area(screen_size)?;
+        let mut pending_viewport_area = match self.prepared_viewport_area.take() {
+            Some(area) => area,
+            None => self.pending_viewport_area(screen_size)?,
+        };
 
         ensure_virtual_terminal_processing()?;
 
-        stdout().sync_update(|_| {
+        synchronized_output(&mut stdout(), self.synchronized_update_active, |_| {
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
                 self.terminal.invalidate_cursor_state();
@@ -1356,6 +1439,25 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn clear_ambient_pet_before_frame(
+        &mut self,
+        screen_size: Size,
+    ) -> std::result::Result<(), crate::pets::PetImageRenderError> {
+        if let Some(area) = crate::pets::clear_ambient_pet_before_frame(
+            self.terminal.backend_mut(),
+            &mut self.ambient_pet_image_state,
+            Rect::new(
+                /*x*/ 0,
+                /*y*/ 0,
+                screen_size.width,
+                screen_size.height,
+            ),
+        )? {
+            self.terminal.invalidate_area(area);
+        }
+        Ok(())
+    }
+
     pub fn draw_ambient_pet_image(
         &mut self,
         request: Option<crate::pets::AmbientPetDraw>,
@@ -1366,7 +1468,7 @@ impl Tui {
 
         let terminal = &mut self.terminal;
         let state = &mut self.ambient_pet_image_state;
-        stdout().sync_update(|_| {
+        synchronized_output(&mut stdout(), self.synchronized_update_active, |_| {
             match crate::pets::render_ambient_pet_image(terminal.backend_mut(), state, request) {
                 Ok(()) => Ok(Ok(())),
                 Err(crate::pets::PetImageRenderError::Terminal(err)) => Err(err),
@@ -1385,7 +1487,7 @@ impl Tui {
 
         let terminal = &mut self.terminal;
         let state = &mut self.pet_picker_preview_image_state;
-        stdout().sync_update(|_| {
+        synchronized_output(&mut stdout(), self.synchronized_update_active, |_| {
             match crate::pets::render_pet_picker_preview_image(
                 terminal.backend_mut(),
                 state,
@@ -1432,7 +1534,7 @@ impl Tui {
 
         ensure_virtual_terminal_processing()?;
 
-        stdout().sync_update(|_| {
+        synchronized_output(&mut stdout(), self.synchronized_update_active, |_| {
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
                 self.terminal.invalidate_cursor_state();

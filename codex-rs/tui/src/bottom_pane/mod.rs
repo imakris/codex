@@ -2302,6 +2302,7 @@ impl BottomPane {
                 RenderableItem::Borrowed(questions.as_ref())
             } else if options.max_height.is_none()
                 && options.textarea_right_reserve == 0
+                && options.minimum_height == 0
                 && options.warning_count == 0
                 && options.footer.is_none()
                 && !options.separate_status_line
