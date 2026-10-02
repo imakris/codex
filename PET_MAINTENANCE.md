@@ -58,8 +58,10 @@ themselves; rerun an update command or schedule the download-only updater.
 
 ## Synchronization and publication
 
-One workflow run captures the fork and upstream commits and prepares an
-unpublished merge candidate. A conflict stops before builds. The exact candidate
+A push run first checks the current fork tip against the latest published
+release and skips before fetching upstream when that tip is already released.
+Other runs capture the fork and upstream commits and prepare an unpublished
+merge candidate. A conflict stops before builds. The exact candidate
 is transferred to both builders using a Git bundle. Each builder checks the
 required pet regression test inventory, runs all twelve tests through `just test`,
 builds the canonical native package, and smoke-tests a fresh npm installation.
@@ -75,13 +77,15 @@ and publish it as the latest release. A build failure leaves the branch and
 previous release intact. A publication failure can leave a verified branch
 advance or draft; it does not replace the latest successful release. A later
 run retries. Scheduled runs build and verify a new release even when source is
-unchanged. Push and manual runs skip builds when a matching published release
-exists.
+unchanged. Manual runs refresh upstream and skip builds when the prepared
+candidate already has a matching published release.
 Release metadata records the source and upstream commits; checksums cover the
 packages, metadata and downloadable installer.
 
-GitHub's hosted job queue and workflow concurrency serialize release attempts;
-each isolated build declares four Cargo/CMake/native jobs. Local compilation
+GitHub's hosted job queue and workflow concurrency serialize release attempts.
+The concurrency group retains up to 100 pending requests, so a promotion push
+does not replace an already pending scheduled or manual run. Each isolated
+build declares four Cargo/CMake/native jobs. Local compilation
 still uses the machine's real `queued-build` command. The hosted Windows job
 uses the Visual Studio 2026 image and checks MSVC 14.51. Original OpenAI release
 workflows depend on private runner groups, signing services and registry trust;
@@ -113,9 +117,11 @@ and [additional credential options](https://docs.github.com/en/actions/tutorials
 
 Unlike `GITHUB_TOKEN`, a personal access token's pushes trigger matching push
 workflows. Advancing the branch therefore queues another pet release run.
-Workflow concurrency starts it after the active release attempt finishes; if
-the source still matches the published release, it skips builds. New upstream
-commits can make that follow-up run prepare and verify another candidate.
+Workflow concurrency starts it after the active release attempt finishes. When
+the current fork tip matches the published release, the follow-up skips before
+fetching upstream. Scheduled and manual runs refresh upstream; human pushes
+that change the fork tip and runs without a matching public release still
+prepare and verify a candidate.
 
 To rotate credentials, create a replacement token with the same repository
 selection and permissions, update `PET_SYNC_TOKEN`, and revoke the superseded

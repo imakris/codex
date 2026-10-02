@@ -47,7 +47,9 @@ runs on branch pushes and manual dispatch. It merges upstream changes, builds
 Windows x64 and Linux x64 packages, runs twelve selected pet regression tests on
 each platform, and checks a fresh npm installation before publishing a release.
 Scheduled runs attempt a new release even when source is unchanged. Push and
-manual runs skip builds when a matching release exists. Conflicts or failed
+manual runs use separate release checks: a push skips before refreshing upstream
+when the fork tip already has a published release, while a manual run refreshes
+upstream and skips only an already published candidate. Conflicts or failed
 checks leave the previous release available. GitHub can delay scheduled starts;
 publication follows successful verification.
 
