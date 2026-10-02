@@ -15,6 +15,7 @@ permissions:
 # each isolated builder limits native compilation to four local CPU jobs.
 concurrency:
   group: pet-release
+  queue: max
   cancel-in-progress: false
 
 jobs:

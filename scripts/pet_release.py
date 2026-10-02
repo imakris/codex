@@ -70,6 +70,13 @@ def prepare(directory):
     directory.mkdir(parents=True, exist_ok=True)
     run("git", "fetch", "origin", BRANCH)
     base = run("git", "rev-parse", "FETCH_HEAD", capture=True)
+    latest = api("releases/latest")
+    # Promotion pushes must not chase upstream changes that arrived during the previous build.
+    if (os.environ.get("GITHUB_EVENT_NAME") == "push" and latest is not None
+            and latest["tag_name"].endswith("-" + base)):
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write("build=false\n")
+        return
     run("git", "checkout", "--detach", base)
     run("git", "fetch", "https://github.com/openai/codex.git", "main")
     upstream = run("git", "rev-parse", "FETCH_HEAD", capture=True)
@@ -77,8 +84,7 @@ def prepare(directory):
     run("git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
     run("git", "merge", "--no-edit", upstream)
     candidate = run("git", "rev-parse", "HEAD", capture=True)
-    latest = api("releases/latest")
-    # The commit-bound tag lets push/manual runs avoid publishing the same source twice.
+    # Manual refreshes can skip a candidate that already has a published release.
     unchanged = latest is not None and latest["tag_name"].endswith("-" + candidate)
     skip_build = unchanged and os.environ.get("GITHUB_EVENT_NAME") != "schedule"
     version = f"0.0.0-pet.{os.environ['GITHUB_RUN_NUMBER']}.{os.environ['GITHUB_RUN_ATTEMPT']}"
