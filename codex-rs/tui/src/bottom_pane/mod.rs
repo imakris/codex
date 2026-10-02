@@ -2300,7 +2300,8 @@ impl BottomPane {
             flex2.push(/*flex*/ 1, RenderableItem::Owned(above_composer));
             let composer: RenderableItem<'_> = if let Some(questions) = question_editor {
                 RenderableItem::Borrowed(questions.as_ref())
-            } else if options.textarea_right_reserve == 0
+            } else if options.max_height.is_none()
+                && options.textarea_right_reserve == 0
                 && options.minimum_height == 0
                 && options.warning_count == 0
                 && options.footer.is_none()
@@ -2384,6 +2385,7 @@ impl Renderable for ChatComposerPresentation<'_> {
     fn desired_height(&self, width: u16) -> u16 {
         self.composer
             .desired_height_with_options(width, self.options)
+            .min(self.options.max_height.unwrap_or(u16::MAX))
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {

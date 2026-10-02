@@ -2696,10 +2696,18 @@ async fn ambient_pet_hides_when_the_composer_viewport_cannot_fit_it() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     enable_test_ambient_pet(&mut chat);
 
+    let composer = chat.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions {
+        max_height: Some(3),
+        ..Default::default()
+    });
+    assert_eq!(composer.desired_height(80), 3);
     assert!(
         chat.ambient_pet_draw(
             Rect::new(
-                /*x*/ 0, /*y*/ 21, /*width*/ 80, /*height*/ 3,
+                /*x*/ 0,
+                /*y*/ 21,
+                /*width*/ 80,
+                composer.desired_height(80),
             ),
             /*composer_bottom_y*/ 24
         )
@@ -2734,12 +2742,8 @@ async fn ambient_pet_fits_beside_short_and_multiline_composers() {
     ] {
         chat.bottom_pane
             .set_composer_text(draft.to_string(), Vec::new(), Vec::new());
-        let composer = chat.bottom_pane_renderable(
-            /*footer*/ None,
-            crate::bottom_pane::CommandPopupPlacement::AboveComposer,
-            /*composer_gap*/ None,
-            /*working_tip*/ None,
-        );
+        let composer =
+            chat.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default());
         let height = composer.desired_height(width);
         let area = Rect::new(/*x*/ 0, /*y*/ 4, width, height);
         let draw = chat
@@ -2782,12 +2786,8 @@ async fn ambient_pet_hides_notification_text_overlay() {
         (crate::pets::PetNotificationKind::Failed, "Blocked"),
     ] {
         chat.set_ambient_pet_notification(kind, /*body*/ None);
-        let composer = chat.bottom_pane_renderable(
-            /*footer*/ None,
-            crate::bottom_pane::CommandPopupPlacement::AboveComposer,
-            /*composer_gap*/ None,
-            /*working_tip*/ None,
-        );
+        let composer =
+            chat.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default());
         let area = Rect::new(
             /*x*/ 0,
             /*y*/ 0,
