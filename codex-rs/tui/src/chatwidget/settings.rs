@@ -198,6 +198,13 @@ impl ChatWidget {
         self.model_catalog.clone()
     }
 
+    pub(crate) fn on_account_email_loaded(&mut self, current_email: Option<String>) {
+        if let Some(StatusAccountDisplay::ChatGpt { email, .. }) = &mut self.status_account_display
+        {
+            *email = current_email;
+        }
+    }
+
     pub(crate) fn current_plan_type(&self) -> Option<PlanType> {
         self.plan_type
     }
@@ -221,6 +228,7 @@ impl ChatWidget {
         // be identical across two accounts, so always invalidate account-scoped requests and data.
         self.model_popup_request_id = None;
         self.invalidate_permission_discovery();
+        self.permission_discovery = None;
         self.invalidate_connector_scope();
         self.clear_pending_rate_limit_reset_requests();
         self.clear_backend_banner();
@@ -534,6 +542,9 @@ impl ChatWidget {
 
     fn apply_thread_settings_cwd(&mut self, cwd: AbsolutePathBuf) {
         let previous_cwd = std::mem::replace(&mut self.config.cwd, cwd.clone());
+        if previous_cwd != cwd {
+            self.permission_discovery = None;
+        }
         self.current_cwd = Some(cwd.to_path_buf());
         self.status_line_project_root_name_cache = None;
 

@@ -3,8 +3,14 @@
 The [Pet fork sync and release workflow](https://github.com/imakris/codex/actions/workflows/pet-release.yml)
 merges upstream `openai/codex:main`, builds Windows x64 and Linux x64 packages,
 and publishes verified builds to [GitHub Releases](https://github.com/imakris/codex/releases).
-It runs daily at 07:17 UTC, after pushes to `pet-composer-layout`, and on manual
-dispatch. It does not require this computer to be switched on.
+It is scheduled daily at 07:17 Berlin time (`Europe/Berlin`) year-round, and also
+runs after pushes to `pet-composer-layout` and on manual dispatch. Scheduled
+runs attempt a new verified release even when source is unchanged. It does not
+require this computer to be switched on.
+
+The schedule follows Berlin's daylight saving time automatically: 05:17 UTC in
+summer and 06:17 UTC in winter. GitHub can delay scheduled starts; publication
+follows successful verification.
 
 ## Install without compiling
 
@@ -68,7 +74,9 @@ changed, push normally without forcing, upload the complete assets to a draft,
 and publish it as the latest release. A build failure leaves the branch and
 previous release intact. A publication failure can leave a verified branch
 advance or draft; it does not replace the latest successful release. A later
-run retries. Unchanged source with a matching published release skips builds.
+run retries. Scheduled runs build and verify a new release even when source is
+unchanged. Push and manual runs skip builds when a matching published release
+exists.
 Release metadata records the source and upstream commits; checksums cover the
 packages, metadata and downloadable installer.
 
