@@ -552,7 +552,7 @@ async fn owned_details_keep_the_composer_cursor_and_screen() -> Result<()> {
 }
 
 #[tokio::test]
-async fn owned_transcript_keeps_text_out_of_the_pet_columns() -> Result<()> {
+async fn owned_transcript_uses_full_width_above_the_pet() -> Result<()> {
     let mut app = crate::app::test_support::make_test_app().await;
     app.transcript_cells = vec![Arc::new(crate::history_cell::PlainHistoryCell::new(vec![
         "x".repeat(/*n*/ 150).into(),
@@ -568,12 +568,16 @@ async fn owned_transcript_keeps_text_out_of_the_pet_columns() -> Result<()> {
     app.chat_widget
         .install_test_ambient_pet_for_tests(/*animations_enabled*/ false);
     let width = app.chat_widget.history_wrap_width(size.width);
-    assert!(width < size.width);
+    assert_eq!(width, size.width);
     let bottom = app.render_owned_transcript(&mut tui, size)?;
     let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
-    assert!(buffer_text(buffer).contains(&"x".repeat(/*n*/ 60)));
-    for y in 0..bottom.y {
-        for x in width..size.width {
+    assert!(buffer_text(buffer).contains(&"x".repeat(usize::from(size.width))));
+    let pet = app
+        .chat_widget
+        .ambient_pet_draw(bottom, bottom.bottom())
+        .expect("pet fits beside composer");
+    for y in pet.y..pet.y + pet.rows {
+        for x in pet.x..pet.x + pet.columns {
             assert_eq!(buffer[(x, y)].symbol(), " ");
         }
     }
