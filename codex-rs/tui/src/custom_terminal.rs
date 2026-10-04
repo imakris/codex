@@ -535,6 +535,17 @@ where
         }
     }
 
+    /// Repaint cells erased by an image protocol outside the text diff renderer.
+    pub(crate) fn invalidate_area(&mut self, area: Rect) {
+        let previous = self.previous_buffer_mut();
+        let area = area.intersection(previous.area);
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                previous[(x, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
+    }
+
     /// Clear the entire visible screen (not just the viewport) and force a full redraw.
     pub fn clear_visible_screen(&mut self) -> io::Result<()> {
         let home = Position { x: 0, y: 0 };

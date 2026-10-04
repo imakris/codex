@@ -211,6 +211,17 @@ impl AmbientPet {
         .delay
     }
 
+    /// Height the composer must reserve so the pet never covers transcript rows.
+    pub(crate) fn required_height(&self) -> u16 {
+        let notification_height = self
+            .visible_notification(Instant::now())
+            .map_or(0, notification_height);
+        self.image_size()
+            .rows
+            .saturating_add(notification_height)
+            .saturating_add(composer_gap_rows())
+    }
+
     /// Build an image draw request for the ambient pet anchored above the composer.
     ///
     /// Returning `None` means "do not render the sprite this frame", typically
@@ -240,7 +251,7 @@ impl AmbientPet {
             protocol,
             x,
             y,
-            clear_top_y: area.y,
+            clear_top_y: y,
             columns: size.columns,
             rows: size.rows,
             height_px: size.height_px,
@@ -493,6 +504,26 @@ fn test_animation() -> Animation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ambient_sprite_only_clears_its_own_rows() {
+        let mut pet = test_ambient_pet(
+            FrameRequester::test_dummy(),
+            /*animations_enabled*/ false,
+        );
+        pet.set_image_support_for_tests(PetImageSupport::Supported(ImageProtocol::Sixel));
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 24,
+        );
+
+        let request = pet.draw_request(area, area.bottom()).unwrap();
+
+        assert_eq!(request.clear_top_y, request.y);
+        assert_eq!(
+            request.y + request.rows + composer_gap_rows(),
+            area.bottom()
+        );
+    }
 
     #[test]
     fn notification_labels_match_codex_app_vocabulary() {
