@@ -1,6 +1,7 @@
 //! Inline editing for asynchronous questions. Legacy request_user_input keeps its own overlay.
 //! Local submissions and committed desktop replies remove questions; arrival never steals focus.
 //! Live turn completion recovers unsent typed drafts before removing pending questions.
+//! Prompt and option text support the same selection gestures as the answer composer.
 
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::CancellationEvent;
@@ -27,8 +28,10 @@ use unicode_width::UnicodeWidthStr;
 
 mod input;
 mod layout;
+mod mouse;
 mod render;
 mod state;
+mod text_selection;
 
 const OTHER_OPTION_LABEL: &str = "Other";
 pub(super) const TIP_SEPARATOR: &str = "   ";
@@ -67,6 +70,8 @@ pub(crate) struct AsyncQuestions {
     pub(crate) delivery_enabled: bool,
     pub(crate) submission: Option<QuestionSubmission>,
     visible_options: std::cell::Cell<(usize, usize)>,
+    text_selection: std::cell::RefCell<text_selection::QuestionTextSelection>,
+    answer_mouse_ready: bool,
     keymap: RuntimeKeymap,
     // Ignore autorepeat from the number key that opened Other.
     other_selector: Option<KeyCode>,
@@ -102,6 +107,8 @@ impl AsyncQuestions {
             delivery_enabled: true,
             submission: None,
             visible_options: std::cell::Cell::new((0, 0)),
+            text_selection: std::cell::RefCell::default(),
+            answer_mouse_ready: false,
             keymap,
             other_selector: None,
             composer,
@@ -153,9 +160,9 @@ impl AsyncQuestions {
     pub(super) fn wrapped_question_lines(&self, width: u16) -> Vec<String> {
         self.current_question()
             .map(|q| {
-                textwrap::wrap(&q.title, width.max(1) as usize)
+                crate::wrapping::wrap_ranges_trim(&q.title, usize::from(width.max(1)))
                     .into_iter()
-                    .map(|line| line.to_string())
+                    .map(|range| q.title[range].to_string())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()
@@ -226,6 +233,7 @@ impl AsyncQuestions {
     }
 
     fn restore_current_draft(&mut self) {
+        self.text_selection.borrow_mut().clear();
         self.sync_composer_placeholder();
         let draft = self
             .current_answer()

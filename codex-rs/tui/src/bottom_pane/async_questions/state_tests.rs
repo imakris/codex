@@ -27,6 +27,336 @@ fn editor() -> AsyncQuestions {
     editor
 }
 
+fn wrapped_other_editor() -> AsyncQuestions {
+    let mut editor = editor();
+    editor.clear_pending();
+    editor.append(
+        "wrapped",
+        &[question(
+            "Question?",
+            Some(vec![
+                "First option spans two rows".into(),
+                "Second choice spans two rows".into(),
+            ]),
+        )],
+    );
+    editor.set_expanded(true);
+    editor.select_option(2);
+    editor
+}
+
+fn painted_text_start(buffer: &Buffer, text: &str) -> (u16, u16) {
+    let area = buffer.area;
+    (area.y..area.bottom())
+        .find_map(|row| {
+            (area.x..area.right()).find_map(|column| {
+                let suffix = (column..area.right())
+                    .map(|x| buffer[(x, row)].symbol())
+                    .collect::<String>();
+                suffix.starts_with(text).then_some((column, row))
+            })
+        })
+        .unwrap_or_else(|| panic!("missing painted {text:?} in {buffer:?}"))
+}
+
+fn question_mouse(
+    editor: &mut AsyncQuestions,
+    kind: crossterm::event::MouseEventKind,
+    position: (u16, u16),
+    width: u16,
+    height: u16,
+) {
+    let event = crossterm::event::MouseEvent {
+        kind,
+        column: position.0,
+        row: position.1,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(editor.prepare_mouse(event));
+    let buffer = render_editor(editor, width, height);
+    assert!(
+        editor.handle_mouse(event),
+        "unhandled {event:?} in {buffer:?}"
+    );
+}
+
+fn question_copy(editor: &mut AsyncQuestions, expected: &str) {
+    use crate::clipboard_copy::CopyStatus;
+    assert_eq!(
+        editor.copy_selection(
+            &crate::tui::TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+            |text| {
+                assert_eq!(text, expected);
+                Ok(CopyStatus::Confirmed)
+            },
+        ),
+        Some((expected.chars().count(), Ok(CopyStatus::Confirmed)))
+    );
+}
+
+#[test]
+fn clipped_other_cross_block_copy_excludes_hidden_choices() {
+    use crossterm::event::MouseButton::Left;
+    use crossterm::event::MouseEventKind::Down;
+    use crossterm::event::MouseEventKind::Drag;
+    use crossterm::event::MouseEventKind::Up;
+
+    for reverse in [false, true] {
+        let mut editor = wrapped_other_editor();
+        let buffer = render_editor(&editor, 32, 11);
+        assert!(!buffer_text(&buffer).contains("First"));
+        let title = painted_text_start(&buffer, "Question?");
+        let second = painted_text_start(&buffer, "Second");
+        let second_end = (second.0 + 6, second.1);
+        let (start, end) = if reverse {
+            (second_end, title)
+        } else {
+            (title, second_end)
+        };
+        question_mouse(&mut editor, Down(Left), start, 32, 11);
+        question_mouse(&mut editor, Drag(Left), end, 32, 11);
+        question_mouse(&mut editor, Up(Left), end, 32, 11);
+        assert_eq!(
+            editor.copy_selection(
+                &crate::tui::TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+                |text| {
+                    assert_eq!(text, "Question?\n\nSecond");
+                    Ok(crate::clipboard_copy::CopyStatus::Unconfirmed)
+                },
+            ),
+            Some((17, Ok(crate::clipboard_copy::CopyStatus::Unconfirmed)))
+        );
+        // Newly visible choices were outside the gesture's painted coverage.
+        let expanded = render_editor(&editor, 32, 18);
+        assert!(buffer_text(&expanded).contains("First"));
+        question_copy(&mut editor, "Question?\n\nSecond");
+        assert_eq!(editor.selected_option_index(), Some(2));
+        assert_eq!(editor.composer.current_text(), "");
+        assert!(editor.submission.is_none());
+    }
+}
+
+#[test]
+fn clipped_question_word_and_line_copy_excludes_hidden_tails() {
+    use crossterm::event::MouseButton::Left;
+    use crossterm::event::MouseEventKind::Down;
+    use crossterm::event::MouseEventKind::Up;
+
+    for clicks in [2, 3] {
+        let mut editor = editor();
+        editor.clear_pending();
+        editor.append("clipped", &[question("ABCDEFGHIJKLMNOPQRSTUVWXYZ", None)]);
+        editor.set_expanded(true);
+        let buffer = render_editor(&editor, 12, 4);
+        let start = painted_text_start(&buffer, "ABCDEFGH");
+        assert!(!buffer_text(&buffer).contains("IJKL"));
+        for _ in 0..clicks {
+            question_mouse(&mut editor, Down(Left), start, 12, 4);
+            question_mouse(&mut editor, Up(Left), start, 12, 4);
+        }
+        assert_eq!(
+            editor.copy_selection(
+                &crate::tui::TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+                |text| {
+                    assert_eq!(text, "ABCDEFGH");
+                    Ok(crate::clipboard_copy::CopyStatus::Unconfirmed)
+                },
+            ),
+            Some((8, Ok(crate::clipboard_copy::CopyStatus::Unconfirmed)))
+        );
+        render_editor(&editor, 40, 8);
+        question_copy(&mut editor, "ABCDEFGH");
+    }
+}
+
+#[test]
+fn question_selection_toggles_painted_fallback_style() {
+    use crossterm::event::MouseButton::Left;
+    use crossterm::event::MouseEventKind::Down;
+    use crossterm::event::MouseEventKind::Drag;
+    use crossterm::event::MouseEventKind::Up;
+
+    let mut editor = wrapped_other_editor();
+    editor.select_option(1);
+    let base = render_editor(&editor, 32, 11);
+    let start = painted_text_start(&base, "Second");
+    let end = (start.0 + 6, start.1);
+    question_mouse(&mut editor, Down(Left), start, 32, 11);
+    question_mouse(&mut editor, Drag(Left), end, 32, 11);
+    question_mouse(&mut editor, Up(Left), end, 32, 11);
+    // The unknown-palette picker paints its keyboard-selected row reversed.
+    // Apply that final painted style independently of the test host's color probe.
+    let mut painted = base;
+    for column in painted.area.x..painted.area.right() {
+        painted[(column, start.1)]
+            .modifier
+            .insert(Modifier::REVERSED);
+    }
+    let fallback = painted.clone();
+    editor.text_selection.borrow().highlight(&mut painted);
+    for row in painted.area.y..painted.area.bottom() {
+        for column in painted.area.x..painted.area.right() {
+            let mut expected = fallback[(column, row)].clone();
+            if row == start.1 && (start.0..end.0).contains(&column) {
+                expected.modifier.remove(Modifier::REVERSED);
+            }
+            assert_eq!(painted[(column, row)], expected, "cell ({column}, {row})");
+        }
+    }
+}
+
+#[test]
+fn question_pending_copy_tracks_changed_painted_coverage() {
+    use crate::clipboard_copy::CopyStatus;
+    use crossterm::event::MouseButton::Left;
+    use crossterm::event::MouseEventKind::Down;
+    use crossterm::event::MouseEventKind::Drag;
+    use crossterm::event::MouseEventKind::Up;
+
+    let mut editor = editor();
+    editor.clear_pending();
+    editor.append("coverage", &[question("ABCDEFGHIJKLMNOPQRSTUVWXYZ", None)]);
+    editor.set_expanded(true);
+    let buffer = render_editor(&editor, 40, 8);
+    let start = painted_text_start(&buffer, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    let end = (start.0 + 26, start.1);
+    question_mouse(&mut editor, Down(Left), start, 40, 8);
+    question_mouse(&mut editor, Drag(Left), end, 40, 8);
+    question_mouse(&mut editor, Up(Left), end, 40, 8);
+    assert_eq!(
+        editor.copy_selection(
+            &crate::tui::TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+            |text| {
+                assert_eq!(text, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+                Ok(CopyStatus::Pending(91))
+            },
+        ),
+        Some((26, Ok(CopyStatus::Pending(91))))
+    );
+    render_editor(&editor, 12, 4);
+    assert_eq!(
+        editor.finish_copy(&(91, Ok(CopyStatus::Confirmed)), true),
+        None
+    );
+    question_copy(&mut editor, "ABCDEFGH");
+
+    let buffer = render_editor(&editor, 40, 8);
+    let start = painted_text_start(&buffer, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    let end = (start.0 + 26, start.1);
+    question_mouse(&mut editor, Down(Left), start, 40, 8);
+    question_mouse(&mut editor, Drag(Left), end, 40, 8);
+    question_mouse(&mut editor, Up(Left), end, 40, 8);
+    assert_eq!(
+        editor.copy_selection(
+            &crate::tui::TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+            |text| {
+                assert_eq!(text, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+                Ok(CopyStatus::Pending(92))
+            },
+        ),
+        Some((26, Ok(CopyStatus::Pending(92))))
+    );
+    render_editor(&editor, 18, 10);
+    assert_eq!(
+        editor.finish_copy(&(92, Ok(CopyStatus::Confirmed)), true),
+        Some(26)
+    );
+}
+
+#[test]
+fn clipped_other_option_copy_uses_painted_rows() {
+    use crate::clipboard_copy::CopyStatus;
+    use crate::tui::TuiEvent;
+    use crossterm::event::MouseButton::Left;
+    use crossterm::event::MouseEventKind::Down;
+    use crossterm::event::MouseEventKind::Drag;
+    use crossterm::event::MouseEventKind::Up;
+
+    fn select_word(editor: &mut AsyncQuestions, word: &str, width: u16, height: u16) {
+        let buffer = render_editor(editor, width, height);
+        let (column, row) = (0..height)
+            .find_map(|row| {
+                (0..width).find_map(|column| {
+                    let suffix = (column..width)
+                        .map(|x| buffer[(x, row)].symbol())
+                        .collect::<String>();
+                    suffix.starts_with(word).then_some((column, row))
+                })
+            })
+            .expect("visible question text");
+        for (kind, column) in [
+            (Down(Left), column),
+            (Drag(Left), column + word.len() as u16),
+            (Up(Left), column + word.len() as u16),
+        ] {
+            let event = crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(editor.prepare_mouse(event));
+            let rendered = render_editor(editor, width, height);
+            assert!(
+                editor.handle_mouse(event),
+                "unhandled {event:?} in {rendered:?}"
+            );
+        }
+        assert_eq!(
+            editor.copy_selection(
+                &TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+                |text| {
+                    assert_eq!(text, word);
+                    Ok(CopyStatus::Confirmed)
+                },
+            ),
+            Some((word.len(), Ok(CopyStatus::Confirmed)))
+        );
+    }
+
+    let mut editor = editor();
+    editor.clear_pending();
+    editor.append(
+        "wrapped",
+        &[question(
+            "Question?",
+            Some(vec![
+                "First option spans two rows".into(),
+                "Second choice spans two rows".into(),
+            ]),
+        )],
+    );
+    editor.set_expanded(true);
+    editor.select_option(2);
+    let buffer = render_editor(&editor, 32, 11);
+    assert!(!buffer_text(&buffer).contains("First"));
+    assert!(buffer_text(&buffer).contains("Second choice spans two"));
+    assert_eq!(editor.visible_options.get(), (1, 1));
+    for word in ["Second", "rows"] {
+        select_word(&mut editor, word, 32, 11);
+        assert_eq!(editor.selected_option_index(), Some(2));
+        assert_eq!(editor.composer.current_text(), "");
+        assert_eq!(editor.visible_options.get(), (1, 1));
+        assert!(editor.submission.is_none());
+    }
+
+    editor.handle_paste("Typed answer".into());
+    select_word(&mut editor, "Typed", 32, 11);
+    assert_eq!(editor.composer.current_text(), "Typed answer");
+    assert_eq!(editor.selected_option_index(), Some(2));
+    assert!(editor.submission.is_none());
+
+    editor.select_option(1);
+    select_word(&mut editor, "Second", 32, 11);
+    assert_eq!(editor.composer.current_text(), "Typed answer");
+    assert_eq!(editor.selected_option_index(), Some(1));
+    editor.handle_key_event(KeyCode::Enter.into());
+    assert!(matches!(
+        editor.submission,
+        Some(QuestionSubmission::Submit(_))
+    ));
+}
+
 #[test]
 fn taking_pending_drafts_preserves_order_expands_pastes_and_skips_blank_drafts() {
     let mut editor = editor();
@@ -331,6 +661,7 @@ fn question_other_excludes_clipped_options_at_the_width_boundary() {
         /*x*/ 0, /*y*/ 0, /*width*/ 20, /*height*/ 2,
     );
     let mut buffer = Buffer::empty(area);
+    editor.prepare_text_selection_layout();
     editor.render_inline_options(area, &mut buffer);
     assert_eq!(editor.visible_options.get(), (0, 0));
     insta::assert_snapshot!(

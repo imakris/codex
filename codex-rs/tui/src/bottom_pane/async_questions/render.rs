@@ -42,6 +42,7 @@ impl Renderable for AsyncQuestions {
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
         self.visible_options.set((0, 0));
+        self.prepare_text_selection_layout();
         ratatui::widgets::Clear.render(area, buf);
         let content_area = render_menu_surface(area, buf);
         if content_area.is_empty() {
@@ -53,6 +54,7 @@ impl Renderable for AsyncQuestions {
             .style(crate::style::accent_style())
             .bold()
             .render(sections.question_area, buf);
+        self.record_question_rows(sections.question_area);
 
         let option_rows = self.option_rows();
 
@@ -98,6 +100,7 @@ impl Renderable for AsyncQuestions {
                 option_rows.len().max(1),
                 "No options",
             );
+            self.record_option_rows(sections.options_area, first, &option_rows);
         }
 
         if !self.has_options() {
@@ -139,6 +142,7 @@ impl Renderable for AsyncQuestions {
             .map(|line| truncate_line_word_boundary_with_ellipsis(line, footer_area.width as usize))
             .collect::<Vec<_>>();
         Paragraph::new(lines).render(footer_area, buf);
+        self.text_selection.borrow().highlight(buf);
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
@@ -163,6 +167,21 @@ impl Renderable for AsyncQuestions {
 }
 
 impl AsyncQuestions {
+    pub(crate) fn can_reserve_columns(width: u16, columns: u16) -> bool {
+        menu_surface_inset(Rect::new(0, 0, width.saturating_sub(columns), u16::MAX)).width > 0
+    }
+
+    pub(crate) fn presentation(
+        &self,
+        options: crate::bottom_pane::ComposerRenderOptions<'_>,
+    ) -> QuestionPresentation<'_> {
+        QuestionPresentation {
+            questions: self,
+            right_reserve: options.textarea_right_reserve,
+            minimum_height: options.minimum_height,
+        }
+    }
+
     pub(super) fn footer_lines(
         &self,
         width: u16,
@@ -236,5 +255,53 @@ impl AsyncQuestions {
             self.options_len()
         )
         .dim()
+    }
+}
+
+pub(crate) struct QuestionPresentation<'a> {
+    questions: &'a AsyncQuestions,
+    right_reserve: u16,
+    minimum_height: u16,
+}
+
+impl QuestionPresentation<'_> {
+    fn content_area(&self, area: Rect) -> Rect {
+        Rect {
+            width: self.content_width(area.width),
+            ..area
+        }
+    }
+
+    fn content_width(&self, width: u16) -> u16 {
+        if AsyncQuestions::can_reserve_columns(width, self.right_reserve) {
+            width.saturating_sub(self.right_reserve)
+        } else {
+            width
+        }
+    }
+}
+
+impl Renderable for QuestionPresentation<'_> {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        ratatui::widgets::Clear.render(area, buf);
+        self.questions.render(self.content_area(area), buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        let content_width = self.content_width(width);
+        let minimum = if content_width < width {
+            self.minimum_height
+        } else {
+            0
+        };
+        self.questions.desired_height(content_width).max(minimum)
+    }
+
+    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        self.questions.cursor_pos(self.content_area(area))
+    }
+
+    fn cursor_style(&self, area: Rect) -> crossterm::cursor::SetCursorStyle {
+        self.questions.cursor_style(self.content_area(area))
     }
 }

@@ -1793,6 +1793,9 @@ impl BottomPane {
 
     pub(crate) fn end_composer_drag(&mut self) {
         self.composer.end_mouse_drag();
+        if let Some(questions) = &mut self.questions {
+            questions.end_mouse_drag();
+        }
     }
 
     pub(crate) fn finish_composer_copy(
@@ -1801,6 +1804,12 @@ impl BottomPane {
         visible: bool,
     ) -> Option<usize> {
         let current = visible && !self.has_active_view();
+        if let Some(questions) = &mut self.questions
+            && let Some(count) = questions.finish_copy(completion, current && questions.expanded)
+        {
+            return Some(count);
+        }
+        let current = current && !self.questions.as_ref().is_some_and(|q| q.expanded);
         self.composer.finish_copy(completion, current)
     }
 
@@ -1809,8 +1818,11 @@ impl BottomPane {
         event: &crate::tui::TuiEvent,
         copy: impl FnOnce(&str) -> Result<crate::clipboard_copy::CopyStatus, String>,
     ) -> Option<(usize, Result<crate::clipboard_copy::CopyStatus, String>)> {
-        if self.has_active_view() || self.questions.as_ref().is_some_and(|q| q.expanded) {
+        if self.has_active_view() {
             return None;
+        }
+        if let Some(questions) = self.questions.as_mut().filter(|q| q.expanded) {
+            return questions.copy_selection(event, copy);
         }
         self.composer.copy_selection(event, copy)
     }
@@ -1820,14 +1832,21 @@ impl BottomPane {
     }
 
     pub(crate) fn prepare_composer_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
-        if self.has_active_view() || self.questions.as_ref().is_some_and(|q| q.expanded) {
-            self.composer.end_mouse_drag();
+        if self.has_active_view() {
+            self.end_composer_drag();
             return false;
+        }
+        if let Some(questions) = self.questions.as_mut().filter(|q| q.expanded) {
+            self.composer.end_mouse_drag();
+            return questions.prepare_mouse(event);
         }
         self.composer.prepare_mouse(event)
     }
 
     pub(crate) fn handle_composer_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
+        if let Some(questions) = self.questions.as_mut().filter(|q| q.expanded) {
+            return questions.handle_mouse(event);
+        }
         self.composer.handle_mouse(event)
     }
 
@@ -2341,9 +2360,10 @@ impl BottomPane {
             };
             flex2.push(/*flex*/ 1, RenderableItem::Owned(above_composer));
             let composer: RenderableItem<'_> = if let Some(questions) = question_editor {
-                RenderableItem::Borrowed(questions.as_ref())
+                RenderableItem::Owned(Box::new(questions.presentation(options)))
             } else if options.max_height.is_none()
                 && options.textarea_right_reserve == 0
+                && options.minimum_height == 0
                 && options.warning_count == 0
                 && options.footer.is_none()
                 && !options.separate_status_line
