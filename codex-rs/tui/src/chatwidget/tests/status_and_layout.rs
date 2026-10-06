@@ -2581,7 +2581,7 @@ async fn ambient_pet_can_be_disabled() {
 }
 
 #[tokio::test]
-async fn added_history_uses_pet_adjusted_terminal_width() {
+async fn added_history_with_pet_uses_full_terminal_width() {
     #[derive(Debug)]
     struct WidthCell(std::sync::Arc<std::sync::atomic::AtomicU16>);
 
@@ -2611,7 +2611,7 @@ async fn added_history_uses_pet_adjusted_terminal_width() {
 
     chat.add_to_history(WidthCell(std::sync::Arc::clone(&width)));
 
-    assert_eq!(width.load(std::sync::atomic::Ordering::Relaxed), 69);
+    assert_eq!(width.load(std::sync::atomic::Ordering::Relaxed), 80);
     let backend = VT100Backend::new(/*width*/ 80, /*height*/ 4);
     let mut terminal = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
     terminal.set_viewport_area(Rect::new(
@@ -2636,11 +2636,11 @@ width-sensitive history
 
 #[tokio::test]
 #[serial]
-async fn ambient_pet_reserves_history_wrap_width() {
+async fn ambient_pet_preserves_history_wrap_width() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     enable_test_ambient_pet(&mut chat);
 
-    assert_eq!(chat.history_wrap_width(/*width*/ 80), 69);
+    assert_eq!(chat.history_wrap_width(/*width*/ 80), 80);
 
     chat.set_tui_pet(Some(crate::pets::DISABLED_PET_ID.to_string()));
 
@@ -2649,7 +2649,7 @@ async fn ambient_pet_reserves_history_wrap_width() {
 
 #[tokio::test]
 #[serial]
-async fn ambient_pet_reduces_stream_width_and_composer_text_width() {
+async fn ambient_pet_preserves_stream_width_and_reserves_composer_text_width() {
     use ratatui::Terminal;
 
     let (mut with_pet, _with_pet_rx, _with_pet_op_rx) =
@@ -2666,13 +2666,13 @@ async fn ambient_pet_reduces_stream_width_and_composer_text_width() {
 
     assert_eq!(
         stream_width_with_pet,
-        crate::width::usable_content_width(/*total_width*/ 69, /*reserved_cols*/ 2)
+        crate::width::usable_content_width(/*total_width*/ 80, /*reserved_cols*/ 2)
     );
     assert_eq!(
         stream_width_without_pet,
         crate::width::usable_content_width(/*total_width*/ 80, /*reserved_cols*/ 2)
     );
-    assert!(stream_width_with_pet < stream_width_without_pet);
+    assert_eq!(stream_width_with_pet, stream_width_without_pet);
 
     let draft =
         "Minim commodo esse elit Lorem exercitation elit ipsum proident labore. Esse culpa aliqua"
@@ -2720,21 +2720,29 @@ fn row_tail_is_blank(row: &str, start_col: usize) -> bool {
 
 #[tokio::test]
 #[serial]
-async fn ambient_pet_draw_uses_terminal_screen_area_not_short_inline_viewport() {
+async fn ambient_pet_hides_when_the_composer_viewport_cannot_fit_it() {
     use ratatui::layout::Rect;
 
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     enable_test_ambient_pet(&mut chat);
 
+    let composer = chat.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions {
+        max_height: Some(3),
+        ..Default::default()
+    });
+    assert_eq!(composer.desired_height(80), 3);
     assert!(
         chat.ambient_pet_draw(
             Rect::new(
-                /*x*/ 0, /*y*/ 21, /*width*/ 80, /*height*/ 3,
+                /*x*/ 0,
+                /*y*/ 21,
+                /*width*/ 80,
+                composer.desired_height(80),
             ),
             /*composer_bottom_y*/ 24
         )
         .is_none(),
-        "a normal short inline viewport cannot fit the ambient pet"
+        "a clipped composer viewport must not draw into history"
     );
 
     let draw = chat
@@ -2747,6 +2755,101 @@ async fn ambient_pet_draw_uses_terminal_screen_area_not_short_inline_viewport() 
         .expect("full terminal screen has room for the ambient pet");
     assert_eq!(draw.x, 71);
     assert_eq!(draw.y, 18);
+}
+
+#[tokio::test]
+#[serial]
+async fn ambient_pet_fits_beside_short_and_multiline_composers() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    enable_test_ambient_pet(&mut chat);
+    chat.bottom_pane
+        .set_status_line(Some("status across the composer footer".into()));
+
+    for (width, draft) in [
+        (80, "hello"),
+        (30, "hello"),
+        (80, "first\nsecond\nthird\nfourth"),
+    ] {
+        chat.bottom_pane
+            .set_composer_text(draft.to_string(), Vec::new(), Vec::new());
+        let composer =
+            chat.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default());
+        let height = composer.desired_height(width);
+        let area = Rect::new(/*x*/ 0, /*y*/ 4, width, height);
+        let draw = chat
+            .ambient_pet_draw(area, area.bottom())
+            .expect("composer must reserve enough height for the whole pet");
+        assert!(draw.y >= area.y);
+        assert!(draw.y + draw.rows <= area.bottom());
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        composer.render(area, &mut buffer);
+        for y in draw.y..draw.y + draw.rows {
+            for x in draw.x..draw.x + draw.columns {
+                assert_eq!(buffer[(x, y)].symbol(), " ");
+            }
+        }
+        if width == 80 && draft == "hello" {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| composer.render(frame.area(), frame.buffer_mut()))
+                .expect("render short composer");
+            assert_chatwidget_snapshot!(
+                "ambient_pet_short_composer",
+                normalized_backend_snapshot(terminal.backend())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn ambient_pet_fits_beside_expanded_questions() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    enable_test_ambient_pet(&mut chat);
+    chat.add_async_questions(
+        "message",
+        &[codex_protocol::items::AsyncUserInputQuestion {
+            title: "Which route should we take for the next journey?".into(),
+            options: Some(vec!["Take the scenic route through the mountains".into()]),
+        }],
+    );
+    chat.bottom_pane
+        .questions
+        .as_mut()
+        .unwrap()
+        .set_expanded(true);
+    for (width, anchor) in [
+        (80, codex_config::types::TuiPetAnchor::Composer),
+        (30, codex_config::types::TuiPetAnchor::Composer),
+        (80, codex_config::types::TuiPetAnchor::ScreenBottom),
+        (30, codex_config::types::TuiPetAnchor::ScreenBottom),
+    ] {
+        chat.local_settings.tui.pet_anchor = anchor;
+        let panel =
+            chat.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default());
+        let height = panel.desired_height(width);
+        let area = Rect::new(0, 4, width, height);
+        let draw = chat
+            .ambient_pet_draw(area, area.bottom())
+            .expect("expanded question leaves the pet visible");
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        panel.render(area, &mut buffer);
+        for y in draw.y..draw.y + draw.rows {
+            for x in draw.x..draw.x + draw.columns {
+                assert_eq!(
+                    buffer[(x, y)].symbol(),
+                    " ",
+                    "question must leave pet cells clear"
+                );
+            }
+        }
+    }
+    let area = Rect::new(0, 0, 14, 12);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    chat.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default())
+        .render(area, &mut buffer);
+    assert!(chat.ambient_pet_draw(area, area.bottom()).is_none());
+    assert!(buffer.content().iter().any(|cell| cell.symbol() == "W"));
 }
 
 #[tokio::test]
@@ -2764,6 +2867,19 @@ async fn ambient_pet_hides_notification_text_overlay() {
         (crate::pets::PetNotificationKind::Failed, "Blocked"),
     ] {
         chat.set_ambient_pet_notification(kind, /*body*/ None);
+        let composer =
+            chat.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default());
+        let area = Rect::new(
+            /*x*/ 0,
+            /*y*/ 0,
+            /*width*/ 60,
+            composer.desired_height(60),
+        );
+        let draw = chat
+            .ambient_pet_draw(area, area.bottom())
+            .expect("notification pet remains visible");
+        assert!(draw.y >= area.y);
+        assert!(draw.y + draw.rows <= area.bottom());
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("create terminal");
         terminal
             .draw(|f| chat.render(f.area(), f.buffer_mut()))

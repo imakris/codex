@@ -86,7 +86,21 @@ impl ChatWidget {
         area: Rect,
         composer_bottom_y: u16,
     ) -> Option<crate::pets::AmbientPetDraw> {
-        if !self.bottom_pane.no_modal_or_popup_active() {
+        let questions_expanded = self
+            .bottom_pane
+            .questions
+            .as_ref()
+            .is_some_and(|q| q.expanded);
+        if self.fork_in_progress
+            || self.external_writer_view
+            || self.bottom_pane.has_active_view()
+            || (!questions_expanded && !self.bottom_pane.no_modal_or_popup_active())
+            || (questions_expanded
+                && !crate::bottom_pane::AsyncQuestions::can_reserve_columns(
+                    area.width,
+                    self.ambient_pet_wrap_reserved_cols(),
+                ))
+        {
             return None;
         }
 
@@ -94,9 +108,17 @@ impl ChatWidget {
             TuiPetAnchor::Composer => composer_bottom_y,
             TuiPetAnchor::ScreenBottom => area.bottom(),
         };
-        self.ambient_pet
-            .as_ref()?
-            .draw_request(area, anchor_bottom_y)
+        let pet = self.ambient_pet.as_ref()?;
+        // The composer reserves this height so drawing cannot reach full-width history.
+        let top = area
+            .y
+            .max(anchor_bottom_y.saturating_sub(pet.required_height()));
+        let area = Rect {
+            y: top,
+            height: area.bottom().saturating_sub(top),
+            ..area
+        };
+        pet.draw_request(area, anchor_bottom_y)
     }
 
     pub(super) fn ambient_pet_wrap_reserved_cols(&self) -> u16 {
@@ -111,9 +133,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn history_wrap_width(&self, width: u16) -> u16 {
-        width
-            .saturating_sub(self.ambient_pet_wrap_reserved_cols())
-            .max(1)
+        width.max(1)
     }
 
     pub(crate) fn pet_picker_preview_draw(&self) -> Option<crate::pets::AmbientPetDraw> {

@@ -552,7 +552,7 @@ async fn owned_details_keep_the_composer_cursor_and_screen() -> Result<()> {
 }
 
 #[tokio::test]
-async fn owned_transcript_keeps_text_out_of_the_pet_columns() -> Result<()> {
+async fn owned_transcript_uses_full_width_above_the_pet() -> Result<()> {
     let mut app = crate::app::test_support::make_test_app().await;
     app.transcript_cells = vec![Arc::new(crate::history_cell::PlainHistoryCell::new(vec![
         "x".repeat(/*n*/ 150).into(),
@@ -568,12 +568,16 @@ async fn owned_transcript_keeps_text_out_of_the_pet_columns() -> Result<()> {
     app.chat_widget
         .install_test_ambient_pet_for_tests(/*animations_enabled*/ false);
     let width = app.chat_widget.history_wrap_width(size.width);
-    assert!(width < size.width);
+    assert_eq!(width, size.width);
     let bottom = app.render_owned_transcript(&mut tui, size)?;
     let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
-    assert!(buffer_text(buffer).contains(&"x".repeat(/*n*/ 60)));
-    for y in 0..bottom.y {
-        for x in width..size.width {
+    assert!(buffer_text(buffer).contains(&"x".repeat(usize::from(size.width))));
+    let pet = app
+        .chat_widget
+        .ambient_pet_draw(bottom, bottom.bottom())
+        .expect("pet fits beside composer");
+    for y in pet.y..pet.y + pet.rows {
+        for x in pet.x..pet.x + pet.columns {
             assert_eq!(buffer[(x, y)].symbol(), " ");
         }
     }
@@ -1429,6 +1433,196 @@ fn row_containing(tui: &tui::Tui, text: &str) -> u16 {
         .lines()
         .position(|row| row.contains(text))
         .unwrap() as u16
+}
+
+#[tokio::test]
+async fn fullscreen_question_mouse_copy_routes_without_answering() -> Result<()> {
+    use codex_app_server_protocol::ItemCompletedNotification;
+    let (mut app, _events, mut operations) = make_test_app_with_channels().await;
+    app.local_settings.tui.copy_on_select = CopyOnSelect::Never;
+    let thread_id = ThreadId::new();
+    attach_thread(&mut app, thread_id);
+    let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(true)?;
+    app.chat_widget.apply_external_edit("Main draft".into());
+    app.chat_widget.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn".into(),
+            completed_at_ms: 0,
+            item: ThreadItem::AgentMessage {
+                id: "question".into(),
+                text: String::new(),
+                phase: None,
+                memory_citation: None,
+                delivery: None,
+                questions: Some(vec![codex_protocol::items::AsyncUserInputQuestion {
+                    title: "Question text?".into(),
+                    options: Some(vec!["Named answer".into()]),
+                }]),
+            },
+        }),
+        None,
+    );
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    let size = tui.terminal.size()?;
+    app.render_owned_transcript(&mut tui, size)?;
+    let row = row_containing(&tui, "Question text?");
+    let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
+    let column = (0..size.width)
+        .find(|&x| buffer[(x, row)].symbol() == "Q")
+        .unwrap();
+    for event in [
+        TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        TuiEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )),
+        mouse(Down(Right), column + 2, row),
+    ] {
+        for pointer in [
+            mouse(Down(Left), column, row),
+            mouse(Drag(Left), column + 8, row),
+            mouse(Up(Left), column + 8, row),
+        ] {
+            assert!(app.handle_owned_transcript_event(&mut tui, &mut server, &pointer)?);
+        }
+        assert!(!app.transcript_view.has_active_interaction());
+        assert!(app.handle_composer_copy_event(&mut tui, &event, |_, text| {
+            assert_eq!(text, "Question");
+            Ok(crate::clipboard_copy::CopyStatus::Confirmed)
+        }));
+        assert_eq!(app.chat_widget.composer_text_with_pending(), "Main draft");
+        app.render_owned_transcript(&mut tui, size)?;
+        assert!(
+            buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+                &tui.terminal
+            ))
+            .contains("Question text?")
+        );
+    }
+    assert!(
+        std::iter::from_fn(|| operations.try_recv().ok())
+            .all(|operation| !matches!(operation, AppCommand::Interrupt))
+    );
+    assert!(app.local_settings.tui.question_esc_back);
+    for event in [
+        TuiEvent::Key(KeyCode::Char('2').into()),
+        TuiEvent::Paste("Typed answer".into()),
+        TuiEvent::Key(KeyCode::Left.into()),
+        TuiEvent::Key(KeyCode::Left.into()),
+    ] {
+        app.handle_tui_event(&mut tui, &mut server, event).await?;
+    }
+    app.render_owned_transcript(&mut tui, size)?;
+    let answer_cursor = tui.terminal.last_known_cursor_pos;
+    let row = row_containing(&tui, "Question text?");
+    for pointer in [
+        mouse(Down(Left), column, row),
+        mouse(Drag(Left), column + 8, row),
+        mouse(Up(Left), column + 8, row),
+    ] {
+        assert!(app.handle_owned_transcript_event(&mut tui, &mut server, &pointer)?);
+    }
+    assert!(app.handle_composer_copy_event(
+        &mut tui,
+        &TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+        |_, text| {
+            assert_eq!(text, "Question");
+            Ok(crate::clipboard_copy::CopyStatus::Pending(71))
+        }
+    ));
+    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into()))
+        .await?;
+    assert_eq!(
+        app.chat_widget.finish_clipboard(
+            &(71, Ok(crate::clipboard_copy::CopyStatus::Confirmed)),
+            true,
+        ),
+        None
+    );
+    app.render_owned_transcript(&mut tui, size)?;
+    assert!(
+        !buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+            &tui.terminal
+        ))
+        .contains("Typed answer")
+    );
+    app.handle_tui_event(
+        &mut tui,
+        &mut server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+    )
+    .await?;
+    app.render_owned_transcript(&mut tui, size)?;
+    assert_eq!(tui.terminal.last_known_cursor_pos, answer_cursor);
+    assert!(
+        buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+            &tui.terminal
+        ))
+        .contains("Typed answer")
+    );
+    assert!(!app.handle_composer_copy_event(
+        &mut tui,
+        &TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        |_, _| unreachable!()
+    ));
+    // The answer draft retains its usual Ctrl+C clearing behavior. Focus the
+    // named choice before verifying the no-selection turn interrupt route.
+    app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Up.into()))
+        .await?;
+    app.chat_widget.handle_server_notification(
+        ServerNotification::TurnStarted(codex_app_server_protocol::TurnStartedNotification {
+            thread_id: thread_id.to_string(),
+            turn: codex_app_server_protocol::Turn {
+                id: "active-turn".into(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: codex_app_server_protocol::TurnStatus::InProgress,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+            },
+        }),
+        None,
+    );
+    app.handle_tui_event(
+        &mut tui,
+        &mut server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+    )
+    .await?;
+    assert_eq!(
+        std::iter::from_fn(|| operations.try_recv().ok())
+            .filter(|operation| matches!(operation, AppCommand::Interrupt))
+            .count(),
+        1
+    );
+    assert_eq!(app.chat_widget.composer_text_with_pending(), "Main draft");
+    app.chat_widget.open_feature_enable_prompt(Feature::Collab);
+    let event = mouse(Down(Left), column, row);
+    assert!(!app.handle_owned_transcript_event(&mut tui, &mut server, &event)?);
+    assert!(!app.handle_composer_copy_event(
+        &mut tui,
+        &TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+        |_, _| unreachable!()
+    ));
+    assert!(!app.handle_composer_copy_event(
+        &mut tui,
+        &TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        |_, _| unreachable!()
+    ));
+    assert!(
+        std::iter::from_fn(|| operations.try_recv().ok())
+            .all(|operation| !matches!(operation, AppCommand::Interrupt))
+    );
+    server.shutdown().await?;
+    tui.set_owned_screen(false)?;
+    Ok(())
 }
 
 #[tokio::test]

@@ -130,6 +130,37 @@ pub(crate) fn render_ambient_pet_image(
     render_pet_image(writer, state, /*image_id*/ 0xC0DE, request)
 }
 
+/// Remove the previous sprite before text rendering or scrollback insertion changes its rows.
+/// Clip saved coordinates after a resize so clearing cannot wrap or scroll the terminal.
+pub(crate) fn clear_ambient_pet_before_frame(
+    writer: &mut impl Write,
+    state: &mut PetImageRenderState,
+    screen: ratatui::layout::Rect,
+) -> std::result::Result<Option<ratatui::layout::Rect>, PetImageRenderError> {
+    let erased_area = state.last_sixel_clear_area.map(|area| {
+        ratatui::layout::Rect::new(
+            area.x,
+            area.clear_top_y,
+            area.columns,
+            area.clear_bottom_y.saturating_sub(area.clear_top_y),
+        )
+        .intersection(screen)
+    });
+    state.last_sixel_clear_area =
+        erased_area
+            .filter(|area| !area.is_empty())
+            .map(|area| SixelClearArea {
+                x: area.x,
+                clear_top_y: area.y,
+                clear_bottom_y: area.bottom(),
+                columns: area.width,
+            });
+    if state.last_protocol.is_some() || state.last_sixel_clear_area.is_some() {
+        render_ambient_pet_image(writer, state, /*request*/ None)?;
+    }
+    Ok(erased_area)
+}
+
 pub(crate) fn render_pet_picker_preview_image(
     writer: &mut impl Write,
     state: &mut PetImageRenderState,
@@ -284,6 +315,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clearing_before_frame_clips_old_sprite_after_terminal_resize() {
+        let mut state = PetImageRenderState {
+            last_protocol: Some(ImageProtocol::Sixel),
+            last_sixel_clear_area: Some(SixelClearArea {
+                x: 6,
+                clear_top_y: 2,
+                clear_bottom_y: 8,
+                columns: 5,
+            }),
+        };
+        let mut output = Vec::new();
+        let screen = ratatui::layout::Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 8, /*height*/ 4,
+        );
+
+        let erased = clear_ambient_pet_before_frame(&mut output, &mut state, screen).unwrap();
+
+        assert_eq!(
+            erased,
+            Some(ratatui::layout::Rect::new(
+                /*x*/ 6, /*y*/ 2, /*width*/ 2, /*height*/ 2
+            ))
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\x1b7\x1b[3;7H  \x1b[4;7H  \x1b8"
+        );
+        assert!(state.last_sixel_clear_area.is_none());
+        assert!(state.last_protocol.is_none());
+    }
+
+    #[test]
     fn ambient_pet_image_restores_cursor_after_drawing() {
         let dir = tempfile::tempdir().unwrap();
         let frame = dir.path().join("frame.png");
@@ -346,9 +409,14 @@ mod tests {
 
     #[test]
     fn kitty_local_file_pet_image_uses_file_reference_without_inline_payload() {
+        use base64::Engine as _;
+
         let dir = tempfile::tempdir().unwrap();
         let frame = dir.path().join("frame.png");
         std::fs::write(&frame, b"png").unwrap();
+        let canonical_frame = frame.canonicalize().unwrap();
+        let expected_payload = base64::engine::general_purpose::STANDARD
+            .encode(canonical_frame.to_string_lossy().as_bytes());
         let request = AmbientPetDraw {
             frame,
             protocol: ImageProtocol::KittyLocalFile,
@@ -368,8 +436,13 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("a=d,d=I,i=49374,q=2;"));
         assert!(output.contains("\x1b[4;3H"));
-        assert!(output.contains("a=T,t=f,f=100,c=4,r=2,q=2,i=49374;"));
-        assert!(!output.contains("cG5n"));
+        let (_, payload) = output
+            .split_once("a=T,t=f,f=100,c=4,r=2,q=2,i=49374;")
+            .expect("Kitty local file transport");
+        let (payload, _) = payload
+            .split_once("\x1b\\")
+            .expect("Kitty command terminator");
+        assert_eq!(payload, expected_payload);
         assert!(output.contains("\x1b8"));
     }
 

@@ -60,6 +60,8 @@ impl AsyncQuestions {
     }
 
     pub(crate) fn set_expanded(&mut self, expanded: bool) {
+        self.text_selection.borrow_mut().clear();
+        self.end_mouse_drag();
         self.save_current_draft();
         self.expanded = expanded && !self.state.pending.is_empty();
         if self.expanded {

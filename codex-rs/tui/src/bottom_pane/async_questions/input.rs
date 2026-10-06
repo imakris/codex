@@ -28,6 +28,7 @@ impl AsyncQuestions {
     }
 
     pub(super) fn select_option(&mut self, index: usize) {
+        self.text_selection.borrow_mut().clear();
         self.save_current_draft();
         self.state.pending[self.state.current_idx]
             .options_state
@@ -109,6 +110,7 @@ impl AsyncQuestions {
             rows.len(),
             "",
         );
+        self.record_option_rows(named_area, state.scroll_top, &rows);
         let margin = Rect::new(
             area.x,
             input.y,
@@ -160,6 +162,12 @@ impl BottomPaneView for AsyncQuestions {
         if key.kind == KeyEventKind::Release || self.is_complete() {
             return;
         }
+        if crate::key_hint::plain(KeyCode::Esc).is_press(key)
+            && self.text_selection.borrow_mut().clear()
+        {
+            return;
+        }
+        self.text_selection.borrow_mut().clear();
         self.snooze_auto_resolution();
         if self.handles_key_as_editing(key) {
             self.edit(key);
