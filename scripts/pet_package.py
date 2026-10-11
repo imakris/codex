@@ -31,9 +31,7 @@ def stage_package(package_dir: Path, staging_dir: Path, target: str, version: st
     platform = TARGETS[target]
     spec = TARGET_SPECS[target]
     parse_package_version(version)
-    validate_package_dir(
-        package_dir, PACKAGE_VARIANTS["codex"], spec, include_zsh=spec.is_linux
-    )
+    validate_package_dir(package_dir, PACKAGE_VARIANTS["codex"], spec)
     metadata = json.loads((package_dir / "codex-package.json").read_text(encoding="utf-8"))
     if metadata.get("version") != version:
         raise RuntimeError("Canonical package version does not match npm version")
@@ -140,7 +138,7 @@ def smoke(tarball: Path, prefix: Path, target: str, version: str) -> None:
     installed = modules / "@imakris/codex-pet"
     spec = TARGET_SPECS[target]
     native = installed / "vendor" / target
-    validate_package_dir(native, PACKAGE_VARIANTS["codex"], spec, include_zsh=spec.is_linux)
+    validate_package_dir(native, PACKAGE_VARIANTS["codex"], spec)
     reported = subprocess.check_output(
         ["node", str(installed / "bin/codex.js"), "--version"], text=True
     ).strip()

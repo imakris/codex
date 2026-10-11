@@ -75,7 +75,7 @@ before compiling any native payload. The installed CLI must report that exact
 version; the npm package keeps its separate `pet` build suffix.
 
 The payload includes the code-mode host, ripgrep, Windows sandbox helpers, or
-the Linux bubblewrap and patched zsh resources. Linux bubblewrap is finalized
+the Linux bubblewrap resource. Linux bubblewrap is finalized
 and hashed before the CLI build, following upstream's package integrity contract.
 Build dependencies and checksum-verified V8 artifacts reuse upstream tooling.
 

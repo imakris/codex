@@ -2272,7 +2272,10 @@ async fn slash_daybreak_offers_an_application_when_unavailable() {
     chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![model]));
     chat.has_chatgpt_account = false;
     chat.status_account_display = Some(StatusAccountDisplay::ApiKey);
+    chat.set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ true);
     chat.set_daybreak_enabled(/*enabled*/ false);
+    chat.bottom_pane
+        .set_composer_text(String::new(), Vec::new(), Vec::new());
     chat.bottom_pane
         .set_composer_text("/daybreak".to_string(), Vec::new(), Vec::new());
     assert_chatwidget_snapshot!(
@@ -2281,6 +2284,20 @@ async fn slash_daybreak_offers_an_application_when_unavailable() {
             .lines()
             .next()
             .unwrap()
+    );
+    chat.set_daybreak_enabled(/*enabled*/ true);
+    chat.set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ false);
+    chat.bottom_pane
+        .set_composer_text(String::new(), Vec::new(), Vec::new());
+    chat.bottom_pane
+        .set_composer_text("/daybreak".to_string(), Vec::new(), Vec::new());
+    insta::assert_snapshot!(
+        render_bottom_popup(&chat, /*width*/ 80)
+            .lines()
+            .filter(|line| line.contains("broader access"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        @""
     );
     chat.has_chatgpt_account = true;
     chat.status_account_display = None;
@@ -2511,10 +2528,15 @@ async fn slash_keymap_invalid_args_show_usage() {
 async fn copy_shortcut_can_be_remapped() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+        let paste = KeyEvent::new(KeyCode::Char('v'), modifiers);
         assert_matches!(
-            chat.handle_key_event(KeyEvent::new(KeyCode::Char('v'), modifiers)),
+            chat.handle_key_event(paste),
             crate::chatwidget::KeyEventAction::PasteImage
         );
+        chat.handle_key_event(KeyEvent {
+            kind: KeyEventKind::Release,
+            ..paste
+        });
     }
     let mut keymap_config = chat.config_ref().tui_keymap.clone();
     keymap_config.global.copy = Some(codex_config::types::KeybindingsSpec::One(
@@ -2541,6 +2563,29 @@ async fn copy_shortcut_can_be_remapped() {
         rendered.contains("No agent response to copy"),
         "expected remapped copy shortcut to run, got {rendered:?}"
     );
+}
+
+#[tokio::test]
+async fn legacy_image_paste_ignores_buffered_press_until_other_input() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let paste = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+
+    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+    assert_matches!(chat.handle_key_event(paste), KeyEventAction::None);
+
+    chat.suppress_image_paste_until = Instant::now() - Duration::from_secs(/*secs*/ 1);
+    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+
+    chat.suppress_image_paste_until = Instant::now() + Duration::from_secs(/*secs*/ 1);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
+    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
+
+    chat.suppress_image_paste_until = Instant::now() + Duration::from_secs(/*secs*/ 1);
+    chat.handle_key_event(KeyEvent {
+        kind: KeyEventKind::Release,
+        ..paste
+    });
+    assert_matches!(chat.handle_key_event(paste), KeyEventAction::PasteImage);
 }
 
 #[tokio::test]

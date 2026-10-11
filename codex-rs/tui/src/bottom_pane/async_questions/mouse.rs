@@ -85,11 +85,20 @@ impl AsyncQuestions {
         let Some(question) = self.current_question() else {
             return;
         };
-        for (row, source) in
-            crate::wrapping::wrap_ranges_trim(&question.title, usize::from(area.width.max(1)))
-                .into_iter()
-                .take(usize::from(area.height))
-                .enumerate()
+        let mut source_offset = 0;
+        for (row, source) in question
+            .title
+            .split('\n')
+            .flat_map(|line| {
+                let offset = source_offset;
+                source_offset += line.len() + 1;
+                let text = line.strip_suffix('\r').unwrap_or(line);
+                crate::wrapping::wrap_ranges_trim(text, usize::from(area.width.max(1)))
+                    .into_iter()
+                    .map(move |range| offset + range.start..offset + range.end)
+            })
+            .take(usize::from(area.height))
+            .enumerate()
         {
             self.text_selection.borrow_mut().push_row(
                 Rect::new(area.x, area.y + row as u16, area.width, 1),

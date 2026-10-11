@@ -19,9 +19,13 @@ fn response_item(item: ResponseItem) -> RolloutItem {
 
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         phase: None,
@@ -31,9 +35,13 @@ fn user_msg(text: &str) -> ResponseItem {
 
 fn assistant_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         phase: None,
@@ -43,6 +51,7 @@ fn assistant_msg(text: &str) -> ResponseItem {
 
 fn turn_started(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_attribution: None,
         turn_id: turn_id.to_string(),
         root_turn_id: None,
         trace_id: None,
@@ -54,6 +63,7 @@ fn turn_started(turn_id: &str) -> RolloutItem {
 
 fn turn_completed(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        root_turn_id: None,
         turn_id: turn_id.to_string(),
         started_at: None,
         last_agent_message: None,
@@ -243,6 +253,8 @@ fn truncates_rollout_from_start_before_nth_user_only() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             call_id: "c1".to_string(),
             name: "tool".to_string(),

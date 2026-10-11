@@ -78,6 +78,8 @@ impl App {
                     task.abort();
                 }
                 self.agents_overview.request_id = None;
+                self.agents_overview.refresh_show_more = false;
+                self.agents_overview.active_refresh_thread_ids.clear();
                 self.agents_overview.refresh_pending = false;
                 self.agents_overview.initialized = false;
                 self.agents_overview.refresh_notifications.clear();
@@ -280,7 +282,8 @@ impl App {
                     self.chat_widget.dismiss_app_server_request(&request);
                     if self.startup_pending_protected_request {
                         self.startup_pending_protected_request =
-                            self.chat_widget.has_pending_protected_request();
+                            self.chat_widget.has_active_modal()
+                                || self.chat_widget.has_pending_protected_request();
                     }
                 }
             }

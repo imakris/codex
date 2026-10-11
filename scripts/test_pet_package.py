@@ -38,7 +38,6 @@ class PetPackageTests(unittest.TestCase):
                 entrypoint_bin=executable,
                 code_mode_host_bin=executable,
                 rg_bin=executable,
-                zsh_bin=executable if spec.is_linux else None,
                 bwrap_bin=executable if spec.is_linux else None,
                 codex_command_runner_bin=executable if spec.is_windows else None,
                 codex_windows_sandbox_setup_bin=executable if spec.is_windows else None,

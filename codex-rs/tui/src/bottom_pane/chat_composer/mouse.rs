@@ -12,10 +12,6 @@ use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 
 impl ChatComposer {
-    pub(in crate::bottom_pane) fn clear_mouse_selection(&mut self) {
-        self.draft.textarea.set_cursor(self.draft.textarea.cursor());
-    }
-
     pub(crate) fn can_paste_on_right_click(&self) -> bool {
         self.draft.input_enabled
             && !self.blocks_direct_input
@@ -64,6 +60,10 @@ impl ChatComposer {
             self.draft.textarea.set_cursor(self.draft.textarea.cursor());
         }
         Some((char_count, result))
+    }
+
+    pub(crate) fn clear_mouse_selection(&mut self) {
+        self.draft.textarea.set_cursor(self.draft.textarea.cursor());
     }
 
     pub(crate) fn end_mouse_drag(&mut self) {

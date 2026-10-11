@@ -3476,6 +3476,8 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
             let assistant_turn = format!("assistant turn {turn_number}");
             [
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText { text: user_turn }],
@@ -3483,9 +3485,13 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
                     internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
+                        annotations: None,
+                        logprobs: None,
                         text: assistant_turn,
                     }],
                     phase: None,
@@ -5751,7 +5757,7 @@ async fn inbound_handoff_request_updates_realtime_state_during_active_turn(
             text_elements: Vec::new(),
         }]))
         .await?;
-    let TurnInputSubmission::Started { turn_id } = started else {
+    let TurnInputSubmission::Started { turn_id, .. } = started else {
         panic!("expected the text input to start a turn");
     };
 
@@ -5867,7 +5873,13 @@ async fn inbound_handoff_request_updates_realtime_state_during_active_turn(
             text_elements: Vec::new(),
         }]))
         .await?;
-    assert_eq!(steered, TurnInputSubmission::Steered { turn_id });
+    assert_eq!(
+        steered,
+        TurnInputSubmission::Steered {
+            root_turn_id: turn_id.clone(),
+            turn_id
+        }
+    );
     let _ = second_completed_tx.send(());
     second_completion
         .await
