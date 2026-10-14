@@ -59,10 +59,10 @@ Python installer, release checks, and troubleshooting.
 
 ---
 
-## Original upstream README
+## Upstream Codex
 
-The original README follows in full. Its installation commands install official
-OpenAI Codex; use the commands above to install this fork.
+The following overview and links are from upstream Codex. Use the installation
+commands above for this fork.
 
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
@@ -79,57 +79,8 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ### Installing and running Codex CLI
 
-Run the following on Mac or Linux to install Codex CLI:
-
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-```
-
-Run the following on Windows to install Codex CLI:
-
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
-
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
-
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
-```
-
-```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
-```
-
-Codex CLI can also be installed via the following package managers:
-
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
-
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
-
-Then simply run `codex` to get started.
-
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
-
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
-
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
-
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
-
-</details>
+To install official OpenAI Codex, see the
+[upstream installation instructions](https://github.com/openai/codex#installing-and-running-codex-cli).
 
 ### Using Codex with your ChatGPT plan
 
