@@ -43,22 +43,14 @@ upstream npm packaging infrastructure. They are not published to npmjs.com.
 
 The [GitHub Actions workflow](https://github.com/imakris/codex/actions/workflows/pet-release.yml)
 is scheduled daily at **07:17 Berlin time** (`Europe/Berlin`) year-round, and also
-runs on branch pushes and manual dispatch. It integrates current upstream changes,
-keeps the complete fork delta in one commit directly atop that upstream tip, and builds
-Windows x64 and Linux x64 packages, runs twelve selected pet regression tests on
-each platform, and checks a fresh npm installation before publishing a release.
-The native executable reports the latest official stable Codex release version,
-resolved once when preparing the candidate and recorded in its release metadata.
-The npm package adds a `pet` build suffix; the clean installation check requires
-the native version to match the prepared release.
-Scheduled runs attempt a new release even when source is unchanged. Push and
-manual runs use separate release checks: a push skips before refreshing upstream
-when the fork tip already has a published release, while a manual run refreshes
-upstream and skips only a candidate already published with the same native version.
-Conflicts or failed checks leave the previous release available. GitHub can delay scheduled starts;
-publication follows successful verification. Verified promotion rewrites the fork
-branch with a lease on its exact previous tip; release tags and assets remain immutable.
-Existing source clones need the [resynchronization steps](PET_MAINTENANCE.md#source-clones).
+runs on branch pushes and manual dispatch. It integrates current upstream changes
+and publishes verified Windows x64 and Linux x64 packages. GitHub can delay
+scheduled starts; conflicts or failed checks leave the previous release available.
+
+The native executable reports the latest official stable Codex release version;
+the npm package adds a `pet` build suffix. The fork branch is rewritten after
+upstream updates, so existing source clones need the
+[resynchronization steps](PET_MAINTENANCE.md#source-clones).
 
 This happens on GitHub without your computer running. Installed copies do not
 update themselves; rerun the installation command to update. See
