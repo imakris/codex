@@ -305,6 +305,8 @@ pub(crate) enum AppEvent {
         notice: crate::security_setup::Notice,
     },
     OpenDaemonMenu,
+    ConfirmDaemonRestart,
+    RunDaemonRestart,
     ConfirmDaemonUpdate(crate::update_action::DaemonUpdateSource),
     RunDaemonUpdate(crate::update_action::DaemonUpdateSource),
     ReviewMisalignment(Arc<crate::chatwidget::MisalignmentReview>),
@@ -1320,6 +1322,11 @@ pub(crate) enum AppEvent {
         request_id: uuid::Uuid,
     },
     ModelsLoaded {
+        request_id: uuid::Uuid,
+        result: Result<Vec<ModelPreset>, String>,
+    },
+    /// Finished the API-key compatibility check; do not check the same catalog again.
+    ApiKeyCompatModelsLoaded {
         request_id: uuid::Uuid,
         result: Result<Vec<ModelPreset>, String>,
     },

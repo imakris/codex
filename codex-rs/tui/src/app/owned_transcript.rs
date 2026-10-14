@@ -1,7 +1,7 @@
 //! Compose the owned transcript above the composer and route their selection gestures.
 //! Reserve a cleared row below activity and previews, immediately above the composer.
 //! Slash suggestions overlay already-painted rows so opening or closing them leaves transcript
-//! geometry unchanged. Turn tips remain separate from selectable transcript text.
+//! geometry unchanged. Turn tips remain outside transcript history; their painted rows are selectable.
 //! Plain Enter returns an empty composer to latest after transcript interactions and prompt editing.
 
 use super::turn_tips::TipSurface;
@@ -37,6 +37,43 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Publish a completed composer selection with the transcript/footer copy policy.
+    fn handle_composer_selection_release(
+        &mut self,
+        tui: &mut tui::Tui,
+        event: crossterm::event::MouseEvent,
+    ) -> bool {
+        let selection_copy = crate::tui::SelectionCopy::on_select(
+            self.local_settings
+                .copy_on_select(&codex_terminal_detection::terminal_info()),
+            self.right_click_paste_environment.primary,
+            // Editable selections remain visible so the next input can replace them.
+            /*clear_selection*/
+            false,
+        );
+        if !selection_copy.copies_clipboard() && !selection_copy.publishes_primary() {
+            return false;
+        }
+        let Some((char_count, result)) = self.chat_widget.copy_composer_selection_on_release(
+            event,
+            selection_copy,
+            |text, selection_copy| {
+                tui.copy_selection(
+                    text,
+                    crate::clipboard_copy::CopyFormat::PlainText,
+                    selection_copy,
+                    text,
+                )
+            },
+        ) else {
+            return false;
+        };
+        if let Some(result) = result {
+            self.transcript_view.show_copy_feedback(&result, char_count);
+        }
+        true
     }
 
     fn sync_owned_transcript(&mut self, width: u16) -> bool {
@@ -97,7 +134,7 @@ impl App {
             .has_active_interaction()
         {
             Some(
-                ratatui::text::Line::from("Selecting footer · esc cancel")
+                ratatui::text::Line::from("Selecting text · esc cancel")
                     .dim()
                     .into(),
             )
@@ -194,6 +231,8 @@ impl App {
             );
             if let Some(gap) = composer_gap.as_mut() {
                 gap.needs_separator = available > 1
+                    // Keep the tip under the pointer when selection hints or copy feedback appear.
+                    && turn_tip.is_none()
                     && chat_widget.no_modal_or_popup_active()
                     && view.composer_gap_has_content(transcript_width, composer_hint.as_ref(), now);
             }
@@ -287,6 +326,14 @@ impl App {
             .filter(|_| chat_widget.no_modal_or_popup_active());
             feedback_tick =
                 view.render_composer_gap(follow_area, composer_hint.as_ref(), frame.buffer, now);
+            if let Some((_, tip)) = &turn_tip
+                && let Some(area) = tip.rendered.get()
+            {
+                chat_widget
+                    .rendered_selection
+                    .borrow_mut()
+                    .register(area, /*invalidate*/ false);
+            }
             chat_widget
                 .rendered_selection
                 .borrow_mut()
@@ -313,7 +360,7 @@ impl App {
             }
         })?;
         if let Some((surface, tip)) = &turn_tip
-            && tip.rendered.get()
+            && tip.rendered.get().is_some()
         {
             self.turn_tips.acknowledge(*surface);
         }
@@ -424,6 +471,7 @@ impl App {
                 return Ok(true);
             }
             if composer_ready && self.chat_widget.handle_composer_mouse(*mouse) {
+                self.handle_composer_selection_release(tui, *mouse);
                 if !matches!(
                     mouse.kind,
                     crossterm::event::MouseEventKind::ScrollUp
