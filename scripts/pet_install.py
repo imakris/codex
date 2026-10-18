@@ -105,6 +105,9 @@ def install(install_dir, state_dir):
     system = {"Windows": "win32", "Linux": "linux"}.get(platform.system())
     if system is None or platform.machine().lower() not in ("amd64", "x86_64"):
         raise ValueError("Published Codex pet packages support Windows/Linux x64.")
+    explicit_install_dir = install_dir is not None
+    if not explicit_install_dir:
+        install_dir = Path.home() / ".local/share/codex-pet/releases"
     install_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
     with installation_lock(state_dir / "install.lock"):
@@ -141,7 +144,18 @@ def install(install_dir, state_dir):
                 current = json.loads(current_path.read_text(encoding="utf-8"))
                 if (current.get("release") == tag and Path(current["binary"]).is_file()
                         and digest(Path(current["binary"])) == current["sha256"]):
-                    return current
+                    if not explicit_install_dir:
+                        return current
+                    try:
+                        installed_path = Path(current["binary"]).resolve().relative_to(
+                            install_dir.resolve())
+                    except ValueError:
+                        pass
+                    else:
+                        # Each release occupies one direct child of its destination.
+                        # An ancestor of that destination is a relocation request too.
+                        if installed_path.parts[1:] == PurePosixPath(asset["binary"]).parts:
+                            return current
             archive = staging / name
             download(urls[name], archive)
             verify(archive, checksums)
@@ -186,8 +200,7 @@ def install(install_dir, state_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--install-dir", type=Path,
-                        default=Path.home() / ".local/share/codex-pet/releases")
+    parser.add_argument("--install-dir", type=Path)
     parser.add_argument("--state-dir", type=Path,
                         default=Path.home() / ".local/state/codex-pet")
     parser.add_argument("action", choices=["install", "update", "launch", "status"])
@@ -196,7 +209,8 @@ def main():
     if args.action in ("install", "update"):
         status_path = args.state_dir / "status.json"
         try:
-            manifest = install(args.install_dir.resolve(), args.state_dir.resolve())
+            install_dir = args.install_dir.resolve() if args.install_dir is not None else None
+            manifest = install(install_dir, args.state_dir.resolve())
         except Exception as error:
             atomic_json(status_path, {"phase": "failed", "error": str(error),
                                       "checked_at": datetime.now(timezone.utc).isoformat()})

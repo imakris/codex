@@ -31,7 +31,7 @@ class InstallTests(unittest.TestCase):
         self.package_name = "codex-pet-win32-x64.tgz"
         self.make_assets()
 
-    def make_assets(self, member=None, system="win32"):
+    def make_assets(self, member=None, system="win32", version="0.0.0-pet.17"):
         target = "x86_64-pc-windows-msvc" if system == "win32" else "x86_64-unknown-linux-musl"
         self.binary_path = f"vendor/{target}/bin/codex" + (".exe" if system == "win32" else "")
         self.package_name = f"codex-pet-{system}-x64.tgz"
@@ -50,7 +50,7 @@ class InstallTests(unittest.TestCase):
                 entry.size = len(content)
                 archive.addfile(entry, io.BytesIO(content))
         metadata = {
-            "version": "0.0.0-pet.17", "commit": "candidate", "upstream": "upstream",
+            "version": version, "commit": "candidate", "upstream": "upstream",
             "repository": "imakris/codex",
             "assets": [{"name": self.package_name, "os": system, "arch": "x64",
                         "binary": self.binary_path}],
@@ -60,7 +60,7 @@ class InstallTests(unittest.TestCase):
         (self.assets / "SHA256SUMS").write_text("".join(
             f"{hashlib.sha256((self.assets / name).read_bytes()).hexdigest()}  {name}\n"
             for name in names))
-        release = {"tag_name": "pet-v0.0.0-pet.17-candidate", "draft": False, "prerelease": False,
+        release = {"tag_name": f"pet-v{version}-candidate", "draft": False, "prerelease": False,
                    "assets": [{"name": name, "browser_download_url": name}
                               for name in [*names, "SHA256SUMS"]]}
         (self.assets / "github.json").write_text(json.dumps(release))
@@ -69,21 +69,107 @@ class InstallTests(unittest.TestCase):
         name = "github.json" if url.endswith("/latest") else url
         shutil.copyfile(self.assets / name, destination)
 
-    def run_install(self, smoke_error=None, system="Windows"):
+    def run_install(self, smoke_error=None, system="Windows", arguments=None):
         with (patch.object(pet_install, "download", side_effect=self.download),
               patch.object(pet_install.platform, "system", return_value=system),
               patch.object(pet_install.platform, "machine", return_value="AMD64"),
               patch.object(pet_install.subprocess, "run", side_effect=smoke_error,
                            return_value=subprocess.CompletedProcess([], 0, "codex 0.0.0"))):
-            return pet_install.install(self.install_dir, self.state_dir)
+            if arguments is None:
+                return pet_install.install(self.install_dir, self.state_dir)
+            output = io.StringIO()
+            argv = ["pet_install.py", "--state-dir", str(self.state_dir), *arguments]
+            with (patch.object(pet_install.sys, "argv", argv),
+                  patch.object(pet_install.sys, "stdout", output),
+                  patch.object(Path, "home", return_value=self.root / "home")):
+                self.assertEqual(pet_install.main(), 0)
+            return json.loads(output.getvalue())
 
     def test_install_and_repeat_preserve_immutable_binary(self):
         first = self.run_install()
         self.assertEqual(Path(first["binary"]).read_bytes(), b"codex fixture binary")
         self.assertEqual(json.loads(self.current.read_text()), first)
-        second = self.run_install()
+        second = self.run_install(smoke_error=AssertionError("Existing installation was rebuilt"))
         self.assertEqual(first, second)
         self.assertEqual(len(list(self.install_dir.iterdir())), 1)
+
+    def test_explicit_destination_relocates_current_release(self):
+        for action in ("install", "update"):
+            with self.subTest(action=action):
+                first = self.run_install()
+                first_binary = Path(first["binary"])
+                self.install_dir = self.root / action
+
+                second = self.run_install(arguments=["--install-dir", str(self.install_dir), action])
+
+                second_binary = Path(second["binary"])
+                self.assertTrue(second_binary.is_relative_to(self.install_dir))
+                self.assertEqual(second_binary.read_bytes(), first_binary.read_bytes())
+                self.assertTrue((second_binary.parent.parent / "codex-path/rg.exe").is_file())
+                self.assertTrue((first_binary.parent.parent / "codex-path/rg.exe").is_file())
+                self.assertEqual(second["release"], first["release"])
+                self.assertEqual(json.loads(self.current.read_text()), second)
+
+    def test_equivalent_destination_reuses_current_release(self):
+        first = self.run_install()
+        equivalent = self.install_dir / ".." / self.install_dir.name
+
+        second = self.run_install(
+            smoke_error=AssertionError("Existing installation was rebuilt"),
+            arguments=["--install-dir", str(equivalent), "update"])
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(list(self.install_dir.iterdir())), 1)
+
+    def test_ancestor_destination_relocates_current_release(self):
+        first = self.run_install()
+
+        second = self.run_install(arguments=["--install-dir", str(self.root), "update"])
+
+        self.assertNotEqual(first["binary"], second["binary"])
+        installed_path = Path(second["binary"]).relative_to(self.root)
+        self.assertEqual(installed_path.parts[1:], Path(self.binary_path).parts)
+        self.assertEqual(json.loads(self.current.read_text()), second)
+
+    def test_failed_relocation_preserves_current_install(self):
+        first = self.run_install()
+        destination = self.root / "relocated"
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_install(
+                smoke_error=subprocess.CalledProcessError(1, "codex"),
+                arguments=["--install-dir", str(destination), "update"])
+
+        self.assertEqual(json.loads(self.current.read_text()), first)
+        self.assertEqual(Path(first["binary"]).read_bytes(), b"codex fixture binary")
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_omitted_destination_reuses_current_release(self):
+        first = self.run_install()
+
+        for action in ("install", "update"):
+            with self.subTest(action=action):
+                second = self.run_install(
+                    smoke_error=AssertionError("Existing installation was rebuilt"),
+                    arguments=[action])
+
+                self.assertEqual(first, second)
+                self.assertEqual(json.loads(self.current.read_text()), first)
+                self.assertEqual(len(list(self.install_dir.iterdir())), 1)
+
+    def test_omitted_destination_installs_new_release_in_default_directory(self):
+        default_dir = self.root / "home/.local/share/codex-pet/releases"
+        for index, action in enumerate(("install", "update"), start=18):
+            with self.subTest(action=action):
+                first = self.run_install()
+                self.make_assets(version=f"0.0.0-pet.{index}")
+
+                second = self.run_install(arguments=[action])
+
+                self.assertNotEqual(first["release"], second["release"])
+                self.assertTrue(Path(second["binary"]).is_relative_to(default_dir))
+                self.assertEqual(json.loads(self.current.read_text()), second)
+                self.assertEqual(Path(first["binary"]).read_bytes(), b"codex fixture binary")
 
     def test_bad_checksum_preserves_current_install(self):
         (self.assets / self.package_name).write_bytes(b"damaged download")
