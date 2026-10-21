@@ -70,6 +70,20 @@ class PetPackageTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Missing package file"):
             pet_package.stage_package(canonical, self.root / "stage", "x86_64-pc-windows-msvc", "1.2.3")
 
+    def test_linux_package_includes_bubblewrap_license_and_matching_source(self):
+        target = "x86_64-unknown-linux-musl"
+        stage = self.root / "stage"
+        with patch.dict(os.environ, {"STABLE_GIT_COMMIT": "prepared-source"}):
+            pet_package.stage_package(self.canonical_package(target), stage, target, "1.2.3")
+        self.assertEqual(
+            (stage / "vendor" / target / "codex-resources/bubblewrap-COPYING").read_bytes(),
+            (pet_package.REPO_ROOT / "codex-rs/vendor/bubblewrap/COPYING").read_bytes(),
+        )
+        notice = (stage / "NOTICE").read_text(encoding="utf-8")
+        self.assertIn("https://github.com/imakris/codex/archive/prepared-source.tar.gz", notice)
+        self.assertIn("CODEX_BWRAP_SOURCE_DIR", notice)
+        self.assertIn("CODEX_BWRAP_SHA256", notice)
+
     def test_wrong_target_rejects_package(self):
         with self.assertRaisesRegex(RuntimeError, "Invalid package metadata field 'target'"):
             pet_package.stage_package(

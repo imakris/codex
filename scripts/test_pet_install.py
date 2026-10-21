@@ -18,7 +18,7 @@ class InstallTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.assets = self.root / "assets"
         self.assets.mkdir()
         self.install_dir = self.root / "installed"

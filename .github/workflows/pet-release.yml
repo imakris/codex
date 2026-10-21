@@ -66,6 +66,7 @@ jobs:
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_RELEASE_LTO: "false"
       CARGO_PROFILE_RELEASE_DEBUG: 0
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C link-arg=/DEBUG:NONE"
       RUST_MIN_STACK: 8388608
       TARGET: ${{ matrix.target }}
       CODEX_REPO_ROOT: ${{ github.workspace }}
@@ -92,8 +93,21 @@ jobs:
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
         with:
           node-version: 24
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+      - name: Read workspace Rust toolchain
+        id: rust-toolchain
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+
+          toolchain = tomllib.loads(Path("codex-rs/rust-toolchain.toml").read_text(encoding="utf-8"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"channel={toolchain['toolchain']['channel']}\n")
+          PY
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
         with:

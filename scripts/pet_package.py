@@ -18,6 +18,7 @@ os.environ.setdefault("CODEX_REPO_ROOT", str(REPO_ROOT))
 from codex_package.cli import parse_package_version
 from codex_package.layout import validate_package_dir
 from codex_package.targets import PACKAGE_VARIANTS, TARGET_SPECS
+from pet_payload import inspect_package
 
 TARGETS = {
     "x86_64-pc-windows-msvc": "win32",
@@ -46,6 +47,30 @@ def stage_package(package_dir: Path, staging_dir: Path, target: str, version: st
     shutil.copytree(package_dir, staging_dir / "vendor" / target)
     shutil.copy2(REPO_ROOT / "LICENSE", staging_dir / "LICENSE")
     shutil.copy2(REPO_ROOT / "NOTICE", staging_dir / "NOTICE")
+    if spec.is_linux:
+        resources = staging_dir / "vendor" / target / "codex-resources"
+        shutil.copyfile(
+            REPO_ROOT / "codex-rs/vendor/bubblewrap/COPYING",
+            resources / "bubblewrap-COPYING",
+        )
+        source_commit = os.environ.get("STABLE_GIT_COMMIT") or subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
+        ).strip()
+        with (staging_dir / "NOTICE").open("a", encoding="utf-8") as notice:
+            notice.write(
+                "\nBubblewrap is included under LGPL-2.0-or-later; "
+                f"see vendor/{target}/codex-resources/bubblewrap-COPYING.\n"
+                f"Matching source: https://github.com/imakris/codex/archive/{source_commit}.tar.gz\n"
+                "The separate source archive includes vendored bubblewrap, its Rust wrapper, "
+                "Cargo.lock and the build recipe in .github/workflows/pet-release.yml.\n"
+                "To rebuild, set [workspace.package].version in codex-rs/Cargo.toml to the "
+                f"native version {version.partition('-')[0]}, then run "
+                "cargo update --workspace in codex-rs.\n"
+                "For a modified bubblewrap, set CODEX_BWRAP_SOURCE_DIR and build bwrap using "
+                "the target and Release command in that recipe. Rebuild Codex with "
+                "CODEX_BWRAP_SHA256 set to that helper's SHA-256, then replace both "
+                "vendor/<target>/codex-resources/bwrap and vendor/<target>/bin/codex.\n"
+            )
 
     package_json = staging_dir / "package.json"
     package = json.loads(package_json.read_text(encoding="utf-8"))
@@ -168,6 +193,7 @@ def main() -> int:
         tarball = pack_package(
             staging, args.output_dir / f"codex-pet-{TARGETS[args.target]}-x64.tgz"
         )
+        inspect_package(staging, tarball, args.target)
         if args.smoke:
             smoke(tarball, Path(temporary) / "installed", args.target, args.version)
         print(tarball)
