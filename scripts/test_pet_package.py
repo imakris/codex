@@ -73,7 +73,9 @@ class PetPackageTests(unittest.TestCase):
     def test_linux_package_includes_bubblewrap_license_and_matching_source(self):
         target = "x86_64-unknown-linux-musl"
         stage = self.root / "stage"
-        with patch.dict(os.environ, {"STABLE_GIT_COMMIT": "prepared-source"}):
+        # Windows cannot preserve Unix executable modes on this Linux-only fixture.
+        with patch.dict(os.environ, {"STABLE_GIT_COMMIT": "prepared-source"}), \
+                patch("codex_package.layout.is_executable", return_value=True):
             pet_package.stage_package(self.canonical_package(target), stage, target, "1.2.3")
         self.assertEqual(
             (stage / "vendor" / target / "codex-resources/bubblewrap-COPYING").read_bytes(),
