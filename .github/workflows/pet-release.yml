@@ -5,8 +5,6 @@ on:
   schedule:
     - cron: "17 7 * * *"
       timezone: "Europe/Berlin"
-  push:
-    branches: [pet-composer-layout]
 
 permissions:
   contents: read
