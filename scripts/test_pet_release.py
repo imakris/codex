@@ -47,9 +47,8 @@ class ReleaseTests(unittest.TestCase):
                     "GITHUB_RUN_ATTEMPT": "1",
                     "GITHUB_REPOSITORY": "imakris/codex",
                 }
-                tree = "e" * 40
                 commands = [None, candidate, None, None, self.metadata["upstream"],
-                            None, None, None, tree, self.metadata["upstream"], tree, None]
+                            None, None, None, candidate]
                 with patch.dict(os.environ, environment), \
                         patch.object(pet_release, "run", side_effect=commands), \
                         patch.object(pet_release, "api", side_effect=lambda path, repository=None:
@@ -123,12 +122,10 @@ class ReleaseTests(unittest.TestCase):
             pet_release.publish(self.directory, self.directory)
         commands = [call.args for call in run.call_args_list]
         self.assertEqual(commands[2], (
-            "git", "push", f"--force-with-lease=refs/heads/{pet_release.BRANCH}:{self.metadata['base']}",
-            "origin", f"{self.metadata['commit']}:refs/heads/{pet_release.BRANCH}",
+            "git", "push", "origin", f"{self.metadata['commit']}:refs/heads/{pet_release.BRANCH}",
         ))
         self.assertIn("--draft", commands[3])
         self.assertEqual(commands[4][-2:], ("--draft=false", "--latest"))
-        self.assertNotIn("--force", commands[2])
         sums = (self.directory / "SHA256SUMS").read_text()
         self.assertIn("  release.json\n", sums)
         self.assertIn("  pet_install.py\n", sums)
@@ -224,8 +221,7 @@ class GitFixture:
         return metadata, actual, [call.args for call in run.call_args_list]
 
     def promote(self, metadata):
-        self.git(self.runner, "push", f"--force-with-lease=refs/heads/{pet_release.BRANCH}:{metadata['base']}",
-                 "origin", f"{metadata['commit']}:refs/heads/{pet_release.BRANCH}")
+        self.git(self.runner, "push", "origin", f"{metadata['commit']}:refs/heads/{pet_release.BRANCH}")
 
     def assets(self):
         directory = self.directory / "assets"
@@ -236,11 +232,9 @@ class GitFixture:
 
 
 class PreparationGitTests(unittest.TestCase):
-    def assert_compact(self, fixture, metadata):
-        self.assertEqual(fixture.git(fixture.runner, "rev-parse", metadata["commit"] + "^@"),
-                         metadata["upstream"])
-        self.assertEqual(fixture.git(fixture.runner, "rev-list", "--count",
-                                    f"{metadata['upstream']}..{metadata['commit']}"), "1")
+    def assert_integrated(self, fixture, metadata):
+        fixture.git(fixture.runner, "merge-base", "--is-ancestor", metadata["base"], metadata["commit"])
+        fixture.git(fixture.runner, "merge-base", "--is-ancestor", metadata["upstream"], metadata["commit"])
 
     def test_advanced_upstream_preserves_trigger_admission(self):
         cases = [
@@ -274,13 +268,13 @@ class PreparationGitTests(unittest.TestCase):
                     self.assertEqual(metadata["base"], base)
                     self.assertEqual(metadata["upstream"], advanced)
                     self.assertEqual(metadata["commit"], fixture.git(fixture.runner, "rev-parse", "HEAD"))
-                    self.assert_compact(fixture, metadata)
+                    self.assert_integrated(fixture, metadata)
                     self.assertEqual((fixture.runner / "pet.txt").read_text(), "published fork change\n")
                     self.assertEqual((fixture.runner / "upstream.txt").read_text(), "advanced upstream\n")
                     if tip == "human":
                         self.assertEqual((fixture.runner / "human.txt").read_text(), "new human change\n")
 
-    def test_compaction_preserves_prior_conflict_resolution_and_human_changes(self):
+    def test_merge_preserves_prior_conflict_resolution_and_human_changes(self):
         fixture = GitFixture(self)
         fixture.commit(fixture.fork, "shared.txt", "fork version\n", "Fork customization")
         upstream = fixture.commit(fixture.upstream, "shared.txt", "upstream version\n", "Upstream customization")
@@ -298,23 +292,24 @@ class PreparationGitTests(unittest.TestCase):
         expected_tree = fixture.git(expected, "rev-parse", "HEAD^{tree}")
         metadata, output, _ = fixture.prepare()
         self.assertEqual(output["build"], "true")
-        self.assert_compact(fixture, metadata)
+        self.assert_integrated(fixture, metadata)
         self.assertEqual(fixture.git(fixture.runner, "rev-parse", "HEAD^{tree}"), expected_tree)
         self.assertEqual((fixture.runner / "shared.txt").read_text(), "retained conflict resolution\n")
         self.assertEqual((fixture.runner / "human.txt").read_text(), "new human change\n")
 
-    def test_repeated_upstream_refresh_keeps_one_fork_commit(self):
+    def test_repeated_upstream_refresh_preserves_published_history(self):
         fixture = GitFixture(self)
         latest = None
         for index in (1, 2):
             with self.subTest(refresh=index):
                 fixture.commit(fixture.upstream, "upstream.txt", f"upstream version {index}\n", "Advance upstream")
                 metadata, _, _ = fixture.prepare(latest=latest)
-                self.assert_compact(fixture, metadata)
+                self.assert_integrated(fixture, metadata)
+                fixture.git(fixture.runner, "merge-base", "--is-ancestor", fixture.published, metadata["commit"])
                 fixture.promote(metadata)
                 latest = {"tag_name": metadata["tag"]}
 
-    def test_unchanged_compact_source_reuses_identity_and_release_cadence(self):
+    def test_unchanged_source_reuses_identity_and_release_cadence(self):
         fixture = GitFixture(self)
         metadata, _, _ = fixture.prepare()
         fixture.promote(metadata)
@@ -328,13 +323,12 @@ class PreparationGitTests(unittest.TestCase):
                     self.assertEqual(repeated["base"], metadata["commit"])
                     self.assertFalse((fixture.candidate / "candidate.bundle").exists())
 
-    def test_non_descendant_candidate_bundle_restores_exact_source(self):
+    def test_candidate_bundle_restores_exact_integrated_source(self):
         fixture = GitFixture(self)
         fixture.commit(fixture.fork, "human.txt", "new human change\n", "New human change")
         fixture.commit(fixture.upstream, "upstream.txt", "advanced upstream\n", "Advance upstream")
         metadata, _, _ = fixture.prepare()
-        with self.assertRaises(subprocess.CalledProcessError):
-            fixture.git(fixture.runner, "merge-base", "--is-ancestor", metadata["base"], metadata["commit"])
+        self.assert_integrated(fixture, metadata)
         builder = fixture.directory / "builder"
         fixture.git(fixture.directory, "clone", "--branch", pet_release.BRANCH, fixture.fork, builder)
         fixture.git(builder, "bundle", "verify", fixture.candidate / "candidate.bundle")
@@ -357,7 +351,7 @@ class PreparationGitTests(unittest.TestCase):
         self.assertEqual(repeated["version"], "0.161.0-pet.2.1")
         self.assertEqual(fixture.git(fixture.runner, "status", "--porcelain"), "")
 
-    def test_guarded_rewrite_promotes_candidate_and_preserves_release_tag(self):
+    def test_fast_forward_promotes_candidate_and_preserves_release_tag(self):
         fixture = GitFixture(self)
         fixture.git(fixture.fork, "tag", "previous-release", fixture.published)
         fixture.commit(fixture.upstream, "upstream.txt", "advanced upstream\n", "Advance upstream")
@@ -370,7 +364,7 @@ class PreparationGitTests(unittest.TestCase):
         self.assertEqual([command[:3] for command in commands if command[0] == "gh"],
                          [("gh", "release", "create"), ("gh", "release", "edit")])
 
-    def test_guarded_rewrite_preserves_concurrent_fork_changes(self):
+    def test_fast_forward_preserves_concurrent_fork_changes(self):
         for stage in ("before-check", "after-check"):
             with self.subTest(stage=stage):
                 fixture = GitFixture(self)

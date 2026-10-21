@@ -30,6 +30,7 @@ use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::error::CodexErr;
+use codex_protocol::mcp_approval_meta::McpApprovalCancellationReason;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::AskForApproval;
@@ -86,6 +87,8 @@ pub(crate) enum ApprovalAction {
         tty: bool,
         sandbox_permissions: SandboxPermissions,
         additional_permissions: Option<AdditionalPermissionProfile>,
+        #[serde(skip)]
+        additional_permissions_preapproved: bool,
     },
     ApplyPatch {
         id: String,
@@ -167,6 +170,7 @@ impl ApprovalAction {
                 tty,
                 sandbox_permissions,
                 additional_permissions,
+                additional_permissions_preapproved: _,
             } => PermissionRequestPayload {
                 tool_name: HookToolName::new("write_stdin"),
                 tool_input: serde_json::json!({
@@ -299,6 +303,7 @@ impl ApprovalAction {
                 tty,
                 sandbox_permissions,
                 additional_permissions,
+                additional_permissions_preapproved: _,
             } => crate::guardian::GuardianApprovalRequest::WriteStdin {
                 id,
                 approval_id,
@@ -400,12 +405,14 @@ pub(crate) enum ApprovalResolutionSource {
 pub(crate) struct ApprovalResult {
     pub(crate) result: Result<ReviewDecision, ToolError>,
     pub(crate) source: Option<ApprovalResolutionSource>,
+    pub(crate) cancellation_reason: Option<McpApprovalCancellationReason>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ApprovalResolution {
-    decision: ReviewDecision,
-    source: ApprovalResolutionSource,
+pub(crate) struct ApprovalResolution {
+    pub(crate) decision: ReviewDecision,
+    pub(crate) source: ApprovalResolutionSource,
+    pub(crate) cancellation_reason: Option<McpApprovalCancellationReason>,
 }
 
 impl ApprovalResolution {
@@ -449,11 +456,12 @@ impl Session {
         action: ApprovalAction,
         ctx: ApprovalContext,
     ) -> ApprovalResult {
-        // Stdin that exceeds current permissions needs a fresh sandbox approval.
-        // Strict review of ordinary input follows the same routing as ordinary exec.
+        // Retained authority outside current grants needs a new sandbox approval.
+        // Current grants permit review of the input; they never approve the input itself.
         let policy = ctx.review_context.turn().approval_policy();
-        if matches!(&action, ApprovalAction::WriteStdin { sandbox_permissions, .. }
-            if sandbox_permissions.requests_sandbox_override())
+        if matches!(&action, ApprovalAction::WriteStdin { sandbox_permissions, additional_permissions_preapproved, .. }
+            if sandbox_permissions.requests_sandbox_override()
+                && (!additional_permissions_preapproved || matches!(policy, AskForApproval::Never)))
             && !(ctx.strict_auto_review && matches!(policy, AskForApproval::Never))
             && let Some(reason) =
                 prompt_is_rejected_by_policy(policy, /*prompt_is_rule*/ false)
@@ -461,6 +469,7 @@ impl Session {
             return ApprovalResult {
                 result: Err(ToolError::Rejected(reason.to_string())),
                 source: None,
+                cancellation_reason: None,
             };
         }
         let is_mcp_tool_call = matches!(&action, ApprovalAction::McpToolCall { .. });
@@ -485,10 +494,12 @@ impl Session {
             Some(PermissionRequestDecision::Allow) => ApprovalResolution {
                 decision: ReviewDecision::Approved,
                 source: ApprovalResolutionSource::Hook,
+                cancellation_reason: None,
             },
             Some(PermissionRequestDecision::Deny { message }) => ApprovalResolution {
                 decision: ReviewDecision::denied(message),
                 source: ApprovalResolutionSource::Hook,
+                cancellation_reason: None,
             },
             None => self.request_reviewer_approval(action, &ctx).await,
         };
@@ -497,10 +508,12 @@ impl Session {
             record_resolution(&ctx, &resolution);
         }
         let source = Some(resolution.source);
+        let cancellation_reason = resolution.cancellation_reason;
         if is_mcp_tool_call && resolution.decision == ReviewDecision::ApprovedMcpPolicyAmendment {
             return ApprovalResult {
                 result: Ok(resolution.decision),
                 source,
+                cancellation_reason,
             };
         }
         if is_network_approval {
@@ -514,6 +527,7 @@ impl Session {
                     return ApprovalResult {
                         result: Ok(resolution.decision),
                         source,
+                        cancellation_reason,
                     };
                 }
                 (ReviewDecision::Abort, ApprovalResolutionSource::Guardian) => {
@@ -522,6 +536,7 @@ impl Session {
                             "automatic approval review was cancelled".to_string(),
                         )),
                         source,
+                        cancellation_reason,
                     };
                 }
                 _ => {}
@@ -530,6 +545,7 @@ impl Session {
         ApprovalResult {
             result: resolution.into_tool_result(ctx.review_context.turn().model_info()),
             source,
+            cancellation_reason,
         }
     }
 
@@ -540,14 +556,13 @@ impl Session {
     ) -> ApprovalResolution {
         if let Some(decision) = self.request_guardian_approval(action.clone(), ctx).await {
             ApprovalResolution {
+                cancellation_reason: (decision == ReviewDecision::Abort)
+                    .then_some(McpApprovalCancellationReason::Interrupted),
                 decision,
                 source: ApprovalResolutionSource::Guardian,
             }
         } else {
-            ApprovalResolution {
-                decision: self.request_user_approval(&action, ctx).await,
-                source: ApprovalResolutionSource::User,
-            }
+            self.request_user_approval(&action, ctx).await
         }
     }
 
@@ -662,8 +677,8 @@ impl Session {
         &self,
         action: &ApprovalAction,
         ctx: &ApprovalContext,
-    ) -> ReviewDecision {
-        match action {
+    ) -> ApprovalResolution {
+        let decision = match action {
             ApprovalAction::ExecCommand {
                 environment_id,
                 command,
@@ -755,44 +770,43 @@ impl Session {
                     .clone()
                     .or_else(|| ctx.approval_reason.clone());
                 if *permissions_preapproved && reason.is_none() {
-                    return ReviewDecision::Approved;
+                    ReviewDecision::Approved
+                } else if reason.is_some() {
+                    self.request_patch_approval(
+                        ctx.review_context.turn(),
+                        ctx.call_id.clone(),
+                        changes.as_ref().clone(),
+                        reason,
+                        /*grant_root*/ None,
+                    )
+                    .await
+                } else {
+                    with_cached_approval(
+                        &self.services,
+                        "apply_patch",
+                        action.cache_keys(),
+                        || async {
+                            self.request_patch_approval(
+                                ctx.review_context.turn(),
+                                ctx.call_id.clone(),
+                                changes.as_ref().clone(),
+                                /*reason*/ None,
+                                /*grant_root*/ None,
+                            )
+                            .await
+                        },
+                    )
+                    .await
                 }
-                if reason.is_some() {
-                    return self
-                        .request_patch_approval(
-                            ctx.review_context.turn(),
-                            ctx.call_id.clone(),
-                            changes.as_ref().clone(),
-                            reason,
-                            /*grant_root*/ None,
-                        )
-                        .await;
-                }
-                with_cached_approval(
-                    &self.services,
-                    "apply_patch",
-                    action.cache_keys(),
-                    || async {
-                        self.request_patch_approval(
-                            ctx.review_context.turn(),
-                            ctx.call_id.clone(),
-                            changes.as_ref().clone(),
-                            /*reason*/ None,
-                            /*grant_root*/ None,
-                        )
-                        .await
-                    },
-                )
-                .await
             }
             ApprovalAction::McpToolCall { .. } => {
-                request_mcp_tool_user_approval(
+                return request_mcp_tool_user_approval(
                     self,
                     ctx.review_context.turn(),
                     &ctx.call_id,
                     action,
                 )
-                .await
+                .await;
             }
             ApprovalAction::NetworkAccess {
                 environment_id,
@@ -821,6 +835,11 @@ impl Session {
             ApprovalAction::RequestPermissions { .. } => {
                 unreachable!("permission requests are routed directly to Guardian")
             }
+        };
+        ApprovalResolution {
+            decision,
+            source: ApprovalResolutionSource::User,
+            cancellation_reason: None,
         }
     }
 }

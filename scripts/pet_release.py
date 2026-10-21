@@ -23,10 +23,15 @@ REQUIRED_TESTS = [
     "chatwidget::tests::status_and_layout::ambient_pet_hides_notification_text_overlay",
     "pets::ambient::tests::ambient_sprite_only_clears_its_own_rows",
     "pets::tests::clearing_before_frame_clips_old_sprite_after_terminal_resize",
+    "pets::tests::kitty_local_file_pet_image_uses_file_reference_without_inline_payload",
     "tui::tests::synchronized_frame_keeps_clear_text_and_sprite_in_one_update",
     "tui::tests::synchronized_frame_finishes_after_draw_error",
 ]
-TEST_FILTER = " | ".join(f"test(={name})" for name in REQUIRED_TESTS)
+TEST_FILTER = " | ".join([
+    *(f"test(={name})" for name in REQUIRED_TESTS),
+    "test(bottom_pane::async_questions::)",
+    "test(bottom_pane::question_tests::)",
+])
 
 
 BRANCH = "pet-composer-layout"
@@ -95,15 +100,7 @@ def prepare(directory):
     run("git", "config", "user.name", "github-actions[bot]")
     run("git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
     run("git", "merge", "--no-edit", upstream)
-    tree = run("git", "rev-parse", "HEAD^{tree}", capture=True)
-    parents = run("git", "rev-parse", base + "^@", capture=True).splitlines()
-    # Reuse the maintained compact tip when its upstream parent and integrated tree are unchanged.
-    if parents == [upstream] and tree == run("git", "rev-parse", base + "^{tree}", capture=True):
-        candidate = base
-    else:
-        candidate = run("git", "commit-tree", tree, "-p", upstream,
-                        "-m", "Apply pet fork changes", capture=True)
-    run("git", "checkout", "--detach", candidate)
+    candidate = run("git", "rev-parse", "HEAD", capture=True)
     # A new official native version needs a build even when the source candidate is unchanged.
     unchanged = (latest is not None and latest["tag_name"].endswith("-" + candidate)
                  and latest["tag_name"].startswith(f"pet-v{native_version}-pet."))
@@ -187,14 +184,16 @@ def publish(directory, assets_dir):
     actual = run("git", "rev-parse", "FETCH_HEAD", capture=True)
     if actual != metadata["base"]:
         raise RuntimeError("Fork changed during verification; rerun against its new tip")
-    # Compact history rewrites are authorized only while the remote still has this exact base.
-    run("git", "push", f"--force-with-lease=refs/heads/{BRANCH}:{metadata['base']}",
-        "origin", f"{metadata['commit']}:refs/heads/{BRANCH}")
+    run("git", "push", "origin", f"{metadata['commit']}:refs/heads/{BRANCH}")
     notes = assets_dir / "notes.md"
     notes.write_text(
         f"Pet layout fork, source `{metadata['commit']}`, upstream `{metadata['upstream']}`.\n\n"
         f"Native Codex version `{metadata['native_version']}` matches official release "
         f"`{metadata['upstream_release']}`.\n\n"
+        f"[Matching source archive](https://github.com/{metadata['repository']}/archive/{metadata['commit']}.tar.gz) "
+        "includes vendored bubblewrap source, dependency lockfiles and build scripts. "
+        "Use the native version recorded in release.json with the stamp and build steps in "
+        "`.github/workflows/pet-release.yml` to rebuild these packages.\n\n"
         "Windows x64 and Linux x64 packages passed the pet regression tests and clean npm installation smoke checks.\n\n"
         "Install or update (choose your platform):\n\n"
         "```sh\n"

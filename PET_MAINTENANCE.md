@@ -60,14 +60,14 @@ themselves; rerun an update command or schedule the download-only updater.
 
 A push run first checks the current fork tip against the latest published
 release and skips before fetching upstream when that tip is already released.
-Other runs capture the fork and current upstream commits and three-way merge
-their source trees, preserving all net fork changes and prior conflict resolutions.
-A conflict stops before builds. The integrated tree becomes one unpublished
-fork commit whose sole parent is the captured upstream tip, so repeated upstream
-refreshes do not accumulate fork commits. If the maintained tip already has
-that parent and tree, its source identity is reused. The exact candidate
-is transferred to both builders using a Git bundle. Each builder checks the
-required pet regression test inventory, runs all twelve tests through `just test`,
+Other runs capture the fork and current upstream commits and merge
+their history, preserving all fork changes and prior conflict resolutions.
+A conflict stops before builds. The unpublished candidate retains both histories
+and can advance the fork through an ordinary fast-forward push. When upstream
+is already integrated, the maintained tip's source identity is reused. The exact
+candidate is transferred to both builders using a Git bundle. Each builder checks
+the required pet regression test inventory and runs it together with the inline
+question tests through `just test`,
 builds the canonical native package, and smoke-tests a fresh npm installation.
 Preparation captures the latest official stable `rust-v` release tag. Builders
 stamp its version into the Rust workspace and refresh workspace lockfile versions
@@ -80,13 +80,13 @@ and hashed before the CLI build, following upstream's package integrity contract
 Build dependencies and checksum-verified V8 artifacts reuse upstream tooling.
 
 Only after both platforms pass does the final job check that the fork has not
-changed, promote with an explicit `--force-with-lease` on that exact previous tip,
+changed, promote through an ordinary fast-forward push,
 upload the complete assets to a draft,
 and publish it as the latest release. A build failure leaves the branch and
 previous release intact. A publication failure can leave a verified branch
-rewrite or draft; it does not replace the latest successful release. The lease
-also rejects a concurrent update arriving after the final check. Existing
-release tags and assets remain immutable even when the branch is rewritten. A later
+advance or draft; it does not replace the latest successful release. Git
+rejects a conflicting concurrent update arriving after the final check. Existing
+release tags and assets remain immutable. A later
 run retries. Scheduled runs build and verify a new release even when source is
 unchanged. Manual runs refresh upstream and skip builds when the prepared
 candidate already has a matching published release and native version.
@@ -96,24 +96,10 @@ packages, metadata and downloadable installer.
 
 ## Source clones
 
-The published `pet-composer-layout` branch is rewritten after verified upstream
-updates to keep one net fork commit. Existing release tags still retain their
-original source history. Installed packages are unaffected by branch rewrites.
-
-A fresh clone follows the compact history while leaving an existing clone and
-its local work intact. To resynchronize an existing source branch, record its
-current `origin/pet-composer-layout` commit **before** fetching, then fetch origin.
-Only reset when `git status --short` is empty and
-`git log <recorded-origin-tip>..pet-composer-layout` contains no local commits.
-With both checks empty, switch to `pet-composer-layout` and run
-`git reset --hard origin/pet-composer-layout`.
-
-If either check finds work, do not reset. Save local commits on a backup branch
-and commit or separately copy uncommitted and untracked work, then reconcile
-the changes onto the new tip before replacing the local branch.
-If the previous remote tip is unavailable, keep the existing clone and
-use a fresh clone. An ordinary pull can restore the old merge history, so it is
-not the resynchronization path for this branch.
+The published `pet-composer-layout` branch retains its history across upstream
+updates. A clean clone following this branch can update with `git pull --ff-only`.
+When local work prevents a fast-forward, preserve it and reconcile the changes
+before updating. Existing release tags retain their original source history.
 
 ## Hosted verification
 

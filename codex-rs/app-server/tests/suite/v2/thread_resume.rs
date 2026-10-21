@@ -28,6 +28,7 @@ use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::DeprecationNoticeNotification;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
+use codex_app_server_protocol::GeneratedImageRef;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -194,7 +195,7 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
     }))?;
     append_rollout_item_to_path(
         &path,
-        &RolloutItem::Compacted(CompactedItem {
+        &RolloutItem::Compacted(Box::new(CompactedItem {
             message: "compacted history".to_string(),
             replacement_history: Some(Vec::new()),
             retained_context: None,
@@ -207,7 +208,7 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
     )
     .await?;
     append_rollout_item_to_path(
@@ -446,8 +447,15 @@ async fn wait_for_responses_request_count(
     Ok(())
 }
 
+#[test_case(ThreadHistoryMode::Legacy, false; "legacy with turns")]
+#[test_case(ThreadHistoryMode::Legacy, true; "legacy without turns")]
+#[test_case(ThreadHistoryMode::Paginated, false; "paginated with turns")]
+#[test_case(ThreadHistoryMode::Paginated, true; "paginated without turns")]
 #[tokio::test]
-async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
+async fn thread_resume_rejects_unmaterialized_thread(
+    history_mode: ThreadHistoryMode,
+    exclude_turns: bool,
+) -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
@@ -461,6 +469,7 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
     let start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
+            history_mode: Some(history_mode),
             ..Default::default()
         })
         .await?;
@@ -471,6 +480,7 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id.clone(),
+            exclude_turns,
             ..Default::default()
         })
         .await?;
@@ -2148,7 +2158,7 @@ async fn unloaded_thread_goal_mutations_respect_parent_ownership() -> Result<()>
         // must take precedence, just as it does when the thread resumes.
         let mut meta = read_session_meta_line(&path).await?;
         meta.meta.multi_agent_version = version;
-        append_rollout_item_to_path(&path, &RolloutItem::SessionMeta(meta)).await?;
+        append_rollout_item_to_path(&path, &RolloutItem::SessionMeta(Box::new(meta))).await?;
 
         for (method, params) in [
             (
@@ -2781,7 +2791,11 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
         normal_turn.items.iter().any(|item| matches!(
             item,
             ThreadItem::ImageGeneration(item)
-                if item.result == "base64-image-result"
+                if matches!(
+                    &item.image,
+                    GeneratedImageRef::Inline { result }
+                        if result == "base64-image-result"
+                )
                     && item.revised_prompt.as_deref() == Some("secret revised prompt")
         )),
         "normal resume should keep image generation items"
@@ -2889,10 +2903,13 @@ fn append_resume_redaction_history(
             call_id: "ig-1".to_string(),
             status: "completed".to_string(),
             revised_prompt: Some("secret revised prompt".to_string()),
-            result: "base64-image-result".to_string(),
+            image: GeneratedImageRef::Inline {
+                result: "base64-image-result".to_string(),
+            },
             transparent_background: None,
             failure: None,
             saved_path: Some(test_absolute_path("/tmp/ig-1.png")),
+            input_images: Vec::new(),
         }),
     ]
     .into_iter()
@@ -6470,8 +6487,11 @@ async fn setup_rollout_fixture(codex_home: &Path, server_uri: &str) -> Result<Ro
     let rollout_file_path = rollout_path(codex_home, filename_ts, &conversation_id);
     let mut session_meta = read_session_meta_line(&rollout_file_path).await?;
     session_meta.meta.multi_agent_version = Some(MultiAgentVersion::V1);
-    append_rollout_item_to_path(&rollout_file_path, &RolloutItem::SessionMeta(session_meta))
-        .await?;
+    append_rollout_item_to_path(
+        &rollout_file_path,
+        &RolloutItem::SessionMeta(Box::new(session_meta)),
+    )
+    .await?;
     set_rollout_mtime(rollout_file_path.as_path(), expected_updated_at_rfc3339)?;
     Ok(RolloutFixture {
         conversation_id,
