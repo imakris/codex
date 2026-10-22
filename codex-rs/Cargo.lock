@@ -2823,6 +2823,7 @@ dependencies = [
  "codex-features",
  "codex-file-system",
  "codex-git-utils",
+ "codex-http-client",
  "codex-model-provider-info",
  "codex-network-proxy",
  "codex-protocol",
@@ -3163,6 +3164,14 @@ name = "codex-diagnostics"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "pretty_assertions",
+]
+
+[[package]]
+name = "codex-direct-tool-timing"
+version = "0.0.0"
+dependencies = [
+ "codex-utils-critical-path",
  "pretty_assertions",
 ]
 
@@ -4136,6 +4145,7 @@ name = "codex-model-provider-info"
 version = "0.0.0"
 dependencies = [
  "codex-client",
+ "codex-http-client",
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-redacted-string",
@@ -4146,7 +4156,6 @@ dependencies = [
  "serde",
  "tempfile",
  "toml 0.9.11+spec-1.1.0",
- "url",
 ]
 
 [[package]]
