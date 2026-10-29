@@ -100,6 +100,10 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    pub(crate) fn set_ambient_pet_screen_bottom(&mut self, bottom_y: u16) {
+        self.ambient_pet_screen_bottom_y = Some(bottom_y);
+    }
+
     pub(crate) fn ambient_pet_draw(
         &self,
         area: Rect,

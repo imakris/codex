@@ -58,6 +58,51 @@ fn text(buffer: &Buffer) -> String {
 }
 
 #[test]
+fn ambient_pet_footer_width_keeps_status_input_and_cursor_aligned() {
+    let composer = composer();
+    let footer = TranscriptFooter {
+        text: Line::from("Find: ".to_string() + &"needle".repeat(12)).into(),
+        cursor_column: Some(72),
+        is_interactive: true,
+    };
+    let options = composer.resolve_render_options(ComposerRenderOptions {
+        footer: Some(&footer),
+        textarea_right_reserve: 11,
+        full_width_footer: true,
+        minimum_height: 6,
+        separate_status_line: true,
+        ..ComposerRenderOptions::default()
+    });
+    let area = Rect::new(3, 8, 80, composer.desired_height_with_options(80, options));
+    let layout = composer.layout_with_options(area, options);
+    assert_eq!(layout.footer.width, 80);
+    assert_eq!(layout.composer.width, 69);
+    assert_eq!(layout.status.width, 69);
+    let hint_area = inset_footer_hint_area(layout.footer);
+    assert_eq!(
+        composer.cursor_pos_with_options(area, options),
+        Some((hint_area.x + 72, hint_area.y))
+    );
+
+    let multiline_footer = TranscriptFooter {
+        text: vec![Line::from("Find: needle"), Line::from("Enter next")].into(),
+        cursor_column: Some(8),
+        is_interactive: true,
+    };
+    let multiline_options = ComposerRenderOptions {
+        footer: Some(&multiline_footer),
+        ..options
+    };
+    assert_eq!(
+        composer
+            .layout_with_options(area, multiline_options)
+            .footer
+            .width,
+        69
+    );
+}
+
+#[test]
 fn retained_command_suggestions_yield_paint_and_cursor_to_find() {
     let mut composer = composer();
     composer.draft.textarea.insert_str("/");

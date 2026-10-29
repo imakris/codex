@@ -251,6 +251,17 @@ impl ChatWidget {
             options.rendered_selection = Some(&self.rendered_selection);
             options.warning_count = self.warning_display_state.count;
             options.textarea_right_reserve = right_reserve;
+            options.full_width_footer = right_reserve > 0
+                && (self.local_settings.tui.pet_anchor
+                    == codex_config::types::TuiPetAnchor::Composer
+                    || self.ambient_pet_screen_bottom_y.is_some());
+            options.footer_image_rows = match self.local_settings.tui.pet_anchor {
+                codex_config::types::TuiPetAnchor::Composer => None,
+                codex_config::types::TuiPetAnchor::ScreenBottom => self
+                    .ambient_pet_screen_bottom_y
+                    .zip(self.ambient_pet.as_ref())
+                    .map(|(bottom_y, pet)| pet.image_row_range(bottom_y)),
+            };
             options.minimum_height = if right_reserve > 0 {
                 self.ambient_pet
                     .as_ref()

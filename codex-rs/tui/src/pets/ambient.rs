@@ -226,6 +226,12 @@ impl AmbientPet {
             .saturating_add(composer_gap_rows())
     }
 
+    /// Share image bounds with text layout so footer text cannot be erased by sprite redraws.
+    pub(crate) fn image_row_range(&self, anchor_bottom_y: u16) -> (u16, u16) {
+        let bottom = anchor_bottom_y.saturating_sub(composer_gap_rows());
+        (bottom.saturating_sub(self.image_size().rows), bottom)
+    }
+
     /// Build an image draw request for the ambient pet anchored above the composer.
     ///
     /// Returning `None` means "do not render the sprite this frame", typically
@@ -243,13 +249,12 @@ impl AmbientPet {
         let notification = self.visible_notification(Instant::now());
         let notification_height = notification.map_or(0, notification_height);
         let required_height = size.rows.saturating_add(notification_height);
-        let sprite_bottom_y = composer_bottom_y.saturating_sub(composer_gap_rows());
+        let (y, sprite_bottom_y) = self.image_row_range(composer_bottom_y);
         if sprite_bottom_y < area.y.saturating_add(required_height) || area.width < size.columns {
             return None;
         }
 
         let x = area.x + area.width.saturating_sub(size.columns);
-        let y = sprite_bottom_y.saturating_sub(size.rows);
         Some(AmbientPetDraw {
             frame: self.current_frame_path()?,
             protocol,

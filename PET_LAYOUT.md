@@ -1,9 +1,11 @@
 # Pet layout in this fork
 
 This fork keeps transcript history and streaming responses at the full terminal
-width when a pet is enabled. Space for the pet is reserved beside the composer,
-including its status and hint rows. Short composers grow vertically enough to
-contain the sprite; a viewport too small to contain it hides the sprite.
+width when a pet is enabled. Space for the pet is reserved beside the composer
+and rows that overlap the sprite. A single bottom footer row uses the full width
+when it is outside the sprite, including the gap below it. Short composers grow
+vertically enough to contain the sprite; a viewport too small to contain it hides
+the sprite.
 
 ## Origin and adaptation
 
@@ -18,8 +20,8 @@ composer rendering options. It cannot be applied unchanged. This adaptation:
 
 - Removes the pet margin from history and all live transcript cells while
   retaining a composer reservation through the current rendering options.
-- Reserves enough composer height and protects footer/status text as well as
-  the input, so restoring history width does not introduce sprite/text overlap.
+- Reserves enough composer height and protects input and overlapping footer/status
+  text while allowing a clear single footer row to use the full width.
 - Restricts SIXEL blanking to sprite rows. The previous sprite is cleared before
   reflow, history insertion, or text drawing can put transcript content there.
 - Clips saved SIXEL coordinates after terminal resizing and invalidates only

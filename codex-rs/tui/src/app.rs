@@ -1216,6 +1216,8 @@ impl App {
 
     /// Render a complete chat frame for both draw events and immediate event-handler paints.
     fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui, screen_size: Size) -> Result<Rect> {
+        self.chat_widget
+            .set_ambient_pet_screen_bottom(screen_size.height);
         tui.with_synchronized_update(screen_size, |tui| -> Result<Rect> {
             let rendered_area = self.render_chat_widget_text_frame(tui, screen_size)?;
             if self.chat_widget.ambient_pet_image_enabled() {

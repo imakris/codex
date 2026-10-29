@@ -224,6 +224,7 @@ impl ChatWidget {
             active_hook_cell: None,
             pet_http_client,
             ambient_pet: None,
+            ambient_pet_screen_bottom_y: None,
             configured_pet_load_generation,
             pet_picker_preview_state: crate::pets::PetPickerPreviewState::default(),
             pet_picker_preview_pet: None,

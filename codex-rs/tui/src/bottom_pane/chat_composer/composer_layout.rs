@@ -36,17 +36,26 @@ impl ChatComposer {
 }
 
 impl ChatComposer {
+    fn footer_width_with_options(&self, width: u16, options: ComposerRenderOptions<'_>) -> u16 {
+        if options.full_width_footer && self.footer_hint_height(width, options) == 1 {
+            width
+        } else {
+            width.saturating_sub(options.textarea_right_reserve)
+        }
+    }
+
     pub(super) fn layout_with_options(
         &self,
         area: Rect,
         options: ComposerRenderOptions<'_>,
     ) -> ComposerLayout {
-        // Status and hint rows share the pet's vertical extent with the draft.
+        let footer_width = self.footer_width_with_options(area.width, options);
+        // The input and separate status row can share the pet's vertical extent.
         let area = Rect {
             width: area.width.saturating_sub(options.textarea_right_reserve),
             ..area
         };
-        let footer_hint_height = self.footer_hint_height(area.width, options);
+        let footer_hint_height = self.footer_hint_height(footer_width, options);
         // Preserve input and hints before allocating the persistent status row.
         let status_height = self.status_surface_height(options).min(
             area.height
@@ -107,6 +116,13 @@ impl ChatComposer {
             (composer, popup, popup)
         };
         footer_rect.y = footer_rect.y.saturating_add(status.height);
+        if footer_rect.height == 1
+            && options
+                .footer_image_rows
+                .is_none_or(|(top, bottom)| footer_rect.y < top || footer_rect.y >= bottom)
+        {
+            footer_rect.width = footer_width;
+        }
         // Keep the draft visible when clipped.
         let voice_rows = voice_rows * u16::from(composer_rect.height >= voice_rows + 3);
         let mut textarea_rect = composer_rect.inset(Insets::tlbr(
@@ -177,8 +193,9 @@ impl ChatComposer {
         width: u16,
         options: ComposerRenderOptions<'_>,
     ) -> u16 {
+        let footer_width = self.footer_width_with_options(width, options);
         let width = width.saturating_sub(options.textarea_right_reserve);
-        let footer_hint_height = self.footer_hint_height(width, options);
+        let footer_hint_height = self.footer_hint_height(footer_width, options);
         const COLS_WITH_MARGIN: u16 = LIVE_PREFIX_COLS + 1;
         let inner_width = width.saturating_sub(COLS_WITH_MARGIN);
         let remote_images_height: u16 = self

@@ -2774,6 +2774,79 @@ fn row_tail_is_blank(row: &str, start_col: usize) -> bool {
 
 #[tokio::test]
 #[serial]
+async fn ambient_pet_reclaims_footer_width_only_outside_sprite_rows() {
+    use codex_config::types::TuiPetAnchor;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    enable_test_ambient_pet(&mut chat);
+    let (mut disabled, _disabled_rx, _disabled_op_rx) =
+        make_chatwidget_manual(/*model_override*/ None).await;
+    disabled.set_tui_pet(Some(crate::pets::DISABLED_PET_ID.to_string()));
+    for widget in [&mut chat, &mut disabled] {
+        widget.bottom_pane.set_status_line_enabled(true);
+        widget
+            .bottom_pane
+            .set_status_line(Some("footer status ".repeat(12).into()));
+        widget
+            .bottom_pane
+            .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
+    }
+
+    for width in [30, 80] {
+        let terminal_area = Rect::new(0, 0, width, 24);
+        chat.set_ambient_pet_screen_bottom(terminal_area.bottom());
+        for (anchor, composer_bottom, full_width) in [
+            (TuiPetAnchor::Composer, 24, true),
+            (TuiPetAnchor::Composer, 22, true),
+            (TuiPetAnchor::ScreenBottom, 24, true),
+            (TuiPetAnchor::ScreenBottom, 22, false),
+            (TuiPetAnchor::ScreenBottom, 18, true),
+        ] {
+            chat.local_settings.tui.pet_anchor = anchor;
+            let composer =
+                chat.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default());
+            let height = composer.desired_height(width);
+            let area = Rect::new(0, composer_bottom - height, width, height);
+            let draw = chat
+                .ambient_pet_draw(terminal_area, composer_bottom)
+                .expect("pet fits beside the composer");
+            let mut buffer = ratatui::buffer::Buffer::empty(terminal_area);
+            composer.render(area, &mut buffer);
+            let mut disabled_buffer = ratatui::buffer::Buffer::empty(terminal_area);
+            let disabled_composer = disabled
+                .bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default());
+            let disabled_height = disabled_composer.desired_height(width);
+            let disabled_area =
+                Rect::new(0, composer_bottom - disabled_height, width, disabled_height);
+            disabled_composer.render(disabled_area, &mut disabled_buffer);
+            let footer_row = |buffer: &ratatui::buffer::Buffer| {
+                (0..width)
+                    .map(|x| buffer[(x, area.bottom() - 1)].symbol())
+                    .collect::<String>()
+            };
+            let footer = footer_row(&buffer);
+            let disabled_footer = footer_row(&disabled_buffer);
+            assert!(
+                !row_tail_is_blank(&disabled_footer, usize::from(draw.x)),
+                "the footer must exercise the columns beside the pet: \
+                 {anchor:?}, width {width}, composer bottom {composer_bottom}, {disabled_footer:?}"
+            );
+            assert_eq!(
+                footer == disabled_footer,
+                full_width,
+                "{anchor:?}, width {width}, composer bottom {composer_bottom}"
+            );
+            for y in draw.y..draw.y + draw.rows {
+                for x in draw.x..draw.x + draw.columns {
+                    assert_eq!(buffer[(x, y)].symbol(), " ");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn ambient_pet_hides_when_the_composer_viewport_cannot_fit_it() {
     use ratatui::layout::Rect;
 

@@ -667,8 +667,9 @@ pub(crate) struct ChatWidget {
     active_hook_cell: Option<HookCell>,
     // Reused for built-in pet CDN requests so redirects remain route-aware.
     pub(crate) pet_http_client: codex_http_client::RouteAwareClientPool,
-    // Ambient companion rendered over the transcript area, never inside the footer rows.
+    // Ambient companion beside the composer, with footer rows protected where they overlap.
     ambient_pet: Option<crate::pets::AmbientPet>,
+    ambient_pet_screen_bottom_y: Option<u16>,
     configured_pet_load_generation: ConfiguredPetLoadGeneration,
     pet_picker_preview_state: crate::pets::PetPickerPreviewState,
     pet_picker_preview_pet: Option<crate::pets::AmbientPet>,
