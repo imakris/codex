@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression checks for the standalone fork npm package."""
 
+from dataclasses import fields
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,9 @@ class PetPackageTests(unittest.TestCase):
         executable.chmod(0o755)
         package = self.root / "canonical"
         package.mkdir()
+        helper_inputs = {}
+        if "exec_server_bin" in {field.name for field in fields(PackageInputs)}:
+            helper_inputs["exec_server_bin"] = executable
         build_package_dir(
             package, "1.2.3", PACKAGE_VARIANTS["codex"], spec,
             PackageInputs(
@@ -41,6 +45,7 @@ class PetPackageTests(unittest.TestCase):
                 bwrap_bin=executable if spec.is_linux else None,
                 codex_command_runner_bin=executable if spec.is_windows else None,
                 codex_windows_sandbox_setup_bin=executable if spec.is_windows else None,
+                **helper_inputs,
             ),
         )
         return package
@@ -187,13 +192,17 @@ if (typeof process.execve === "function") {
         tarball = pet_package.pack_package(stage, self.root / "codex-pet-win32-x64.tgz")
         with tarfile.open(tarball) as archive:
             names = set(archive.getnames())
-            self.assertTrue({
+            expected = {
                 "package/LICENSE", "package/NOTICE", "package/bin/codex.js",
                 f"package/vendor/{target}/codex-resources/codex-command-runner.exe",
                 f"package/vendor/{target}/codex-resources/codex-windows-sandbox-setup.exe",
                 f"package/vendor/{target}/bin/codex-code-mode-host.exe",
                 f"package/vendor/{target}/codex-path/rg.exe",
-            }.issubset(names))
+            }
+            metadata = json.loads((stage / "vendor" / target / "codex-package.json").read_text())
+            if "execServer" in metadata:
+                expected.add(f"package/vendor/{target}/{metadata['execServer']}")
+            self.assertTrue(expected.issubset(names))
 
 
 if __name__ == "__main__":
