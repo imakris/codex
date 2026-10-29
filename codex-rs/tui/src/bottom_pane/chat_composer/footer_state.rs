@@ -20,6 +20,7 @@ use super::super::footer::shows_passive_footer_line;
 use super::ActivePopup;
 use crate::bottom_pane::footer::FooterKeyHints;
 use crate::bottom_pane::footer::FooterProps;
+use crate::bottom_pane::footer_content::FooterContent;
 use crate::key_hint;
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
@@ -364,8 +365,7 @@ pub(super) struct FooterState {
     pub(super) collaboration_mode_indicator: Option<CollaborationModeIndicator>,
     pub(super) goal_status_indicator: Option<GoalStatusIndicator>,
     pub(super) ide_context_active: bool,
-    pub(super) status_line_value: Option<Line<'static>>,
-    pub(super) status_line_hyperlink_url: Option<String>,
+    pub(super) status_line_value: Option<FooterContent>,
     pub(super) status_line_enabled: bool,
     pub(super) side_conversation_context_label: Option<String>,
     pub(super) active_agent_label: Option<String>,
@@ -403,16 +403,6 @@ impl FooterState {
             .checked_add(duration)
             .unwrap_or_else(Instant::now);
         self.flash = Some(FooterFlash { line, expires_at });
-    }
-
-    #[cfg(test)]
-    pub(super) fn status_line_text(&self) -> Option<String> {
-        self.status_line_value.as_ref().map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
     }
 }
 

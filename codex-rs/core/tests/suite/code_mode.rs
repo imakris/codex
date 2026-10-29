@@ -3,6 +3,10 @@
 #[path = "code_mode_dynamic_tools_tests.rs"]
 mod dynamic_tools;
 
+#[cfg(unix)]
+#[path = "code_mode_host_recovery_tests.rs"]
+mod host_recovery;
+
 use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
@@ -3619,15 +3623,12 @@ async fn code_mode_complete_calls_preserve_large_arguments() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(false, None, false; "control")]
-#[test_case(true, None, false; "ranked_search")]
-#[test_case(true, Some(30_000), false; "ranked_search_expanded_schema")]
-#[test_case(false, None, true; "tool_description_first")]
-#[test_case(true, None, true; "ranked_search_tool_description_first")]
+#[test_case(false, None; "catalog_search")]
+#[test_case(true, None; "ranked_search")]
+#[test_case(true, Some(30_000); "ranked_search_expanded_schema")]
 async fn code_mode_only_searches_and_calls_deferred_app_tools(
     ranked_search: bool,
     schema_max_bytes: Option<usize>,
-    tool_description_first: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3747,13 +3748,6 @@ if (!tool) {
                 .enable(Feature::CodeModeOnly)
                 .expect("test config should allow feature update");
             config.code_mode.tool_input_schema_max_bytes = schema_max_bytes;
-            config
-                .features
-                .set_enabled(
-                    Feature::CodeModeToolDescriptionFirst,
-                    tool_description_first,
-                )
-                .expect("test config should allow description order update");
             if ranked_search {
                 config
                     .features
@@ -3841,11 +3835,7 @@ if (!tool) {
             "hasDeclaration": true,
             "hasSchemaDescription": schema_max_bytes.is_some(),
             "hasNamespacePrefix": true,
-            "descriptionPrefix": if tool_description_first {
-                "Calendar search context.\n\nRead timezone option 99.\n\nPlan events and manage your calendar."
-            } else {
-                "Calendar search context.\n\nPlan events and manage your calendar.\n\nRead timezone option 99."
-            },
+            "descriptionPrefix": "Calendar search context.\n\nRead timezone option 99.\n\nPlan events and manage your calendar.",
             "matchesCatalog": true,
             "isError": false,
             "text": "called calendar_timezone_option_99 for  at  with ",
@@ -4830,6 +4820,7 @@ async fn code_mode_wait_timeout_reconnects_on_next_exec() -> Result<()> {
 #[derive(Default)]
 struct ResponseIdObserver {
     response_ids: Mutex<Vec<(String, Option<String>)>>,
+    serving_assessments: Mutex<Vec<Option<bool>>>,
     originating_items: Mutex<Vec<(String, Option<codex_protocol::ResponseItemId>)>>,
     wait_started: tokio::sync::Notify,
 }
@@ -4837,6 +4828,18 @@ struct ResponseIdObserver {
 impl ToolLifecycleContributor for ResponseIdObserver {
     fn on_tool_start<'a>(&'a self, input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(async move {
+            if input.tool_name.name == "exec_command"
+                && let codex_extension_api::ToolPayload::Function { arguments } = input.payload
+                && let Ok(arguments) = serde_json::from_str::<Value>(arguments)
+                && arguments["cmd"]
+                    .as_str()
+                    .is_some_and(|cmd| cmd.starts_with("printf 'phase "))
+            {
+                self.serving_assessments
+                    .lock()
+                    .unwrap()
+                    .push(input.serving_assessment);
+            }
             if matches!(input.tool_name.name.as_str(), "exec" | "exec_command") {
                 self.originating_items.lock().unwrap().push((
                     input.tool_name.name.clone(),
@@ -4860,18 +4863,44 @@ impl ToolLifecycleContributor for ResponseIdObserver {
 }
 
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[test_case::test_case(None; "without_assessment")]
+#[test_case::test_case(Some(false); "low_risk_assessment")]
+#[test_case::test_case(Some(true); "review_required_assessment")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
+async fn code_mode_can_yield_and_resume_with_wait(requires_review: Option<bool>) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"model": "gpt-5.6-luna"}),
+        ))
+        .respond_with(responses::sse_response(sse(vec![ev_completed(
+            "unexpected-score",
+        )])))
+        .expect(0)
+        .mount(&server)
+        .await;
     let observer = Arc::new(ResponseIdObserver::default());
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     extensions.tool_lifecycle_contributor(observer.clone());
     let mut builder = test_codex()
+        .with_model("guardian-probe-parent")
         .with_extensions(Arc::new(extensions.build()))
+        .with_pre_build_hook(move |home| {
+            if requires_review.is_some() {
+                fs::write(home.join("config.toml"), "[features.guardianv2]\nenabled = true\n[features.guardianv2.review_scope]\ncomputer_use_only = false\nsandboxed_exec_commands = true\n")
+                    .expect("enable Guardian scoring");
+            }
+        })
+        .with_model_info_override("guardian-probe-parent", |model| { model.guardian = None; })
         .with_config(move |config| {
             let _ = config.features.enable(Feature::CodeMode);
+            if requires_review.is_some() {
+                config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+                config.permissions.set_permission_profile(PermissionProfile::read_only()).expect("read-only permissions");
+                config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            }
         });
     let test = builder.build(&server).await?;
     let phase_2_gate = test.workspace_path("code-mode-phase-2.ready");
@@ -4881,7 +4910,7 @@ async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
 
     let code = format!(
         r#"
-text("phase 1");
+text((await tools.exec_command({{cmd: "printf 'phase 1'"}})).output);
 yield_control();
 {phase_2_wait}
 text((await tools.exec_command({{cmd: "printf 'phase 2'"}})).output);
@@ -4891,15 +4920,17 @@ text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
 "#
     );
 
-    responses::mount_sse_once(
-        &server,
-        sse(vec![
-            responses::ev_response_created("resp-1"),
-            ev_custom_tool_call("call-1", "exec", &code),
-            ev_completed("resp-1"),
-        ]),
-    )
-    .await;
+    let mut tool = ev_custom_tool_call("call-1", "exec", &code);
+    tool["item"]["id"] = serde_json::json!("assessed-cell");
+    let mut events = vec![ev_response_created("resp-1")];
+    if let Some(requires_review) = requires_review {
+        events.push(serde_json::json!({
+            "type": "response.metadata", "response_id": "resp-1",
+            "metadata": {"guardian": {"item_id": "assessed-cell", "requires_review": requires_review}}
+        }));
+    }
+    events.extend([tool, ev_completed("resp-1")]);
+    responses::mount_sse_once(&server, sse(events)).await;
     let first_completion = responses::mount_sse_once(
         &server,
         sse(vec![
@@ -5029,6 +5060,10 @@ text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
             .all(|(_, item)| item.as_ref() == Some(&wrapper_item))
     );
 
+    assert_eq!(
+        *observer.serving_assessments.lock().unwrap(),
+        vec![requires_review; 3]
+    );
     let observed = observer.response_ids.lock().unwrap();
     let mut nested_response_ids = observed
         .iter()
@@ -7918,7 +7953,7 @@ text(JSON.stringify({
         exec_output,
         serde_json::json!({
             "name": "editor__apply_patch",
-            "description": format!("Editing tools.\n\n{second_description}"),
+            "description": format!("Apply a raw editor patch (step 2).\n\nEditing tools.\n\nexec tool declaration:\n```ts\n{declaration}\n```"),
             "result": {
                 "namespace": "editor",
                 "name": "apply_patch",
@@ -8064,8 +8099,8 @@ text(JSON.stringify(tool));
         serde_json::json!({
             "name": "mcp__rmcp__echo",
             "description": concat!(
-                "Use these tools to exercise the rmcp test server.\n\n",
                 "Echo back the provided message and include environment data.\n\n",
+                "Use these tools to exercise the rmcp test server.\n\n",
                 "exec tool declaration:\n",
                 "```ts\n",
                 "declare const tools: { mcp__rmcp__echo(args: { env_var?: string; message: string; }): ",
