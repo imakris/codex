@@ -2784,9 +2784,9 @@ async fn ambient_pet_reclaims_footer_width_only_outside_sprite_rows() {
     disabled.set_tui_pet(Some(crate::pets::DISABLED_PET_ID.to_string()));
     for widget in [&mut chat, &mut disabled] {
         widget.bottom_pane.set_status_line_enabled(true);
-        widget
-            .bottom_pane
-            .set_status_line(Some("footer status ".repeat(12).into()));
+        widget.bottom_pane.set_status_line(Some(
+            ratatui::text::Line::from("footer status ".repeat(12)).into(),
+        ));
         widget
             .bottom_pane
             .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
