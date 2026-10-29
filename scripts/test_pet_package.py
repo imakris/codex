@@ -152,11 +152,20 @@ class PetPackageTests(unittest.TestCase):
         source = launcher.read_text(encoding="utf-8")
         source = source.replace(
             'import { spawn } from "node:child_process";',
-            '''function spawn(binary, args, options) {
-  console.log(JSON.stringify({binary, env: options.env}));
+            '''function recordLaunch(binary, env) {
+  console.log(JSON.stringify({binary, env}));
+}
+function spawn(binary, args, options) {
+  recordLaunch(binary, options.env);
   return {on(event, callback) {
     if (event === "exit") setImmediate(() => callback(0, null));
   }};
+}
+if (typeof process.execve === "function") {
+  process.execve = (binary, args, env) => {
+    recordLaunch(binary, env);
+    process.exit(0);
+  };
 }''',
         )
         launcher.write_text(source, encoding="utf-8")

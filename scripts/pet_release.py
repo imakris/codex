@@ -14,6 +14,7 @@ import urllib.request
 
 REQUIRED_TESTS = [
     "app::owned_transcript::tests::owned_transcript_uses_full_width_above_the_pet",
+    "app::owned_transcript::tests::fullscreen_question_mouse_copy_routes_without_answering",
     "app::tests::resize_reflow_preserves_transcript_width_when_pet_is_enabled",
     "chatwidget::tests::status_and_layout::added_history_with_pet_uses_full_terminal_width",
     "chatwidget::tests::status_and_layout::ambient_pet_preserves_history_wrap_width",

@@ -3,10 +3,9 @@
 The [Pet fork sync and release workflow](https://github.com/imakris/codex/actions/workflows/pet-release.yml)
 integrates current upstream `openai/codex:main`, builds Windows x64 and Linux x64 packages,
 and publishes verified builds to [GitHub Releases](https://github.com/imakris/codex/releases).
-It is scheduled daily at 07:17 Berlin time (`Europe/Berlin`) year-round, and also
-runs after pushes to `pet-composer-layout` and on manual dispatch. Scheduled
-runs attempt a new verified release even when source is unchanged. It does not
-require this computer to be switched on.
+It is scheduled daily at 07:17 Berlin time (`Europe/Berlin`) year-round and can
+also be started manually. Scheduled runs attempt a new verified release even
+when source is unchanged. It does not require this computer to be switched on.
 
 The schedule follows Berlin's daylight saving time automatically: 05:17 UTC in
 summer and 06:17 UTC in winter. GitHub can delay scheduled starts; publication
@@ -58,9 +57,7 @@ themselves; rerun an update command or schedule the download-only updater.
 
 ## Synchronization and publication
 
-A push run first checks the current fork tip against the latest published
-release and skips before fetching upstream when that tip is already released.
-Other runs capture the fork and current upstream commits and merge
+Each run captures the fork and current upstream commits and merges
 their history, preserving all fork changes and prior conflict resolutions.
 A conflict stops before builds. The unpublished candidate retains both histories
 and can advance the fork through an ordinary fast-forward push. When upstream
@@ -104,9 +101,8 @@ before updating. Existing release tags retain their original source history.
 ## Hosted verification
 
 GitHub's hosted job queue and workflow concurrency serialize release attempts.
-The concurrency group retains up to 100 pending requests, so a promotion push
-does not replace an already pending scheduled or manual run. Each isolated
-build declares four Cargo/CMake/native jobs. Local compilation
+The concurrency group retains up to 100 pending scheduled or manual runs.
+Each isolated build declares four Cargo/CMake/native jobs. Local compilation
 still uses the machine's real `queued-build` command. The hosted Windows job
 uses the Visual Studio 2026 image and checks MSVC 14.51. Original OpenAI release
 workflows depend on private runner groups, signing services and registry trust;
@@ -135,14 +131,6 @@ Only the publish checkout receives this token for the source push. Preparation,
 builders, and release API requests retain the built-in repository token.
 GitHub documents the [workflow-file permission requirement](https://docs.github.com/en/rest/repos/contents#create-or-update-file-contents)
 and [additional credential options](https://docs.github.com/en/actions/tutorials/authenticate-with-github_token#granting-additional-permissions).
-
-Unlike `GITHUB_TOKEN`, a personal access token's pushes trigger matching push
-workflows. Advancing the branch therefore queues another pet release run.
-Workflow concurrency starts it after the active release attempt finishes. When
-the current fork tip matches the published release, the follow-up skips before
-fetching upstream. Scheduled and manual runs refresh upstream; human pushes
-that change the fork tip and runs without a matching public release still
-prepare and verify a candidate.
 
 To rotate credentials, create a replacement token with the same repository
 selection and permissions, update `PET_SYNC_TOKEN`, and revoke the superseded

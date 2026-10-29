@@ -1453,17 +1453,15 @@ async fn fullscreen_question_mouse_copy_routes_without_answering() -> Result<()>
             thread_id: thread_id.to_string(),
             turn_id: "turn".into(),
             completed_at_ms: 0,
-            item: ThreadItem::AgentMessage {
-                id: "question".into(),
-                text: String::new(),
-                phase: None,
-                memory_citation: None,
-                delivery: None,
-                questions: Some(vec![codex_protocol::items::AsyncUserInputQuestion {
-                    title: "Question text?".into(),
-                    options: Some(vec!["Named answer".into()]),
-                }]),
-            },
+            item: serde_json::from_value(serde_json::json!({
+                "type": "agentMessage",
+                "id": "question",
+                "text": "",
+                "questions": [{
+                    "title": "Question text?",
+                    "options": ["Named answer"],
+                }],
+            }))?,
         }),
         None,
     );
