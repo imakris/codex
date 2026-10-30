@@ -44,8 +44,8 @@ command above to get the latest published release. See
 [installation and maintenance](PET_MAINTENANCE.md) for the synchronization
 schedule, alternative Python installer, and troubleshooting.
 
-The fork branch is rewritten after upstream updates; existing source clones need
-the [resynchronization steps](PET_MAINTENANCE.md#source-clones).
+Source clones can update with `git pull --ff-only`; see the
+[source-clone instructions](PET_MAINTENANCE.md#source-clones).
 
 For general usage, see the [upstream Codex documentation](https://developers.openai.com/codex).
 This repository also has [contributing](docs/contributing.md) and
