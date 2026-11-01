@@ -1,14 +1,15 @@
 //! Questions route selection to prompt/choice text or the existing inline answer editor.
 
 use super::*;
+use crate::bottom_pane::selection_popup_common::wrap_row_lines;
+use crate::bottom_pane::selection_row_layout::SelectionDescriptionLayout;
 use crate::clipboard_copy::CopyStatus;
+use crate::terminal_hyperlinks::LogicalLineSource;
 use crate::tui::TuiEvent;
 use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
-use unicode_width::UnicodeWidthStr;
 
 impl AsyncQuestions {
     pub(crate) fn end_mouse_drag(&mut self) {
@@ -67,117 +68,81 @@ impl AsyncQuestions {
         count.or_else(|| self.composer.finish_copy(completion, editor_current))
     }
 
-    pub(super) fn prepare_text_selection_layout(&self) {
-        let Some(answer) = self.current_answer() else {
-            return;
-        };
-        let mut text = answer.question.title.clone();
-        if self.has_options() {
-            text.push_str("\n\n");
-            text.push_str(&self.options().join("\n"));
-        }
-        self.text_selection
-            .borrow_mut()
-            .begin_layout(&answer.question_id, text);
-    }
-
-    pub(super) fn record_question_rows(&self, area: Rect) {
-        let Some(question) = self.current_question() else {
-            return;
-        };
-        let mut source_offset = 0;
-        for (row, source) in question
-            .title
-            .split('\n')
-            .flat_map(|line| {
-                let offset = source_offset;
-                source_offset += line.len() + 1;
-                let text = line.strip_suffix('\r').unwrap_or(line);
-                crate::wrapping::wrap_ranges_trim(text, usize::from(area.width.max(1)))
-                    .into_iter()
-                    .map(move |range| offset + range.start..offset + range.end)
-            })
-            .take(usize::from(area.height))
+    pub(super) fn prepare_text_selection_layout(
+        &self,
+        question_lines: &[HyperlinkLine],
+        rows: &[GenericDisplayRow],
+        width: u16,
+    ) {
+        let options = rows
+            .iter()
             .enumerate()
-        {
-            self.text_selection.borrow_mut().push_row(
-                Rect::new(area.x, area.y + row as u16, area.width, 1),
-                /*block*/ 0,
-                source,
-            );
-        }
+            .map(|(index, row)| {
+                let mut lines = wrap_row_lines(
+                    row,
+                    /*desc_col*/ 0,
+                    width,
+                    SelectionDescriptionLayout::Columns,
+                );
+                if row.wrapped_name.is_empty()
+                    && let Some(label) = self.options().get(index)
+                {
+                    // At tiny widths the picker paints a plain label; retain its exact wraps
+                    // while excluding the numbered gutter from the selectable text.
+                    let prefix = row.name.len() - label.len();
+                    let origin = LogicalLineSource::new(label.clone());
+                    for line in &mut lines {
+                        let painted = line
+                            .source
+                            .take()
+                            .unwrap_or_else(|| LogicalLineSource::from_line(&line.line));
+                        let mut source = origin.clone();
+                        source.prefix_bytes = painted.prefix_bytes
+                            + painted
+                                .range
+                                .end
+                                .min(prefix)
+                                .saturating_sub(painted.range.start);
+                        source.range = painted.range.start.saturating_sub(prefix)
+                            ..painted.range.end.saturating_sub(prefix);
+                        line.source = Some(source);
+                    }
+                }
+                lines
+            })
+            .collect::<Vec<_>>();
+        let question_id = self
+            .current_answer()
+            .map_or("", |answer| answer.question_id.as_str());
+        self.text_selection.borrow_mut().begin_layout(
+            question_id,
+            std::iter::once(question_lines).chain(options.iter().map(Vec::as_slice)),
+        );
     }
 
-    pub(super) fn record_option_rows(&self, area: Rect, first: usize, rows: &[GenericDisplayRow]) {
+    pub(super) fn record_option_rows(&self, area: Rect, first: usize, row_count: usize) {
         if area.is_empty() {
             return;
         }
-        let wrapped: Vec<_> = rows
-            .iter()
-            .skip(first)
-            .map(|row| {
-                let line = Line::from(row.name.as_str());
-                let options = crate::wrapping::RtOptions::new(usize::from(area.width))
-                    .subsequent_indent(Line::from(
-                        " ".repeat(
-                            row.wrap_indent
-                                .unwrap_or(0)
-                                .min(usize::from(area.width - 1)),
-                        ),
-                    ));
-                crate::wrapping::word_wrap_line_with_source(&line, options)
-                    .into_iter()
-                    .map(|line| (line.range, line.prefix_bytes))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let total_rows = wrapped.iter().map(Vec::len).sum::<usize>();
+        let mut selection = self.text_selection.borrow_mut();
+        let total_rows = (first..row_count)
+            .map(|index| selection.block_row_count(index + 1))
+            .sum::<usize>();
         let y_offset = area
             .height
             .saturating_sub(u16::try_from(total_rows).unwrap_or(u16::MAX));
         let mut y = area.y + y_offset;
-        let mut source_offset = self
-            .current_question()
-            .map_or(0, |question| question.title.len() + 2)
-            + self
-                .options()
-                .iter()
-                .take(first)
-                .map(|label| label.len() + 1)
-                .sum::<usize>();
-        for ((index, row), wrapped) in rows.iter().enumerate().skip(first).zip(wrapped) {
-            let prefix = format!(
-                "{} {}. ",
-                if self.selected_option_index() == Some(index) {
-                    '›'
-                } else {
-                    ' '
-                },
-                index + 1
-            );
-            for (range, generated_prefix) in wrapped {
-                if y >= area.bottom() {
-                    return;
-                }
-                if index < self.options().len() {
-                    let start = range.start.max(prefix.len());
-                    let end = range.end.max(prefix.len());
-                    let prefix_columns =
-                        generated_prefix + row.name[range.start..start.min(range.end)].width();
-                    let columns = u16::try_from(prefix_columns)
-                        .unwrap_or(u16::MAX)
-                        .min(area.width);
-                    self.text_selection.borrow_mut().push_row(
-                        Rect::new(area.x + columns, y, area.width - columns, 1),
-                        /*block*/ index + 1,
-                        source_offset + start - prefix.len()..source_offset + end - prefix.len(),
-                    );
-                }
-                y += 1;
+        for index in first..row_count {
+            if y >= area.bottom() {
+                return;
             }
-            if let Some(label) = self.options().get(index) {
-                source_offset += label.len() + 1;
+            let height = u16::try_from(selection.block_row_count(index + 1))
+                .unwrap_or(u16::MAX)
+                .min(area.bottom() - y);
+            if index < self.options().len() {
+                selection.push_block(Rect::new(area.x, y, area.width, height), index + 1);
             }
+            y += height;
         }
     }
 }

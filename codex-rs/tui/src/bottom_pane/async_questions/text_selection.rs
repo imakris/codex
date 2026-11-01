@@ -1,7 +1,8 @@
-//! Read-only selection retains raw offsets but copies and highlights only painted source fragments.
+//! Read-only selection follows rendered Markdown's logical text and painted source fragments.
 //! Gestures capture visible prompt/option blocks so reflow cannot add omitted text to a selection.
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crossterm::event::MouseButton;
@@ -14,6 +15,8 @@ use ratatui::style::Modifier;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::clipboard_copy::CopyStatus;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::LogicalLineSource;
 use crate::text_selection::SelectionUnit;
 use crate::tui::TuiEvent;
 use crate::width::display_width;
@@ -22,9 +25,16 @@ use crate::width::display_width;
 pub(super) struct QuestionTextSelection {
     question_id: String,
     text: String,
+    block_rows: Vec<Vec<RenderedRow>>,
     rows: Vec<SelectionRow>,
     selection: Option<Selection>,
     last_click: Option<(Instant, u16, u16, u8)>,
+}
+
+#[derive(Clone)]
+struct RenderedRow {
+    prefix_columns: u16,
+    source: Range<usize>,
 }
 
 struct SelectionRow {
@@ -56,7 +66,22 @@ struct Selection {
 }
 
 impl QuestionTextSelection {
-    pub(super) fn begin_layout(&mut self, question_id: &str, text: String) {
+    pub(super) fn begin_layout<'a>(
+        &mut self,
+        question_id: &str,
+        blocks: impl IntoIterator<Item = &'a [HyperlinkLine]>,
+    ) {
+        let mut text = String::new();
+        self.block_rows = blocks
+            .into_iter()
+            .enumerate()
+            .map(|(block, lines)| {
+                if block > 0 {
+                    text.push_str(if block == 1 { "\n\n" } else { "\n" });
+                }
+                append_rendered_block(&mut text, lines)
+            })
+            .collect();
         if self.question_id != question_id || self.text != text {
             self.clear();
             self.question_id = question_id.to_string();
@@ -65,7 +90,32 @@ impl QuestionTextSelection {
         self.rows.clear();
     }
 
-    pub(super) fn push_row(&mut self, area: Rect, block: usize, mut source: Range<usize>) {
+    pub(super) fn clear_layout(&mut self) {
+        self.rows.clear();
+    }
+
+    pub(super) fn block_row_count(&self, block: usize) -> usize {
+        self.block_rows[block].len()
+    }
+
+    pub(super) fn push_block(&mut self, area: Rect, block: usize) {
+        for index in 0..self.block_row_count(block).min(usize::from(area.height)) {
+            let row = self.block_rows[block][index].clone();
+            let columns = row.prefix_columns.min(area.width);
+            self.push_row(
+                Rect::new(
+                    area.x + columns,
+                    area.y + index as u16,
+                    area.width - columns,
+                    1,
+                ),
+                block,
+                row.source,
+            );
+        }
+    }
+
+    fn push_row(&mut self, area: Rect, block: usize, mut source: Range<usize>) {
         let mut used = 0;
         for (offset, grapheme) in self.text[source.clone()].grapheme_indices(true) {
             used += display_width(grapheme);
@@ -328,4 +378,46 @@ impl QuestionTextSelection {
             }
         }
     }
+}
+
+/// Shared logical provenance preserves soft-wrap whitespace without copying display gutters.
+fn append_rendered_block(text: &mut String, lines: &[HyperlinkLine]) -> Vec<RenderedRow> {
+    let mut previous: Option<LogicalLineSource> = None;
+    let mut logical_start = text.len();
+    let mut source_start = 0;
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let source = line
+                .source
+                .clone()
+                .unwrap_or_else(|| LogicalLineSource::from_line(&line.line));
+            match previous.as_ref().filter(|previous| {
+                Arc::ptr_eq(&previous.text, &source.text)
+                    && previous.range.end <= source.range.start
+            }) {
+                Some(previous) => {
+                    text.push_str(&source.text[previous.range.end..source.range.end]);
+                }
+                None => {
+                    if index > 0 {
+                        text.push('\n');
+                    }
+                    logical_start = text.len();
+                    source_start = source.range.start;
+                    text.push_str(&source.text[source.range.clone()]);
+                }
+            }
+            let painted = line.line.to_string();
+            let row = RenderedRow {
+                prefix_columns: u16::try_from(display_width(&painted[..source.prefix_bytes]))
+                    .unwrap_or(u16::MAX),
+                source: logical_start + source.range.start - source_start
+                    ..logical_start + source.range.end - source_start,
+            };
+            previous = Some(source);
+            row
+        })
+        .collect()
 }

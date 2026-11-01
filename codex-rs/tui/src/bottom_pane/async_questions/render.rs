@@ -43,25 +43,32 @@ impl Renderable for AsyncQuestions {
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
         self.visible_options.set((0, 0));
-        self.prepare_text_selection_layout();
         ratatui::widgets::Clear.render(area, buf);
         let content_area = render_menu_surface(area, buf);
         if content_area.is_empty() {
+            self.text_selection.borrow_mut().clear_layout();
             return;
         }
         let sections = self.layout_sections(content_area);
+        let option_rows = self.option_rows(content_area.width);
+        self.prepare_text_selection_layout(
+            &sections.question_lines,
+            &option_rows,
+            content_area.width,
+        );
         Paragraph::new(self.progress_prefix_text().dim()).render(sections.progress_area, buf);
         HyperlinkParagraph::new(
             &sections.question_lines,
             crate::style::accent_style().not_bold(),
         )
         .render(sections.question_area, buf);
-        self.record_question_rows(sections.question_area);
+        self.text_selection
+            .borrow_mut()
+            .push_block(sections.question_area, /*block*/ 0);
 
         if self.other_selected() {
-            self.render_inline_options(sections.options_area, buf);
+            self.render_inline_options(sections.options_area, buf, &option_rows);
         } else if self.has_options() && sections.options_area.height > 0 {
-            let option_rows = self.option_rows(sections.options_area.width);
             let mut options_state = self.state.pending[self.state.current_idx].options_state;
             let selected = options_state.selected_idx.unwrap_or(0);
             let heights: Vec<_> = option_rows
@@ -101,7 +108,7 @@ impl Renderable for AsyncQuestions {
                 option_rows.len().max(1),
                 "No options",
             );
-            self.record_option_rows(sections.options_area, first, &option_rows);
+            self.record_option_rows(sections.options_area, first, option_rows.len());
         }
 
         if !self.has_options() {

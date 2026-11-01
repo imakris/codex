@@ -25,7 +25,7 @@ impl AsyncQuestions {
     pub(super) fn layout_sections(&self, area: Rect) -> LayoutSections {
         let has_options = self.has_options();
         let full_options_height = self.options_required_height(area.width);
-        let mut question_lines = self.wrapped_question_lines(area.width);
+        let question_lines = self.wrapped_question_lines(area.width);
         let mut footer_pref = self.footer_lines(area.width, /*option_tip*/ None).len() as u16;
         if has_options
             && question_lines.len()
@@ -43,7 +43,6 @@ impl AsyncQuestions {
         let question_height = question_lines.len().min(usize::from(
             available.saturating_sub(u16::from(self.other_selected())),
         )) as u16;
-        question_lines.truncate(usize::from(question_height));
         let mut remaining = available.saturating_sub(question_height);
         let mut options_height = 0;
         let mut spacer_before_question = 0;

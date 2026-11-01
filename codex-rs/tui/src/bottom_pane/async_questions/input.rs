@@ -84,33 +84,37 @@ impl AsyncQuestions {
         )
     }
 
-    pub(super) fn render_inline_options(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    pub(super) fn render_inline_options(
+        &self,
+        area: Rect,
+        buf: &mut ratatui::buffer::Buffer,
+        rows: &[GenericDisplayRow],
+    ) {
         use ratatui::text::Line;
         use ratatui::widgets::Widget;
 
         let input = self.other_input_area(area);
         let named_area = Rect::new(area.x, area.y, area.width, input.y.saturating_sub(area.y));
-        let mut rows = self.option_rows(named_area.width);
-        rows.pop();
+        let rows = &rows[..rows.len() - 1];
         let mut state = ScrollState::default();
         while state.scroll_top + 1 < rows.len()
-            && measure_rows_height(&rows, &state, rows.len(), named_area.width) > named_area.height
+            && measure_rows_height(rows, &state, rows.len(), named_area.width) > named_area.height
         {
             state.scroll_top += 1;
         }
-        if measure_rows_height(&rows, &state, rows.len(), named_area.width) <= named_area.height {
+        if measure_rows_height(rows, &state, rows.len(), named_area.width) <= named_area.height {
             self.visible_options
                 .set((state.scroll_top, rows.len() - state.scroll_top));
         }
         crate::bottom_pane::request_user_input::render::render_rows_bottom_aligned(
             named_area,
             buf,
-            &rows,
+            rows,
             &state,
             rows.len(),
             "",
         );
-        self.record_option_rows(named_area, state.scroll_top, &rows);
+        self.record_option_rows(named_area, state.scroll_top, rows.len());
         let margin = Rect::new(
             area.x,
             input.y,

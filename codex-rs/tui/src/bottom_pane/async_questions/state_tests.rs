@@ -53,7 +53,9 @@ fn painted_text_start(buffer: &Buffer, text: &str) -> (u16, u16) {
                 let suffix = (column..area.right())
                     .map(|x| buffer[(x, row)].symbol())
                     .collect::<String>();
-                suffix.starts_with(text).then_some((column, row))
+                crate::terminal_hyperlinks::strip_osc8(&suffix)
+                    .starts_with(text)
+                    .then_some((column, row))
             })
         })
         .unwrap_or_else(|| panic!("missing painted {text:?} in {buffer:?}"))
@@ -92,6 +94,148 @@ fn question_copy(editor: &mut AsyncQuestions, expected: &str) {
         ),
         Some((expected.chars().count(), Ok(CopyStatus::Confirmed)))
     );
+}
+
+#[test]
+fn fenced_question_selection_follows_rendered_command_cells() {
+    use crossterm::event::MouseButton::Left;
+    use crossterm::event::MouseEventKind::Down;
+    use crossterm::event::MouseEventKind::Drag;
+    use crossterm::event::MouseEventKind::Up;
+
+    let mut editor = editor();
+    editor.clear_pending();
+    editor.append(
+        "commands",
+        &[question(
+            "Run these commands:\n\n```powershell\nWrite-Host first\nWrite-Host second\n```",
+            None,
+        )],
+    );
+    editor.set_expanded(true);
+    let base = render_editor(&editor, 80, 16);
+    let start = painted_text_start(&base, "Write-Host first");
+    let end = (start.0 + 16, start.1);
+    question_mouse(&mut editor, Down(Left), start, 80, 16);
+    question_mouse(&mut editor, Drag(Left), end, 80, 16);
+    question_mouse(&mut editor, Up(Left), end, 80, 16);
+
+    let highlighted = render_editor(&editor, 80, 16);
+    for position in base.area.positions() {
+        let mut expected = base[position].clone();
+        if position.y == start.1 && (start.0..end.0).contains(&position.x) {
+            expected.modifier.toggle(Modifier::REVERSED);
+        }
+        assert_eq!(highlighted[position], expected, "cell {position:?}");
+    }
+    question_copy(&mut editor, "Write-Host first");
+}
+
+#[test]
+fn fenced_question_selection_copies_wrapped_command_without_fences() {
+    use crossterm::event::MouseButton::Left;
+    use crossterm::event::MouseEventKind::Down;
+    use crossterm::event::MouseEventKind::Drag;
+    use crossterm::event::MouseEventKind::Up;
+
+    let command = "az functionapp config appsettings list --name sandbox --output table";
+    let mut editor = editor();
+    editor.clear_pending();
+    editor.append(
+        "wrapped-command",
+        &[question(
+            &format!("Run this command:\n\n```powershell\n{command}\n```"),
+            None,
+        )],
+    );
+    editor.set_expanded(true);
+    let base = render_editor(&editor, 48, 16);
+    let start = painted_text_start(&base, "az functionapp");
+    let tail = painted_text_start(&base, "table");
+    assert!(tail.1 > start.1, "command must wrap in this viewport");
+    let end = (tail.0 + 5, tail.1);
+    question_mouse(&mut editor, Down(Left), start, 48, 16);
+    question_mouse(&mut editor, Drag(Left), end, 48, 16);
+    question_mouse(&mut editor, Up(Left), end, 48, 16);
+    assert!(
+        editor
+            .copy_selection(
+                &crate::tui::TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
+                |text| {
+                    assert_eq!(text, command);
+                    Ok(crate::clipboard_copy::CopyStatus::Unconfirmed)
+                },
+            )
+            .is_some()
+    );
+    render_editor(&editor, 90, 16);
+    question_copy(&mut editor, command);
+}
+
+#[test]
+fn rendered_question_and_choice_share_selection_offsets() {
+    use crossterm::event::MouseButton::Left;
+    use crossterm::event::MouseEventKind::Down;
+    use crossterm::event::MouseEventKind::Drag;
+    use crossterm::event::MouseEventKind::Up;
+
+    let mut editor = editor();
+    editor.clear_pending();
+    editor.append(
+        "formatted-choice",
+        &[question(
+            "Run **diagnostics**?",
+            Some(vec![
+                "Use `sandbox` and [Details](https://example.com/diagnostics).".into(),
+            ]),
+        )],
+    );
+    editor.set_expanded(true);
+    editor.select_option(0);
+    let base = render_editor(&editor, 80, 16);
+    let start = painted_text_start(&base, "Run diagnostics?");
+    let visible_choice =
+        if crate::markdown_render::hide_web_link_destination("https://example.com/diagnostics") {
+            "Use sandbox and Details."
+        } else {
+            "Use sandbox and Details (https://example.com/diagnostics)."
+        };
+    let choice = painted_text_start(&base, visible_choice);
+    let end = (choice.0 + visible_choice.len() as u16, choice.1);
+    question_mouse(&mut editor, Down(Left), start, 80, 16);
+    question_mouse(&mut editor, Drag(Left), end, 80, 16);
+    question_mouse(&mut editor, Up(Left), end, 80, 16);
+    question_copy(
+        &mut editor,
+        &format!("Run diagnostics?\n\n{visible_choice}"),
+    );
+    assert_eq!(editor.selected_option_index(), Some(0));
+    assert!(editor.submission.is_none());
+}
+
+#[test]
+fn rendered_question_selection_respects_wide_and_combining_graphemes() {
+    use crossterm::event::MouseButton::Left;
+    use crossterm::event::MouseEventKind::Down;
+    use crossterm::event::MouseEventKind::Drag;
+    use crossterm::event::MouseEventKind::Up;
+
+    let mut editor = editor();
+    editor.clear_pending();
+    editor.append(
+        "unicode-command",
+        &[question("Run **診断** using `e\u{301}cho`.", None)],
+    );
+    editor.set_expanded(true);
+    for (visible, expected, columns) in [("診", "診断", 4), ("e\u{301}cho", "e\u{301}cho", 4)] {
+        let base = render_editor(&editor, 60, 12);
+        let start = painted_text_start(&base, visible);
+        let end = (start.0 + columns, start.1);
+        question_mouse(&mut editor, Down(Left), start, 60, 12);
+        question_mouse(&mut editor, Drag(Left), end, 60, 12);
+        question_mouse(&mut editor, Up(Left), end, 60, 12);
+        question_copy(&mut editor, expected);
+    }
 }
 
 #[test]
@@ -781,8 +925,13 @@ fn question_other_excludes_clipped_options_at_the_width_boundary() {
         /*x*/ 0, /*y*/ 0, /*width*/ 20, /*height*/ 2,
     );
     let mut buffer = Buffer::empty(area);
-    editor.prepare_text_selection_layout();
-    editor.render_inline_options(area, &mut buffer);
+    let rows = editor.option_rows(area.width);
+    editor.prepare_text_selection_layout(
+        &editor.wrapped_question_lines(area.width),
+        &rows,
+        area.width,
+    );
+    editor.render_inline_options(area, &mut buffer, &rows);
     assert_eq!(editor.visible_options.get(), (0, 0));
     insta::assert_snapshot!(
         "question_other_clipped_width_boundary",

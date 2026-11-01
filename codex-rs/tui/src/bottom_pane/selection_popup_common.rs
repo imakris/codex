@@ -24,7 +24,7 @@ use super::selection_row_layout::build_full_line;
 #[path = "selection_row_links.rs"]
 mod hyperlinks;
 use hyperlinks::full_hyperlink_row;
-use hyperlinks::wrap_row_lines;
+pub(super) use hyperlinks::wrap_row_lines;
 #[cfg(test)]
 use hyperlinks::wrap_two_column_row;
 

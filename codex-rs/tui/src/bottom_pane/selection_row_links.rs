@@ -159,7 +159,7 @@ fn wrap_standard_row(
     crate::terminal_hyperlinks::remap_source_wrapped_line(&full_line, wrapped)
 }
 
-pub(super) fn wrap_row_lines(
+pub(in crate::bottom_pane) fn wrap_row_lines(
     row: &GenericDisplayRow,
     desc_col: usize,
     width: u16,
