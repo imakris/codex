@@ -21,7 +21,7 @@ permissions:
 # Hosted runners have their own admission queue. One release runs at a time;
 # each isolated builder limits native compilation to four local CPU jobs.
 concurrency:
-  group: pet-release
+  group: ${{ inputs.tests_only && 'pet-tests' || 'pet-release' }}
   queue: max
   cancel-in-progress: false
 
