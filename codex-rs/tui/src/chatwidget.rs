@@ -281,6 +281,7 @@ mod goal_menu;
 mod ide_context;
 use self::ide_context::IdeContextState;
 mod input_queue;
+mod provider_error;
 mod reconnect;
 use self::input_queue::InputQueueState;
 mod image_submission;
@@ -344,6 +345,8 @@ mod luna_reserve_return;
 mod security_setup;
 pub(crate) use backend_banners::AutomaticModelSwitchReason;
 mod protocol;
+pub(crate) use protocol::final_agent_message;
+pub(crate) use protocol::needs_agent_message;
 mod protocol_requests;
 mod rate_limits;
 mod usage_notice;
@@ -598,6 +601,7 @@ pub(crate) struct ChatWidget {
     // Remember the account's Reserve entry notice across chats and transient banner refreshes.
     luna_reserve_notice_account_id: Option<String>,
     pub(crate) warning_display_state: WarningDisplayState,
+    pub(crate) composer_images: Option<crate::transcript_image::composer::ComposerImages>,
     pub(crate) rendered_selection: std::cell::RefCell<crate::rendered_selection::RenderedSelection>,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
     add_credits_nudge_email_in_flight: Option<rate_limits::PendingCreditsNudge>,
@@ -627,6 +631,8 @@ pub(crate) struct ChatWidget {
     safety_buffering: SafetyBufferingState,
     task_complete_pending: bool,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
+    /// Exits observed during the pending list request take precedence over its response.
+    pending_terminal_restore: Option<(uuid::Uuid, HashSet<String>)>,
     /// Tracks per-server MCP startup state while startup is in progress.
     ///
     /// The map is `Some(_)` from the first startup status update until the
@@ -686,6 +692,7 @@ pub(crate) struct ChatWidget {
     active_side_conversation: bool,
     blocks_direct_input: bool,
     external_writer_view: bool,
+    provider_error: Option<codex_app_server_protocol::ModelProviderError>,
     /// Covers both queued and executing forks so repeated shortcuts cannot queue another one.
     pub(crate) fork_in_progress: bool,
     misalignment_policy_violation: Option<misalignment_policy::MisalignmentViolation>,
@@ -710,6 +717,7 @@ pub(crate) struct ChatWidget {
     safety_buffering_source: UserMessageSource,
     /// Main chat-surface bindings resolved from `tui.keymap.chat`.
     chat_keymap: ChatKeymap,
+    new_backend_label: Option<String>,
     /// Whether the preset submenu owns the next key.
     quick_dial_menu: bool,
     /// Ignore a held key after it dismisses the preset submenu.
@@ -1265,31 +1273,31 @@ impl ChatWidget {
         &mut self,
         cell: &dyn HistoryCell,
     ) -> Option<Box<dyn HistoryCell>> {
+        let active = self.transcript.active_cell.as_ref()?;
         // Keep the placeholder session header as the active cell until real session info arrives,
         // so we can merge headers instead of committing a duplicate box to history.
-        let keep_placeholder_header_active = !self.is_session_configured()
-            && self
-                .transcript
-                .active_cell
-                .as_ref()
-                .is_some_and(|c| c.as_any().is::<history_cell::SessionHeaderHistoryCell>());
+        if !self.is_session_configured()
+            && active
+                .as_any()
+                .is::<history_cell::SessionHeaderHistoryCell>()
+        {
+            return None;
+        }
         let history_width = self
             .last_rendered_width
             .get()
             .map(|width| self.history_wrap_width(width))
             .unwrap_or(u16::MAX);
 
-        if !keep_placeholder_header_active
-            && !cell
-                .display_lines_for_mode(history_width, self.history_render_mode())
-                .is_empty()
+        if !cell
+            .display_lines_for_mode(history_width, self.history_render_mode())
+            .is_empty()
         {
             // Only break exec grouping if the cell renders visible lines.
             if !self.has_active_stream_tail() {
                 return self.transcript.take_active_cell();
             }
-        } else if !keep_placeholder_header_active
-            && self.has_completed_tool_activity()
+        } else if self.has_completed_tool_activity()
             && !cell.transcript_lines(history_width).is_empty()
         {
             return self.transcript.take_active_cell();
@@ -1449,7 +1457,7 @@ impl ChatWidget {
         self.bottom_pane.show_shutdown_in_progress();
     }
 
-    fn request_redraw(&mut self) {
+    pub(crate) fn request_redraw(&self) {
         self.frame_requester.schedule_frame();
     }
 
@@ -1521,8 +1529,7 @@ impl ChatWidget {
 
     fn clean_background_terminals(&mut self) {
         self.submit_op(AppCommand::clean_background_terminals());
-        self.unified_exec_processes.clear();
-        self.sync_unified_exec_footer();
+        self.clear_background_terminals();
         self.add_info_message(
             "Stopping all background terminals.".to_string(),
             /*hint*/ None,
@@ -1743,6 +1750,17 @@ impl ChatWidget {
         if !had_rendered_width {
             self.request_redraw();
         }
+    }
+
+    /// Reflow at the allocated conversation width and report any presentation-only revision change.
+    pub(crate) fn resize_owned_conversation(&mut self, width: u16) -> Option<(u64, u64)> {
+        if self.last_rendered_width.get() == Some(width) {
+            return None;
+        }
+        let previous = self.transcript.active_cell_revision;
+        self.on_terminal_resize(width);
+        let reflowed = self.transcript.active_cell_revision;
+        (previous != reflowed).then_some((previous, reflowed))
     }
 
     /// Whether an agent message stream is active (not a plan stream).
@@ -2072,14 +2090,18 @@ impl ChatWidget {
         &self.config
     }
 
-    #[cfg(test)]
+    pub(crate) fn new_status_indicator(
+        &self,
+    ) -> crate::status_indicator_widget::StatusIndicatorWidget {
+        self.bottom_pane.new_status_indicator()
+    }
+
     pub(crate) fn status_line_text(&self) -> Option<String> {
         self.status_line_content()
             .cloned()
             .map(|content| content.into_hyperlink_line().line.to_string())
     }
 
-    #[cfg(test)]
     pub(crate) fn status_line_content(
         &self,
     ) -> Option<&crate::bottom_pane::footer_content::FooterContent> {

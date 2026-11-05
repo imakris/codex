@@ -4,6 +4,9 @@
 //! cells, commit ticks, and interrupt deferral.
 
 use super::*;
+use crate::app_event::CapturedSideDisplay;
+use crate::app_event::CapturedSideStream;
+use crate::app_event::CapturedSideWork;
 use crate::markdown_render::ListSpacing;
 
 fn streamed_message_matches_completed(streamed: &str, completed: &str) -> bool {
@@ -200,6 +203,81 @@ impl ChatWidget {
             self.status_state.current_status.details_max_lines,
         );
         self.status_state.pending_status_indicator_restore = false;
+    }
+
+    /// Capture at handoff, while links and visualization directives still have the outgoing cwd.
+    pub(crate) fn take_side_display(
+        &mut self,
+        width: u16,
+    ) -> (Option<CapturedSideStream>, CapturedSideDisplay) {
+        self.flush_completed_tool_activity();
+        let visualizations = self.thread_id.and_then(|id| {
+            crate::inline_visualization::InlineVisualizationContext::from_config(&self.config, id)
+        });
+        let stream = if let Some(controller) = &self.stream_controller {
+            let source = controller.source_snapshot();
+            let markdown = parse_assistant_markdown(&source, self.config.cwd.as_path());
+            let cell = history_cell::AgentMarkdownCell::from_parsed_message(
+                markdown.visible_markdown,
+                source,
+                &self.config.cwd,
+                visualizations.clone(),
+                &[],
+            );
+            Some(CapturedSideStream::Answer {
+                cell: Arc::new(cell),
+                item: self.transcript.active_streamed_agent_message.clone(),
+            })
+        } else if self.plan_stream_controller.is_some() {
+            Some(CapturedSideStream::Plan(Arc::new(
+                history_cell::new_proposed_plan(
+                    self.transcript.plan_delta_buffer.clone(),
+                    &self.config.cwd,
+                ),
+            )))
+        } else {
+            None
+        };
+        let active = self
+            .transcript
+            .take_active_cell()
+            .filter(|cell| match &stream {
+                Some(CapturedSideStream::Answer { .. }) => {
+                    !cell.as_any().is::<history_cell::StreamingAgentTailCell>()
+                }
+                Some(CapturedSideStream::Plan(_)) => {
+                    !cell.as_any().is::<history_cell::StreamingPlanTailCell>()
+                }
+                None => true,
+            });
+        let display = CapturedSideDisplay {
+            rendered_completion_turn_ids: self.turn_lifecycle.rendered_completion_turn_ids.clone(),
+            active,
+            last_completed_agent_message: self.transcript.last_completed_agent_message.clone(),
+            auxiliary: self
+                .active_cell_transcript_hyperlink_lines(width)
+                .unwrap_or_default(),
+            draft: {
+                let snapshot = self.bottom_pane.composer_recovery_snapshot();
+                let mut draft = Box::new(crate::bottom_pane::TextArea::new());
+                draft.set_text_with_elements(&snapshot.text, &snapshot.text_elements);
+                draft
+            },
+            status: self.status_line_text(),
+            work: self
+                .last_turn_id()
+                .filter(|_| self.is_agent_turn_running())
+                .map(|turn_id| {
+                    CapturedSideWork::new(
+                        turn_id.to_owned(),
+                        self.new_status_indicator(),
+                        self.bottom_pane.status_elapsed().unwrap_or_default(),
+                    )
+                }),
+            cwd: self.config.cwd.clone(),
+            visualizations,
+        };
+        (stream, display)
     }
 
     fn completed_agent_message_was_flushed(&self, message: &str) -> bool {
@@ -470,15 +548,13 @@ impl ChatWidget {
                     thread_id,
                 )
             });
-            self.add_to_history(
-                history_cell::AgentMarkdownCell::new_with_inline_visualizations(
-                    parsed.visible_markdown.clone(),
-                    self.config.cwd.as_path(),
-                    context,
-                )
-                .with_questions(questions)
-                .with_copy_source(Some(message.clone())),
-            );
+            self.add_to_history(history_cell::AgentMarkdownCell::from_parsed_message(
+                parsed.visible_markdown.clone(),
+                message.clone(),
+                self.config.cwd.as_path(),
+                context,
+                questions,
+            ));
             self.handle_stream_finished();
             self.request_redraw();
         } else {
@@ -537,11 +613,10 @@ impl ChatWidget {
 
     /// Runs a commit tick for the current stream queue snapshot.
     ///
-    /// `scope` controls whether this call may commit in smooth mode or only when catch-up
-    /// is currently active. While lines are actively streaming we hide the status row to avoid
-    /// duplicate "in progress" affordances. Restoration is gated separately so we only re-show
+    /// `scope` selects paced, catch-up, or replay draining. While lines are actively streaming
+    /// we hide the status row to avoid duplicate "in progress" affordances. We only re-show
     /// the row after commentary completion once stream queues are idle.
-    pub(super) fn run_commit_tick_with_scope(&mut self, scope: CommitTickScope) {
+    pub(crate) fn run_commit_tick_with_scope(&mut self, scope: CommitTickScope) {
         let now = Instant::now();
         let outcome = run_commit_tick(
             &mut self.adaptive_chunking,

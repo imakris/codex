@@ -57,6 +57,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::security_risk::SecurityRiskScore;
+use codex_protocol_test_support::uuid_v7_item_id_generator_for_test;
 use core_test_support::ThreadIdle;
 use core_test_support::apps_test_server::HostedMessagingServer;
 use core_test_support::responses;
@@ -265,8 +266,13 @@ async fn installed_extension_warms_connections_without_blocking_thread_start() -
 async fn installed_extension_uses_http_after_warm_socket_auth_expires() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("original"));
+    auth_manager
+        .set_external_auth(Arc::new(RefreshableAuth(std::sync::Mutex::new("original"))))
+        .await?;
     let thread_server = responses::start_mock_server().await;
     let test = test_codex()
+        .with_auth_manager(Arc::clone(&auth_manager))
         .with_config(|config| config.approvals_reviewer = ApprovalsReviewer::AutoReview)
         .build_with_auto_env(&thread_server)
         .await?;
@@ -281,10 +287,6 @@ async fn installed_extension_uses_http_after_warm_socket_auth_expires() -> Resul
     let server = responses::start_websocket_server(connections).await;
     let http = responses::start_mock_server().await;
     let http_mock = responses::mount_sse_once(&http, responses::sse(events)).await;
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("original"));
-    auth_manager
-        .set_external_auth(Arc::new(RefreshableAuth(std::sync::Mutex::new("original"))))
-        .await?;
     let mut config = test.config.clone();
     config.model_provider = ModelProviderInfo::create_openai_provider(Some(
         proxy_websocket_servers_with_http(
@@ -310,7 +312,7 @@ async fn installed_extension_uses_http_after_warm_socket_auth_expires() -> Resul
         .get_model_info("gpt-5.5", &config.to_models_manager_config())
         .await;
     model.node_repl_auto_review_required = true;
-    thread_store.insert(model);
+    thread_store.insert_arc(model.model);
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
             config: &config,
@@ -478,7 +480,7 @@ fn user_instruction(text: &str) -> ResponseItem {
     ResponseItem::Message {
         status: None,
         encrypted_content: None,
-        id: Some(ResponseItemId::new("msg")),
+        id: Some(uuid_v7_item_id_generator_for_test()("msg")),
         role: "user".to_owned(),
         content: vec![ContentItem::InputText {
             text: text.to_owned(),
@@ -801,7 +803,7 @@ async fn computer_use_only_scores_cannot_approve_other_actions() -> Result<()> {
         computer_use: Some(codex_protocol::openai_models::GuardianReviewMode::Adaptive),
         ..Default::default()
     });
-    thread_store.insert(changed_model);
+    thread_store.insert_arc(changed_model.model);
     assert_eq!(
         cached_approval(
             &fixture.registry,
@@ -1049,7 +1051,7 @@ async fn sample_configured_conversation_history_with_delivery(
             .get_models_manager()
             .get_model_info("gpt-5.5", &config.to_models_manager_config())
             .await;
-        thread_store.insert(parent_model);
+        thread_store.insert_arc(parent_model.model);
     }
     assert_eq!(
         cached_approval(
@@ -1316,7 +1318,7 @@ async fn contributor_fails_closed_when_model_configuration_is_invalid() -> Resul
         .test
         .codex
         .thread_extension_data()
-        .insert(parent_model);
+        .insert_arc(parent_model.model);
 
     fixture.score_tool(ToolName::plain("read_file")).await;
     fixture.assert_fails_closed("elevated_risk").await
@@ -2065,7 +2067,7 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
         ResponseItem::Message {
             status: None,
             encrypted_content: None,
-            id: Some(ResponseItemId::new("assistant")),
+            id: Some(uuid_v7_item_id_generator_for_test()("assistant")),
             role: "assistant".to_owned(),
             content: vec![ContentItem::OutputText {
                 annotations: None,
@@ -2472,7 +2474,7 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
         .get_model_info("gpt-5.5", &config.to_models_manager_config())
         .await;
     model_info.slug = "protected-model".to_owned();
-    thread_store.insert(model_info);
+    thread_store.insert_arc(model_info.model);
     // A late prewarm preview must leave the active model's review requirements intact.
     let _ = codex_core::guardian_review::prepare_review_prewarm(&test.codex).await?;
     let authorization = ScoreAuthorization::current(&test.codex, &Default::default()).await;
@@ -3348,7 +3350,7 @@ async fn assert_parent_compaction_reuse(parent_context_for_review: bool) -> Resu
         retained_context: parent_context_for_review.then(codex_history::RetainedContext::default),
         review_context_revision,
     };
-    thread_store.insert(parent_model);
+    thread_store.insert_arc(parent_model.model);
 
     registry.tool_lifecycle_contributors()[0]
         .on_tool_start(ToolStartInput {

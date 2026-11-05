@@ -2,6 +2,11 @@ name: Pet fork sync and release
 
 on:
   workflow_dispatch:
+    inputs:
+      verify_only:
+        description: Validate the selected source without syncing or publishing
+        type: boolean
+        default: false
   schedule:
     - cron: "17 7 * * *"
       timezone: "Europe/Berlin"
@@ -34,7 +39,7 @@ jobs:
         id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/pet_release.py prepare
+        run: python3 scripts/pet_release.py prepare ${{ inputs.verify_only && '--verify-only' || '' }}
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         if: steps.candidate.outputs.build == 'true'
         with:
@@ -201,6 +206,7 @@ jobs:
 
   publish:
     needs: [prepare, build]
+    if: ${{ !inputs.verify_only }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write

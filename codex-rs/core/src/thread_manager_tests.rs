@@ -1,6 +1,10 @@
+#![cfg(test)]
+
 use super::*;
+use crate::ThreadStoreBuilder;
 use crate::agent::types::SpawnAgentOptions;
 use crate::config::RolloutBudgetConfig;
+use crate::config::ThreadStoreConfig;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
@@ -14,15 +18,21 @@ use crate::session::tests::make_session_and_context;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
+use codex_config::ConfigLayerStack;
+use codex_execpolicy::Decision;
+use codex_execpolicy::NetworkRuleProtocol;
 use codex_extension_api::SessionIsolation;
 use codex_extension_api::empty_extension_registry;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
+use codex_models_manager::manager::ModelCatalogSettings;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
+use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::error::CodexErrKind;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
 use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
@@ -45,6 +55,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::InMemoryThreadStore;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
@@ -153,6 +164,182 @@ async fn live_fork_keeps_instructions_when_source_is_unloaded_during_setup() {
         .shutdown_and_wait()
         .await
         .expect("shutdown fork");
+}
+
+async fn startup_fixture() -> (tempfile::TempDir, Config, ThreadManager) {
+    let home = tempdir().unwrap();
+    let mut config = test_config().await;
+    config.codex_home = home.path().abs();
+    config.cwd = config.codex_home.abs();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    (home, config, manager)
+}
+
+fn managed_stack(requirements: Option<RequirementsExecPolicy>) -> ConfigLayerStack {
+    let config = codex_config::ConfigRequirements {
+        exec_policy: requirements.map(|policy| {
+            codex_config::Sourced::new(policy, codex_config::RequirementSource::Unknown)
+        }),
+        ..Default::default()
+    };
+    ConfigLayerStack::new(Vec::new(), config, Default::default())
+        .unwrap()
+        .with_user_and_project_exec_policy_rules_ignored(
+            /*ignore_user_and_project_exec_policy_rules*/ true,
+        )
+}
+
+#[tokio::test]
+async fn child_and_grandchild_inherit_session_amendments_and_managed_rules() {
+    let (home, mut config, manager) = startup_fixture().await;
+    let mut managed = Policy::empty();
+    managed
+        .add_prefix_rule(&["rm".into()], Decision::Forbidden)
+        .unwrap();
+    let requirements = RequirementsExecPolicy::new(managed);
+    config.config_layer_stack = managed_stack(Some(requirements));
+    let source = ExecPolicyManager::load(&config.config_layer_stack)
+        .await
+        .unwrap();
+    source
+        .append_amendment_and_update(
+            home.path(),
+            &ExecPolicyAmendment::new(vec!["git".into(), "status".into()]),
+        )
+        .await
+        .unwrap();
+    let (mut policy, mut source_requirements) = source.snapshot();
+    // The child forwards its installed snapshot when it starts the grandchild.
+    for _ in 0..2 {
+        let mut options = StartThreadOptions::new(config.clone());
+        options.set_inherited_exec_policy(policy, source_requirements);
+        let runtime = manager.start_thread(options).await.unwrap();
+        (policy, source_requirements) = runtime.thread.session.services.exec_policy.snapshot();
+        assert!(policy.rules().contains_key("git"));
+        assert!(policy.rules().contains_key("rm"));
+    }
+}
+
+#[tokio::test]
+async fn policy_transfer_rejects_changed_sources_and_weakened_destination_rules() {
+    let mut managed = Policy::empty();
+    managed
+        .add_prefix_rule(&["git".into()], Decision::Forbidden)
+        .unwrap();
+    managed
+        .add_network_rule(
+            "example.org",
+            NetworkRuleProtocol::Https,
+            Decision::Forbidden,
+            /*justification*/ None,
+        )
+        .unwrap();
+    let requirements = RequirementsExecPolicy::new(managed.clone());
+    let stack = managed_stack(Some(requirements.clone()));
+    let require_rejection = async |policy, stack: &ConfigLayerStack| {
+        let snapshot = InheritedExecPolicy {
+            policy: Arc::new(policy),
+            source_requirements: Some(Arc::new(requirements.clone())),
+        };
+        let result = ExecPolicyManager::from_inherited(&snapshot, stack).await;
+        assert_eq!(
+            result.as_ref().err().map(CodexErrKind::from),
+            Some(CodexErrKind::InvalidRequest)
+        );
+    };
+    require_rejection(Policy::empty(), &stack).await;
+    require_rejection(managed.clone(), &managed_stack(/*requirements*/ None)).await;
+    require_rejection(
+        managed.clone(),
+        &stack
+            .clone()
+            .with_user_and_project_exec_policy_rules_ignored(
+                /*ignore_user_and_project_exec_policy_rules*/ false,
+            ),
+    )
+    .await;
+    let mut different_network = managed.clone();
+    different_network
+        .add_network_rule(
+            "another.org",
+            NetworkRuleProtocol::Https,
+            Decision::Forbidden,
+            /*justification*/ None,
+        )
+        .unwrap();
+    require_rejection(
+        managed.clone(),
+        &managed_stack(Some(RequirementsExecPolicy::new(different_network))),
+    )
+    .await;
+    let mut weakened = managed.clone();
+    weakened
+        .add_network_rule(
+            "example.org",
+            NetworkRuleProtocol::Https,
+            Decision::Allow,
+            /*justification*/ None,
+        )
+        .unwrap();
+    require_rejection(weakened, &stack).await;
+    if cfg!(unix) {
+        managed
+            .add_prefix_rule(&["/usr/bin/git".into()], Decision::Allow)
+            .unwrap();
+        require_rejection(managed, &stack).await;
+    }
+}
+
+#[tokio::test]
+async fn fixed_thread_text_supersedes_the_live_provider_and_isolated_helpers_reject_inheritance() {
+    let (_home, config, manager) = startup_fixture().await;
+    let instructions = |text: &str| Instructions {
+        text: text.to_owned(),
+        source: None,
+    };
+    for (fixed, expected) in [
+        (None, Some("live")),
+        (Some("captured"), Some("captured")),
+        (Some(""), None),
+    ] {
+        let mut options = StartThreadOptions::new(config.clone());
+        options.thread_instructions_provider =
+            Some(Arc::new(ParentInstructionsProvider(instructions("live"))));
+        if let Some(text) = fixed {
+            options.set_inherited_thread_instructions(instructions(text));
+        }
+        let runtime = manager.start_thread(options).await.unwrap();
+        let session = &runtime.thread.session;
+        let (result, _) = session
+            .services
+            .agents_md_manager
+            .refresh(&config, &TurnEnvironmentSnapshot::default())
+            .await;
+        result.unwrap();
+        let inherited = session.inherited_instructions().await;
+        assert_eq!(inherited.thread, expected.map(instructions));
+    }
+    let mut with_policy = StartThreadOptions::new(config.clone());
+    with_policy.config.config_layer_stack = managed_stack(/*requirements*/ None);
+    with_policy
+        .set_inherited_exec_policy(Arc::new(Policy::empty()), /*source_requirements*/ None);
+    let mut with_instructions = StartThreadOptions::new(config);
+    with_instructions.set_inherited_thread_instructions(instructions("captured"));
+    for mut isolated in [with_policy, with_instructions] {
+        isolated
+            .thread_extension_init
+            .insert(SessionIsolation::Isolated);
+        let result = manager.start_thread(isolated).await;
+        assert_eq!(
+            result.as_ref().err().map(CodexErrKind::from),
+            Some(CodexErrKind::InvalidRequest)
+        );
+    }
 }
 
 /// A thread opt-out wins over a shared client without disabling its siblings.
@@ -490,6 +677,128 @@ async fn thread_id_generator_does_not_replace_resumed_thread_id() {
         .shutdown_and_wait()
         .await
         .expect("shut down resumed thread");
+}
+
+#[test_case::test_case(false; "local_child")]
+#[test_case::test_case(true; "host_child")]
+#[tokio::test]
+async fn child_session_inherits_resumed_parent_auth(host_child: bool) {
+    let home = tempdir().expect("temporary home");
+    let mut config = test_config().await;
+    config.codex_home = home.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("key-a"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let original = manager
+        .start_thread(StartThreadOptions {
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            ..StartThreadOptions::new(config.clone())
+        })
+        .await
+        .expect("start original thread");
+    original.thread.ensure_rollout_materialized().await;
+    original
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush original history");
+    original
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop original thread");
+    manager.remove_thread(&original.thread_id).await;
+    let replacement = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("key-b"),
+        config.codex_home.to_path_buf(),
+    );
+    let parent = manager
+        .resume_thread_with_history(
+            config.clone(),
+            InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
+                conversation_id: original.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: original.thread.rollout_path(),
+            }),
+            Arc::clone(&replacement),
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+        )
+        .await
+        .expect("resume with replacement credentials");
+    let options = StartThreadOptions {
+        reserved_thread_id: host_child.then(|| manager.reserve_thread_id()),
+        session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: parent.thread_id,
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        })),
+        ..StartThreadOptions::new(config)
+    };
+    let control = parent
+        .thread
+        .session
+        .services
+        .local_agent_runtime
+        .control(parent.thread.session.session_id());
+    let child = if host_child {
+        manager
+            .state
+            .spawn_host_child_thread(
+                options,
+                control.into(),
+                parent.thread_id,
+                crate::agent::host::PreparedChildInheritance {
+                    instructions: parent.thread.session.inherited_instructions().await,
+                    exec_policy: None,
+                    originator: parent.thread.session.originator().await,
+                    attachment_source: None,
+                },
+            )
+            .await
+    } else {
+        manager
+            .state
+            .spawn_child_thread(
+                options,
+                control,
+                Some(parent.thread_id),
+                /*inherited_exec_policy*/ None,
+            )
+            .await
+    }
+    .expect("spawn child under the resumed parent");
+
+    assert!(
+        Arc::ptr_eq(&child.thread.session.services.auth_manager, &replacement),
+        "child must use the resumed parent's credentials",
+    );
+    assert!(
+        Arc::ptr_eq(
+            &child.thread.session.services.runtime_auth,
+            &parent.thread.session.services.runtime_auth,
+        ),
+        "child must share the resumed parent's runtime owner",
+    );
+    assert!(
+        !Arc::ptr_eq(
+            &child.thread.session.services.runtime_auth,
+            &manager.state.runtime_auth
+        ),
+        "replacement-auth descendants must stay separate from the harness runtime",
+    );
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed.len(), 2);
 }
 
 #[tokio::test]
@@ -943,6 +1252,10 @@ async fn code_mode_session_provider_is_shared_across_threads() {
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    config
+        .features
+        .enable(Feature::CodeModeHostOutputTruncation)
+        .expect("enable the built-in provider's server truncation feature");
 
     let provider: Arc<dyn CodeModeSessionProvider> = Arc::new(DisabledCodeModeSessionProvider);
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
@@ -951,6 +1264,9 @@ async fn code_mode_session_provider_is_shared_across_threads() {
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     )
+    // Exercise the production factory with the startup flag before overriding
+    // its lazy built-in provider. No host is started by this test.
+    .with_code_mode_host_program_for_tests(temp_dir.path().join("unused-code-mode-host"), &config)
     .with_code_mode_session_provider(Arc::clone(&provider));
     let first = manager
         .start_thread(StartThreadOptions::new(config.clone()))
@@ -1057,8 +1373,12 @@ async fn mcp_invalidation_refreshes_threads_that_are_still_starting() {
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
     let manager = Arc::new(ThreadManager::new(
         &config,
-        Arc::clone(&auth_manager),
-        build_models_manager(&config, auth_manager),
+        crate::build_startup_models(
+            &config,
+            Arc::clone(&auth_manager),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -1066,9 +1386,8 @@ async fn mcp_invalidation_refreshes_threads_that_are_still_starting() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, /*state_db*/ None),
+        ThreadStoreBuilder::from_config(&config, /*state_db*/ None).build(),
         /*agent_graph_store*/ None,
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     ));
@@ -1725,8 +2044,12 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -1734,9 +2057,8 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, /*state_db*/ None),
+        ThreadStoreBuilder::from_config(&config, /*state_db*/ None).build(),
         /*agent_graph_store*/ None,
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -2172,8 +2494,12 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2181,9 +2507,8 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, /*state_db*/ None),
+        ThreadStoreBuilder::from_config(&config, /*state_db*/ None).build(),
         /*agent_graph_store*/ None,
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -2329,11 +2654,15 @@ async fn explicit_installation_id_skips_codex_home_file() {
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let installation_id = uuid::Uuid::new_v4().to_string();
     let state_db = init_state_db(&config).await;
-    let thread_store = thread_store_from_config(&config, state_db.clone());
+    let thread_store = ThreadStoreBuilder::from_config(&config, state_db.clone()).build();
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            installation_id.clone(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2343,7 +2672,6 @@ async fn explicit_installation_id_skips_codex_home_file() {
         passthrough_image_store(),
         thread_store,
         local_agent_graph_store_from_state_db(state_db.as_ref()),
-        installation_id.clone(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -2376,8 +2704,12 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2385,9 +2717,8 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, /*state_db*/ None),
+        ThreadStoreBuilder::from_config(&config, /*state_db*/ None).build(),
         /*agent_graph_store*/ None,
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -2442,8 +2773,12 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2451,9 +2786,8 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, /*state_db*/ None),
+        ThreadStoreBuilder::from_config(&config, /*state_db*/ None).build(),
         /*agent_graph_store*/ None,
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -2512,11 +2846,15 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
     let auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let state_db = init_state_db(&config).await;
-    let thread_store = thread_store_from_config(&config, state_db.clone());
+    let thread_store = ThreadStoreBuilder::from_config(&config, state_db.clone()).build();
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2526,7 +2864,6 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
         passthrough_image_store(),
         thread_store,
         local_agent_graph_store_from_state_db(state_db.as_ref()),
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -2602,8 +2939,12 @@ async fn subtree_listing_uses_injected_graph_store_without_state_db() {
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2611,9 +2952,8 @@ async fn subtree_listing_uses_injected_graph_store_without_state_db() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, /*state_db*/ None),
+        ThreadStoreBuilder::from_config(&config, /*state_db*/ None).build(),
         Some(agent_graph_store),
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -2643,15 +2983,19 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
     let auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let state_db = init_state_db(&config).await;
-    let thread_store = thread_store_from_config(&config, state_db.clone());
+    let thread_store = ThreadStoreBuilder::from_config(&config, state_db.clone()).build();
     let in_memory_store = thread_store
         .as_any()
         .downcast_ref::<InMemoryThreadStore>()
         .expect("configured in-memory store");
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2661,7 +3005,6 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
         passthrough_image_store(),
         thread_store.clone(),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -2753,15 +3096,19 @@ async fn metadata_update_without_result_reads_only_when_the_caller_needs_the_thr
 
     let auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    let thread_store = thread_store_from_config(&config, /*state_db*/ None);
+    let thread_store = ThreadStoreBuilder::from_config(&config, /*state_db*/ None).build();
     let in_memory_store = thread_store
         .as_any()
         .downcast_ref::<InMemoryThreadStore>()
         .expect("configured in-memory store");
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2771,7 +3118,6 @@ async fn metadata_update_without_result_reads_only_when_the_caller_needs_the_thr
         passthrough_image_store(),
         thread_store.clone(),
         /*agent_graph_store*/ None,
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -2887,8 +3233,12 @@ async fn new_uses_active_provider_for_model_refresh() {
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2896,9 +3246,8 @@ async fn new_uses_active_provider_for_model_refresh() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, /*state_db*/ None),
+        ThreadStoreBuilder::from_config(&config, /*state_db*/ None).build(),
         /*agent_graph_store*/ None,
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -2964,7 +3313,7 @@ async fn new_uses_active_provider_for_model_refresh() {
 }
 
 #[tokio::test]
-async fn injected_models_manager_controls_refresh_policy() {
+async fn startup_catalog_cache_policy_controls_refresh() {
     let server = MockServer::start().await;
     let _ = mount_models_once(&server, ModelsResponse { models: vec![] }).await;
     let _ = mount_models_once(&server, ModelsResponse { models: vec![] }).await;
@@ -2979,15 +3328,14 @@ async fn injected_models_manager_controls_refresh_policy() {
 
     let auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    let provider = create_model_provider(
-        config.model_provider.clone(),
-        Some(Arc::clone(&auth_manager)),
-    );
-    let models_manager = provider.models_manager_without_cache(config.model_catalog.clone());
     let manager = ThreadManager::new(
         &config,
-        auth_manager,
-        models_manager,
+        crate::build_startup_models(
+            &config,
+            auth_manager,
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::default()),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Custom("test-embedder".to_string()),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2995,9 +3343,8 @@ async fn injected_models_manager_controls_refresh_policy() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, /*state_db*/ None),
+        ThreadStoreBuilder::from_config(&config, /*state_db*/ None).build(),
         /*agent_graph_store*/ None,
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -3267,8 +3614,12 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
     let state_db = init_state_db(&config).await;
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -3276,9 +3627,8 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, state_db.clone()),
+        ThreadStoreBuilder::from_config(&config, state_db.clone()).build(),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -3379,8 +3729,12 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
     let state_db = init_state_db(&config).await;
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -3388,9 +3742,8 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, state_db.clone()),
+        ThreadStoreBuilder::from_config(&config, state_db.clone()).build(),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
@@ -3484,8 +3837,12 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
     let state_db = init_state_db(&config).await;
     let manager = ThreadManager::new(
         &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
+        crate::build_startup_models(
+            &config,
+            auth_manager.clone(),
+            TEST_INSTALLATION_ID.to_string(),
+            Arc::new(ModelCatalogSettings::disk(config.codex_home.to_path_buf())),
+        ),
         crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -3493,9 +3850,8 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         passthrough_image_store(),
-        thread_store_from_config(&config, state_db.clone()),
+        ThreadStoreBuilder::from_config(&config, state_db.clone()).build(),
         local_agent_graph_store_from_state_db(state_db.as_ref()),
-        TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );

@@ -896,6 +896,7 @@ client_request_definitions! {
     },
     ThreadItemsList => "thread/items/list" {
         params: v2::ThreadItemsListParams,
+        inspect_params: true,
         // Explicitly concurrent: this primarily reads append-only rollout storage.
         serialization: None,
         response: v2::ThreadItemsListResponse,
@@ -906,6 +907,13 @@ client_request_definitions! {
         // Explicitly concurrent: this primarily reads append-only rollout storage.
         serialization: None,
         response: v2::ThreadItemsReadResponse,
+    },
+    #[experimental("thread/guardianReview")]
+    /// Review the idle thread's final injected exec_command without executing it.
+    ThreadGuardianReview => "thread/guardianReview" {
+        params: v2::ThreadGuardianReviewParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGuardianReviewResponse,
     },
     /// Append raw Responses API items to the thread history without starting a user turn.
     ThreadInjectItems => "thread/inject_items" {
@@ -1166,6 +1174,16 @@ client_request_definitions! {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
         serialization: None,
         response: v2::GatewayOAuthCancelResponse,
+    },
+    ModelProviderList => "modelProvider/list" {
+        params: v2::ModelProviderListParams,
+        serialization: global_shared_read("config"),
+        response: v2::ModelProviderListResponse,
+    },
+    ModelProviderConfigWrite => "modelProvider/config/write" {
+        params: v2::ModelProviderConfigWriteParams,
+        serialization: global("config"),
+        response: v2::ModelProviderConfigWriteResponse,
     },
     ModelProviderCapabilitiesRead => "modelProvider/capabilities/read" {
         params: v2::ModelProviderCapabilitiesReadParams,
@@ -2010,6 +2028,7 @@ server_notification_definitions! {
     ThreadReverted => "thread/reverted" (v2::ThreadRevertedNotification),
     SkillsChanged => "skills/changed" (v2::SkillsChangedNotification),
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
+    ThreadSectionChanged => "thread/section/changed" (v2::ThreadSectionChangedNotification),
     ThreadAttachmentUpdated => "thread/attachment/updated" (v2::ThreadAttachmentUpdatedNotification),
     ThreadGoalUpdated => "thread/goal/updated" (v2::ThreadGoalUpdatedNotification),
     #[experimental("thread/prediction/updated")]
@@ -2551,6 +2570,7 @@ mod tests {
         let mcp_resource_read = ClientRequest::McpResourceRead {
             request_id: request_id(),
             params: v2::McpResourceReadParams {
+                meta: None,
                 thread_id: Some("thread-1".to_string()),
                 origin_call_id: None,
                 server: "server-a".to_string(),
@@ -2738,6 +2758,7 @@ mod tests {
                 cursor: None,
                 limit: None,
                 sort_direction: None,
+                defer_output: None,
             },
         };
         assert_eq!(thread_items_list.serialization_scope(), None);
@@ -2745,6 +2766,7 @@ mod tests {
         let mcp_resource_read = ClientRequest::McpResourceRead {
             request_id: request_id(),
             params: v2::McpResourceReadParams {
+                meta: None,
                 thread_id: None,
                 origin_call_id: None,
                 server: "server-a".to_string(),

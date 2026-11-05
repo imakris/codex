@@ -71,6 +71,30 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(pet_release.latest_native_release(), (tag, version))
                 api.assert_called_once_with("releases/latest", repository="openai/codex")
 
+    def test_verification_uses_selected_source_without_synchronizing_or_publishing(self):
+        output = self.directory / "verification-output.txt"
+        candidate = self.metadata["commit"]
+        environment = {
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_RUN_NUMBER": "5",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_REPOSITORY": "imakris/codex",
+        }
+        with patch.dict(os.environ, environment), \
+                patch.object(pet_release, "run", return_value=candidate) as run, \
+                patch.object(pet_release, "api", return_value={"tag_name": "rust-v0.160.0"}) as api:
+            pet_release.prepare(self.directory, verify_only=True)
+            run.assert_called_once_with("git", "rev-parse", "HEAD", capture=True)
+            api.assert_called_once_with("releases/latest", repository="openai/codex")
+            with self.assertRaisesRegex(RuntimeError, "cannot be published"):
+                pet_release.publish(self.directory, self.directory)
+            run.assert_called_once()
+        metadata = json.loads((self.directory / "candidate.json").read_text())
+        self.assertEqual(metadata["base"], candidate)
+        self.assertEqual(metadata["commit"], candidate)
+        self.assertTrue(metadata["verify_only"])
+        self.assertIn("build=true\n", output.read_text())
+
     def test_invalid_official_release_stops_preparation(self):
         releases = [None, {"tag_name": "rust-v0.161.0-alpha.1"}, {"tag_name": "sdk-v0.161.0"},
                     {"tag_name": "rust-v0.161.0", "prerelease": True},

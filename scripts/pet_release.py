@@ -15,6 +15,7 @@ import urllib.request
 REQUIRED_TESTS = [
     "app::owned_transcript::tests::owned_transcript_uses_full_width_above_the_pet",
     "app::owned_transcript::tests::fullscreen_question_mouse_copy_routes_without_answering",
+    "app::owned_transcript::tests::composer_thumbnails_follow_draft_deletion_and_resize",
     "app::tests::resize_reflow_preserves_transcript_width_when_pet_is_enabled",
     "chatwidget::tests::status_and_layout::added_history_with_pet_uses_full_terminal_width",
     "chatwidget::tests::status_and_layout::ambient_pet_preserves_history_wrap_width",
@@ -85,11 +86,14 @@ def latest_native_release():
     return tag, match.group(1)
 
 
-def prepare(directory):
+def prepare(directory, verify_only=False):
     directory.mkdir(parents=True, exist_ok=True)
-    run("git", "fetch", "origin", BRANCH)
-    base = run("git", "rev-parse", "FETCH_HEAD", capture=True)
-    latest = api("releases/latest")
+    if verify_only:
+        base = run("git", "rev-parse", "HEAD", capture=True)
+    else:
+        run("git", "fetch", "origin", BRANCH)
+        base = run("git", "rev-parse", "FETCH_HEAD", capture=True)
+    latest = None if verify_only else api("releases/latest")
     # Promotion pushes must not chase upstream changes that arrived during the previous build.
     if (os.environ.get("GITHUB_EVENT_NAME") == "push" and latest is not None
             and latest["tag_name"].endswith("-" + base)):
@@ -97,13 +101,17 @@ def prepare(directory):
             output.write("build=false\n")
         return
     upstream_release, native_version = latest_native_release()
-    run("git", "checkout", "--detach", base)
-    run("git", "fetch", "https://github.com/openai/codex.git", "main")
-    upstream = run("git", "rev-parse", "FETCH_HEAD", capture=True)
-    run("git", "config", "user.name", "github-actions[bot]")
-    run("git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
-    run("git", "merge", "--no-edit", upstream)
-    candidate = run("git", "rev-parse", "HEAD", capture=True)
+    if verify_only:
+        upstream = None
+        candidate = base
+    else:
+        run("git", "checkout", "--detach", base)
+        run("git", "fetch", "https://github.com/openai/codex.git", "main")
+        upstream = run("git", "rev-parse", "FETCH_HEAD", capture=True)
+        run("git", "config", "user.name", "github-actions[bot]")
+        run("git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+        run("git", "merge", "--no-edit", upstream)
+        candidate = run("git", "rev-parse", "HEAD", capture=True)
     # A new official native version needs a build even when the source candidate is unchanged.
     unchanged = (latest is not None and latest["tag_name"].endswith("-" + candidate)
                  and latest["tag_name"].startswith(f"pet-v{native_version}-pet."))
@@ -113,6 +121,8 @@ def prepare(directory):
                 "upstream_release": upstream_release, "native_version": native_version,
                 "version": version, "repository": os.environ["GITHUB_REPOSITORY"],
                 "tag": f"pet-v{version}-{candidate}", "assets": ASSETS}
+    if verify_only:
+        metadata["verify_only"] = True
     write_json(directory / "candidate.json", metadata)
     if candidate != base:
         run("git", "branch", "-f", "pet-candidate", candidate)
@@ -164,6 +174,8 @@ def verify_tests(target):
 
 def publish(directory, assets_dir):
     metadata = json.loads((directory / "candidate.json").read_text())
+    if metadata.get("verify_only"):
+        raise RuntimeError("Verification candidates cannot be published")
     for asset in metadata["assets"]:
         path = assets_dir / asset["name"]
         if not path.is_file() or path.stat().st_size == 0:
@@ -219,9 +231,10 @@ def main():
     parser.add_argument("--directory", type=Path, default=ROOT / "candidate")
     parser.add_argument("--assets-dir", type=Path, default=ROOT / "release-assets")
     parser.add_argument("--target")
+    parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
     if args.command == "prepare":
-        prepare(args.directory.resolve())
+        prepare(args.directory.resolve(), verify_only=args.verify_only)
     elif args.command == "restore":
         restore(args.directory.resolve())
     elif args.command == "stamp":

@@ -20,6 +20,7 @@ use codex_login::default_client::ClientRedirectPolicy;
 use codex_login::default_client::create_client_for_route;
 use codex_model_provider_info::GatewayOAuthDelivery;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::OAuthCredentialsStore;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -74,6 +75,7 @@ async fn gateway_credentials_accompany_primary_auth_in_models_and_responses() {
             resource: None,
             scopes: vec![],
             redirect_port: None,
+            credentials_store: Default::default(),
             delivery: delivery.clone(),
         };
         let info = ModelProviderInfo {
@@ -105,7 +107,11 @@ async fn gateway_credentials_accompany_primary_auth_in_models_and_responses() {
         models
             .raw_model_catalog(RefreshStrategy::Online, factory.clone())
             .await;
-        let (api, auth) = provider.api_provider_and_auth().await.unwrap();
+        let (api, resolved) = provider
+            .request_provider_and_auth(/*scope*/ None)
+            .await
+            .unwrap();
+        let auth = resolved.auth;
         let scoped = provider
             .api_auth_for_scope(ProviderAuthScope {
                 agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
@@ -210,6 +216,7 @@ async fn gateway_preserves_runtime_auth_and_rejects_header_collisions() {
                 resource: None,
                 scopes: vec![],
                 redirect_port: None,
+                credentials_store: Default::default(),
                 delivery: GatewayOAuthDelivery::Header {
                     name: "x-gateway-auth".into(),
                     scheme: "Bearer".into(),
@@ -311,6 +318,7 @@ async fn gateway_refresh_preserves_primary_auth_and_hides_issuer_errors() {
                 resource: None,
                 scopes: vec![],
                 redirect_port: None,
+                credentials_store: Default::default(),
                 delivery: GatewayOAuthDelivery::Header {
                     name: "x-gateway-auth".into(),
                     scheme: "Bearer".into(),
@@ -405,6 +413,8 @@ async fn models_cache_is_reused_only_for_matching_gateway_configuration() {
             resource: None,
             scopes: vec![],
             redirect_port: None,
+            // Keyring latency is outside the cache behavior under test.
+            credentials_store: OAuthCredentialsStore::File,
             delivery: GatewayOAuthDelivery::Header {
                 name: "x-gateway-auth".into(),
                 scheme: "Bearer".into(),
@@ -485,6 +495,7 @@ async fn models_observe_gateway_rotation(instance: ProviderInstance) {
             resource: None,
             scopes: vec![],
             redirect_port: None,
+            credentials_store: Default::default(),
             delivery: GatewayOAuthDelivery::Header {
                 name: "x-gateway-auth".into(),
                 scheme: "Bearer".into(),
@@ -599,6 +610,7 @@ async fn gateway_setup_errors_are_reported_when_authentication_is_requested() {
             resource: None,
             scopes: vec![],
             redirect_port: None,
+            credentials_store: Default::default(),
             delivery: GatewayOAuthDelivery::Header {
                 name: "x-gateway-auth".into(),
                 scheme: "Bearer".into(),
@@ -666,6 +678,7 @@ async fn gateway_login_required_invalidates_the_last_successful_catalog() {
             resource: None,
             scopes: vec![],
             redirect_port: None,
+            credentials_store: OAuthCredentialsStore::File,
             delivery: GatewayOAuthDelivery::Header {
                 name: "x-gateway-auth".into(),
                 scheme: "Bearer".into(),
@@ -750,6 +763,7 @@ async fn gateway_login_states_stop_request_retries() {
             resource: None,
             scopes: vec![],
             redirect_port: None,
+            credentials_store: Default::default(),
             delivery: GatewayOAuthDelivery::Header {
                 name: "x-gateway-auth".into(),
                 scheme: "Bearer".into(),

@@ -493,8 +493,7 @@ web_search = true
         cfg.tools,
         Some(ToolsToml {
             web_search: None,
-            experimental_request_user_input: None,
-            update_plan: None,
+            ..Default::default()
         })
     );
 }
@@ -513,8 +512,7 @@ web_search = false
         cfg.tools,
         Some(ToolsToml {
             web_search: None,
-            experimental_request_user_input: None,
-            update_plan: None,
+            ..Default::default()
         })
     );
 }
@@ -531,9 +529,8 @@ fn tools_experimental_request_user_input_defaults_to_enabled() {
     assert_eq!(
         cfg.tools,
         Some(ToolsToml {
-            web_search: None,
             experimental_request_user_input: Some(ExperimentalRequestUserInput { enabled: true }),
-            update_plan: None,
+            ..Default::default()
         })
     );
 }
@@ -551,9 +548,8 @@ enabled = false
     assert_eq!(
         cfg.tools,
         Some(ToolsToml {
-            web_search: None,
             experimental_request_user_input: Some(ExperimentalRequestUserInput { enabled: false }),
-            update_plan: None,
+            ..Default::default()
         })
     );
 }
@@ -569,6 +565,7 @@ async fn load_config_resolves_experimental_request_user_input_enabled() -> std::
                     enabled: false,
                 }),
                 update_plan: None,
+                ..Default::default()
             }),
             ..ConfigToml::default()
         },
@@ -1393,6 +1390,7 @@ fn config_toml_deserializes_model_availability_nux() {
     assert_eq!(
         cfg.tui.expect("tui config should deserialize"),
         Tui {
+            default_hosts: Default::default(),
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
             screen_reader_detection_done: None,
@@ -1406,6 +1404,7 @@ fn config_toml_deserializes_model_availability_nux() {
             question_esc_back: true,
             raw_output_mode: false,
             fullscreen_transcript: true,
+            sidebar_width_percent: None,
             mouse_scroll_speed: None,
             copy_on_select: Default::default(),
             copy_on_select_clear_selection: false,
@@ -2204,7 +2203,9 @@ respect_system_proxy = true
         codex_http_client::OutboundProxyPolicy::RespectSystemProxy
     );
     assert_eq!(
-        config.plugins_config_input().remote_plugin_service_config(),
+        config
+            .plugins_config_input()
+            .remote_plugin_service_config(/*runtime_auth*/ None),
         codex_core_plugins::remote::RemotePluginServiceConfig::new(
             config.chatgpt_base_url,
             codex_http_client::HttpClientFactory::new(
@@ -2430,6 +2431,117 @@ enabled = true
             .expect("experimental_network should configure the managed proxy")
             .enabled()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_network_requirements_ignore_disabled_proxy_feature_config() -> std::io::Result<()>
+{
+    let feature_config = r#"
+[features.network_proxy]
+enabled = true
+dangerously_allow_all_unix_sockets = true
+allow_local_binding = true
+domains = { "unmanaged.example" = "allow" }
+unix_sockets = { "/tmp/unmanaged.sock" = "allow" }
+"#;
+    let requirements = r#"
+default_permissions = "managed-primary"
+
+[features]
+network_proxy = false
+
+[allowed_permission_profiles]
+managed-primary = true
+managed-secondary = true
+
+[permissions.network]
+enabled = true
+allow_upstream_proxy = false
+domains = { "shared.example" = "allow", "blocked.example" = "deny" }
+
+[permissions.managed-primary]
+extends = ":workspace"
+
+[permissions.managed-primary.network]
+enabled = true
+proxy_url = "http://127.0.0.1:43128"
+dangerously_allow_all_unix_sockets = false
+domains = { "primary.example" = "allow" }
+unix_sockets = { "/tmp/primary.sock" = "allow" }
+
+[permissions.managed-secondary]
+extends = "managed-primary"
+
+[permissions.managed-secondary.network]
+proxy_url = "http://127.0.0.1:43129"
+"#;
+    let mut baseline: Option<(NetworkProxySpec, NetworkProxySpec)> = None;
+
+    for source in ["baseline", "user", "trusted project"] {
+        let codex_home = TempDir::new()?;
+        let workspace = TempDir::new()?;
+        let workspace_key = TomlValue::String(project_trust_key(workspace.path()));
+        let user_features = if source == "user" { feature_config } else { "" };
+        std::fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            format!(
+                r#"
+[projects.{workspace_key}]
+trust_level = "trusted"
+{user_features}
+"#
+            ),
+        )?;
+        if source == "trusted project" {
+            let project_config_dir = workspace.path().join(".codex");
+            std::fs::create_dir_all(&project_config_dir)?;
+            std::fs::write(project_config_dir.join(CONFIG_TOML_FILE), feature_config)?;
+        }
+
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home.path().to_path_buf())
+            .harness_overrides(ConfigOverrides {
+                cwd: Some(workspace.path().to_path_buf()),
+                ..Default::default()
+            })
+            .cloud_config_bundle(
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(requirements),
+            )
+            .build()
+            .await?;
+
+        assert!(!config.features.enabled(Feature::NetworkProxy), "{source}");
+        assert!(config.managed_network_requirements_enabled(), "{source}");
+        let active_profile = config
+            .permissions
+            .active_permission_profile()
+            .expect("managed profile should be active");
+        let initial = config
+            .permissions
+            .network
+            .as_ref()
+            .expect("shared requirements should enable the proxy");
+        let mut selected_profile = active_profile;
+        selected_profile.id = "managed-secondary".to_string();
+        let reselected = config
+            .network_proxy_spec_for_active_permission_profile(
+                &selected_profile,
+                config.permissions.permission_profile(),
+            )?
+            .expect("reselected managed profile should retain the proxy");
+
+        if let Some((baseline_initial, baseline_reselected)) = &baseline {
+            assert_eq!(initial, baseline_initial, "{source} initial");
+            assert_eq!(&reselected, baseline_reselected, "{source} reselected");
+        } else {
+            assert!(initial.enabled());
+            assert!(reselected.enabled());
+            assert_eq!(initial.proxy_host_and_port(), "127.0.0.1:43128");
+            assert_eq!(reselected.proxy_host_and_port(), "127.0.0.1:43129");
+            baseline = Some((initial.clone(), reselected));
+        }
+    }
     Ok(())
 }
 
@@ -4643,6 +4755,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
     assert_eq!(
         tui,
         Tui {
+            default_hosts: Default::default(),
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
             screen_reader_detection_done: None,
@@ -4656,6 +4769,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             question_esc_back: true,
             raw_output_mode: false,
             fullscreen_transcript: true,
+            sidebar_width_percent: None,
             mouse_scroll_speed: None,
             copy_on_select: Default::default(),
             copy_on_select_clear_selection: false,
@@ -8815,6 +8929,9 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template(
                 "  Configured template: {{ tenant_policy_config }}  ".to_string(),
             ),
             experimental_conversation_history_prompt: None,
+            experimental_denial_reconsideration_prompt: Some(
+                "  Reconsider this review carefully.  ".to_owned(),
+            ),
             conversation_history_max_output_tokens: None,
         }),
         ..Default::default()
@@ -8836,12 +8953,14 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template(
             config.guardian_policy_config.as_deref(),
             config.guardian_extra_policy.as_deref(),
             config.guardian_policy_template.as_deref(),
+            config.guardian_denial_reconsideration_prompt.as_deref(),
         ),
         (
             expected_mode,
             Some("Use the user-configured guardian policy."),
             Some("Use the user-configured additional policy."),
             Some("Configured template: {{ tenant_policy_config }}"),
+            Some("Reconsider this review carefully."),
         )
     );
 
@@ -8852,6 +8971,82 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template(
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn load_config_rejects_oversized_guardian_reconsideration_prompt() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        auto_review: Some(AutoReviewToml {
+            experimental_denial_reconsideration_prompt: Some("é".repeat(501)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let error = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides {
+            cwd: Some(codex_home.path().to_path_buf()),
+            ..Default::default()
+        },
+        codex_home.abs(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "auto_review.experimental_denial_reconsideration_prompt exceeds 1,000 UTF-8 bytes"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_elastic_budget_is_opt_in_and_validated() {
+    let excessive_minimum = codex_guardian_context::DEFAULT_MAX_INPUT_TOKENS + 1;
+    let minimum_mismatch = format!(
+        r#"[features.guardianv2.sync_elastic_sections.root_conversation_messages]
+min_total_section_tokens = {excessive_minimum}
+max_section_entry_tokens = 1
+"#
+    );
+    let maximum_below_minimum = r#"[features.guardianv2.sync_elastic_sections.root_conversation_messages]
+min_total_section_tokens = 1
+max_section_entry_tokens = 1
+max_total_section_tokens = 0
+"#;
+    let home = TempDir::new().unwrap();
+    for sections in [
+        r#"[features.guardianv2.sync_elastic_sections.transcript_tools]
+min_total_section_tokens = 1
+max_section_entry_tokens = 0
+"#,
+        maximum_below_minimum,
+        minimum_mismatch.as_str(),
+        r#"[features.guardianv2.sync_elastic_sections.root_messages]
+min_total_section_tokens = 1
+max_section_entry_tokens = 1
+[features.guardianv2.sync_elastic_sections.root_conversation_messages]
+min_total_section_tokens = 1
+max_section_entry_tokens = 1
+"#,
+    ] {
+        for enabled in [false, true] {
+            let result = Config::load_from_base_config_with_overrides(
+                toml::from_str(&format!(
+                    "[features.guardianv2]\nenabled = false\nsync_elastic_budgeting = {enabled}\n{sections}"
+                ))
+                .unwrap(),
+                ConfigOverrides {
+                    cwd: Some(home.path().to_path_buf()),
+                    ..Default::default()
+                },
+                home.abs(),
+            )
+            .await;
+            assert_eq!(result.is_err(), enabled);
+        }
+    }
 }
 
 #[tokio::test]
@@ -8883,6 +9078,7 @@ async fn requirements_guardian_policy_beats_auto_review() -> std::io::Result<()>
                 extra_policy: Some("Use the user-configured additional policy.".to_string()),
                 experimental_policy_template: None,
                 experimental_conversation_history_prompt: None,
+                experimental_denial_reconsideration_prompt: None,
                 conversation_history_max_output_tokens: None,
             }),
             ..Default::default()
@@ -8925,6 +9121,7 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
             extra_policy: Some("   ".to_string()),
             experimental_policy_template: None,
             experimental_conversation_history_prompt: Some(String::new()),
+            experimental_denial_reconsideration_prompt: Some("  ".to_owned()),
             conversation_history_max_output_tokens: None,
         }),
         ..Default::default()
@@ -8945,8 +9142,9 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
             config.guardian_policy_config,
             config.guardian_extra_policy,
             config.guardian_conversation_history_prompt,
+            config.guardian_denial_reconsideration_prompt,
         ),
-        (None, None, None)
+        (None, None, None, None)
     );
 
     Ok(())
@@ -9937,6 +10135,27 @@ job_max_runtime_seconds = 900
             ..Default::default()
         })
     );
+}
+
+#[tokio::test]
+async fn legacy_multi_agent_opt_out_survives_a_session_override() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    std::fs::write(
+        home.path().join(CONFIG_TOML_FILE),
+        "[features]\nmulti_agent = false\n",
+    )?;
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .cli_overrides(vec![("features.multi_agent".to_string(), true.into())])
+        .build()
+        .await?;
+    assert!(config.features.enabled(Feature::Collab));
+    assert_eq!(
+        legacy_multi_agent_disabled_sources(&config.config_layer_stack),
+        ["user"]
+    );
+    Ok(())
 }
 
 #[tokio::test]
