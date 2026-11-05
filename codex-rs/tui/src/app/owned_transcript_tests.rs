@@ -1751,6 +1751,7 @@ async fn fullscreen_question_mouse_copy_routes_without_answering() -> Result<()>
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: thread_id.to_string(),
             turn_id: "turn".into(),
+            content_token_count: None,
             completed_at_ms: 0,
             item: serde_json::from_value(serde_json::json!({
                 "type": "agentMessage",
