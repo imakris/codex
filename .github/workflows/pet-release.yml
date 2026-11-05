@@ -7,6 +7,10 @@ on:
         description: Validate the selected source without syncing or publishing
         type: boolean
         default: false
+      tests_only:
+        description: Run tooling and TUI tests without building native packages
+        type: boolean
+        default: false
   schedule:
     - cron: "17 7 * * *"
       timezone: "Europe/Berlin"
@@ -39,7 +43,7 @@ jobs:
         id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/pet_release.py prepare ${{ inputs.verify_only && '--verify-only' || '' }}
+        run: python3 scripts/pet_release.py prepare ${{ (inputs.verify_only || inputs.tests_only) && '--verify-only' || '' }}
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         if: steps.candidate.outputs.build == 'true'
         with:
@@ -164,7 +168,7 @@ jobs:
       - name: Stamp native version from the prepared official release
         run: python scripts/pet_release.py stamp
       - name: Build and hash Linux sandbox helper
-        if: runner.os == 'Linux'
+        if: ${{ runner.os == 'Linux' && !inputs.tests_only }}
         working-directory: codex-rs
         run: |
           cargo build --locked --release --target "$TARGET" --jobs 4 --bin bwrap
@@ -172,6 +176,7 @@ jobs:
           strip --strip-debug --strip-unneeded "$binary"
           echo "CODEX_BWRAP_SHA256=$(sha256sum "$binary" | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
       - name: Build canonical native package
+        if: ${{ !inputs.tests_only }}
         env:
           PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
@@ -184,12 +189,14 @@ jobs:
       - name: Run all required pet regression tests
         run: python scripts/pet_release.py test --target "$TARGET"
       - name: Package and smoke-test a clean npm installation
+        if: ${{ !inputs.tests_only }}
         env:
           PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           python scripts/pet_package.py --target "$TARGET" --version "$PACKAGE_VERSION" \
             --package-dir "$RUNNER_TEMP/pet-package" --output-dir release-assets --smoke
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        if: ${{ !inputs.tests_only }}
         with:
           name: pet-package-${{ matrix.platform }}
           path: release-assets/*.tgz
@@ -206,7 +213,7 @@ jobs:
 
   publish:
     needs: [prepare, build]
-    if: ${{ !inputs.verify_only }}
+    if: ${{ !inputs.verify_only && !inputs.tests_only }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
