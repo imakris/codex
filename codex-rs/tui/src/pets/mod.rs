@@ -161,7 +161,7 @@ pub(crate) fn clear_ambient_pet_before_frame(
                 clear_bottom_y: area.bottom(),
                 columns: area.width,
             });
-    if state.last_protocol.is_some() || state.last_sixel_clear_area.is_some() {
+    if state.last_kitty_id.is_some() || state.last_sixel_clear_area.is_some() {
         render_ambient_pet_image(writer, state, /*request*/ None)?;
     }
     Ok(erased_area)
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn clearing_before_frame_clips_old_sprite_after_terminal_resize() {
         let mut state = PetImageRenderState {
-            last_protocol: Some(ImageProtocol::Sixel),
+            last_kitty_id: None,
             last_sixel_clear_area: Some(SixelClearArea {
                 x: 6,
                 clear_top_y: 2,
@@ -343,7 +343,7 @@ mod tests {
             "\x1b7\x1b[3;7H  \x1b[4;7H  \x1b8"
         );
         assert!(state.last_sixel_clear_area.is_none());
-        assert!(state.last_protocol.is_none());
+        assert!(state.last_kitty_id.is_none());
     }
 
     #[test]
