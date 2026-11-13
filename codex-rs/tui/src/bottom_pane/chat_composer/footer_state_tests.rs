@@ -28,6 +28,7 @@ fn render(
 ) -> (Buffer, Option<(u16, u16)>) {
     let options = composer.resolve_render_options(ComposerRenderOptions {
         footer,
+        separate_status_line: true,
         ..ComposerRenderOptions::default()
     });
     let width = 60;
@@ -59,7 +60,9 @@ fn text(buffer: &Buffer) -> String {
 
 #[test]
 fn ambient_pet_footer_width_keeps_status_input_and_cursor_aligned() {
-    let composer = composer();
+    let mut composer = composer();
+    composer.set_text_content("hello".into(), Vec::new(), Vec::new());
+    composer.set_status_line(Some(Line::from("s".repeat(70)).into()));
     let footer = TranscriptFooter {
         text: Line::from("Find: ".to_string() + &"needle".repeat(12)).into(),
         cursor_column: Some(72),
@@ -77,7 +80,8 @@ fn ambient_pet_footer_width_keeps_status_input_and_cursor_aligned() {
     let layout = composer.layout_with_options(area, options);
     assert_eq!(layout.footer.width, 80);
     assert_eq!(layout.composer.width, 69);
-    assert_eq!(layout.status.width, 69);
+    assert_eq!(layout.status.x, 5);
+    assert_eq!(layout.status.width, 67);
     let hint_area = inset_footer_hint_area(layout.footer);
     assert_eq!(
         composer.cursor_pos_with_options(area, options),
@@ -100,6 +104,31 @@ fn ambient_pet_footer_width_keeps_status_input_and_cursor_aligned() {
             .width,
         69
     );
+
+    let status_only_options = ComposerRenderOptions {
+        footer: None,
+        ..options
+    };
+    let status = composer
+        .layout_with_options(area, status_only_options)
+        .status;
+    assert_eq!(
+        (status.width, status.height, status.bottom()),
+        (78, 1, area.bottom())
+    );
+    let overlapping_options = ComposerRenderOptions {
+        footer_image_rows: Some((status.y, status.bottom())),
+        ..status_only_options
+    };
+    let status = composer
+        .layout_with_options(area, overlapping_options)
+        .status;
+    assert_eq!((status.width, status.height), (67, 2));
+    composer.set_status_line(Some(Line::from("s".repeat(90)).into()));
+    let status = composer
+        .layout_with_options(area, status_only_options)
+        .status;
+    assert_eq!((status.width, status.height), (67, 2));
 }
 
 #[test]
@@ -120,6 +149,7 @@ fn retained_command_suggestions_yield_paint_and_cursor_to_find() {
     let options = composer.resolve_render_options(ComposerRenderOptions {
         footer: Some(&footer),
         command_popup_placement: CommandPopupPlacement::Hidden,
+        separate_status_line: true,
         ..ComposerRenderOptions::default()
     });
     let mut frames = Vec::new();
@@ -167,7 +197,10 @@ fn copying_from_find_preserves_the_query_above_selection_feedback() {
     );
     let (buffer, cursor) = render(&composer, Some(&footer));
     assert_eq!(cursor, None);
-    insta::assert_snapshot!("transcript_find_copy_footer", text(&buffer));
+    let output = text(&buffer);
+    assert!(output.contains("Find: needle"));
+    assert!(output.contains("Copied selection to clipboard"));
+    insta::assert_snapshot!("transcript_find_copy_footer", output);
 }
 
 #[test]

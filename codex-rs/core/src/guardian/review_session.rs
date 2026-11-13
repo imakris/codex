@@ -5,7 +5,6 @@
 #[path = "review_session_setup.rs"]
 mod setup;
 pub use setup::PreparedGuardianContext;
-pub(super) use setup::prepare_review;
 pub use setup::prepare_review_prewarm;
 pub(crate) use setup::run_guardian_review_session;
 
@@ -588,7 +587,12 @@ async fn run_review_on_session(
         personality: params.personality,
         model: review_model.model.clone(),
         reasoning_effort: review_model.reasoning_effort.clone(),
-        cyber_access_program: parent_turn.cyber_access_program,
+        cyber_access_program: parent_turn.cyber_access_program.filter(|_| {
+            crate::RequiredCyberAccessPrograms::for_thread(
+                &params.parent_session.services.thread_extension_data,
+            )
+            .is_none()
+        }),
         parent_response_id: params
             .parent_context
             .parent_response
