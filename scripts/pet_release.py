@@ -25,6 +25,20 @@ REQUIRED_TESTS = [
     "chatwidget::tests::status_and_layout::ambient_pet_hides_when_the_composer_viewport_cannot_fit_it",
     "chatwidget::tests::status_and_layout::ambient_pet_hides_notification_text_overlay",
     "bottom_pane::chat_composer::footer_state::tests::ambient_pet_footer_width_keeps_status_input_and_cursor_aligned",
+    "bottom_pane::chat_composer::status_surface::tests::"
+    "shortcut_help_stays_above_the_prompt_and_bottom_status",
+    "bottom_pane::chat_composer::status_surface::tests::"
+    "shortcut_help_keeps_bottom_anchored_composer_status_and_cursor_stable",
+    "bottom_pane::chat_composer::status_surface::tests::"
+    "shortcut_help_keeps_input_and_close_hint_visible_when_height_is_tiny",
+    "bottom_pane::chat_composer::status_surface::tests::"
+    "shortcut_help_close_row_uses_runtime_binding_and_narrow_fallback",
+    "bottom_pane::shortcut_overlay::tests::shortcut_overlay_uses_runtime_bindings_and_wsl_paste",
+    "bottom_pane::shortcut_overlay::tests::shortcut_overlay_leaves_remapped_tab_and_function_keys_available",
+    "bottom_pane::shortcut_overlay::tests::shortcut_overlay_draws_base_keyboard_and_falls_back_to_the_list",
+    "bottom_pane::shortcut_overlay::tests::shortcut_keyboard_adapts_to_probed_and_unknown_terminal_colors",
+    "bottom_pane::shortcut_overlay::tests::shortcut_keyboard_keeps_diagram_for_keys_outside_us_layout",
+    "bottom_pane::shortcut_overlay::tests::shortcut_overlay_clipping_preserves_customization_in_small_areas",
     "pets::ambient::tests::ambient_sprite_only_clears_its_own_rows",
     "pets::tests::clearing_before_frame_clips_old_sprite_after_terminal_resize",
     "pets::tests::kitty_local_file_pet_image_uses_file_reference_without_inline_payload",

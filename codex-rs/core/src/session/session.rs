@@ -99,6 +99,8 @@ pub(crate) struct Session {
     pub(super) multi_agent_version: OnceLock<MultiAgentVersion>,
     /// Owns invalidation and serializes refreshes without blocking captured calls.
     pub(super) mcp_refresh: McpRefresh,
+    /// Serializes cloud publication with capture of a step's plugin and skill snapshots.
+    pub(super) cloud_catalog_preparation: super::cloud_plugins::CloudCatalogPreparation,
     /// Non-owning lookup for approval data retained by running MCP invocations.
     pub(crate) mcp_tool_approval_metadata: std::sync::Mutex<McpToolApprovalMetadataMap>,
     pub(super) mcp_elicitation_reviewer_handle: OnceLock<codex_mcp::ElicitationReviewerHandle>,
@@ -265,17 +267,6 @@ impl SessionConfiguration {
             .set_legacy_permission_profile(permission_profile)
     }
 
-    pub(super) fn sandbox_policy(
-        &self,
-        environments: &[TurnEnvironmentSelection],
-    ) -> SandboxPolicy {
-        let permission_profile = self.materialized_permission_profile(environments);
-        codex_sandboxing::compatibility_sandbox_policy_for_permission_profile(
-            &permission_profile,
-            self.cwd(),
-        )
-    }
-
     pub(super) fn file_system_sandbox_policy(
         &self,
         environments: &[TurnEnvironmentSelection],
@@ -294,6 +285,7 @@ impl SessionConfiguration {
             .map(|config| config.permission_profile.clone())
             .unwrap_or_else(|| self.permission_profile_state.snapshot());
         ThreadConfigSnapshot {
+            request_country: self.step_settings.request_country.clone(),
             model: self.step_settings.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
             service_tier: self.step_settings.service_tier.clone(),
@@ -703,6 +695,7 @@ impl Session {
             request_kind,
         );
         ExecutionMetadata::from_settings(&step_context.settings).apply_to(&mut responses_metadata);
+        responses_metadata.request_country = step_context.settings.request_country().clone();
         responses_metadata.guardian_recorded_items = self.parent_observer_event_tx.get().is_some();
         if responses_metadata.subagent_header.as_deref()
             == Some(crate::guardian::GUARDIAN_REVIEWER_NAME)
@@ -739,11 +732,11 @@ impl Session {
     // request remains turn-backed; local compaction does not have a finalized request inventory.
     pub(crate) async fn compaction_responses_metadata(
         &self,
-        turn_context: &TurnContext,
+        step_context: &StepContext,
         compaction_metadata: CompactionTurnMetadata,
     ) -> CodexResponsesMetadata {
         self.compaction_responses_metadata_for_window(
-            turn_context,
+            step_context,
             compaction_metadata,
             self.current_window().await,
         )
@@ -751,15 +744,17 @@ impl Session {
 
     pub(crate) fn compaction_responses_metadata_for_window(
         &self,
-        turn_context: &TurnContext,
+        step_context: &StepContext,
         compaction_metadata: CompactionTurnMetadata,
         (window_id, window_number, context_window_id): (String, u64, ContextWindowId),
     ) -> CodexResponsesMetadata {
-        let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+        let turn_context = &step_context.turn;
+        let mut responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
             self.installation_id.clone(),
             window_id,
             CodexResponsesRequestKind::Compaction(compaction_metadata),
         );
+        responses_metadata.request_country = step_context.settings.request_country().clone();
         self.with_window_and_fork_metadata(
             turn_context,
             responses_metadata,
@@ -1017,6 +1012,10 @@ impl Session {
                     SessionId::from(thread_id)
                 }
             });
+        let inherited_items = agent_control
+            .runtime()
+            .retained_items_for_fresh_child(&initial_history, &session_source)
+            .await;
         let has_provided_agent_control =
             matches!(&agent_control, AgentControlInit::Provided { .. });
         let (agent_control, local_agent_runtime): (Arc<dyn AgentControl>, _) = match agent_control {
@@ -1061,6 +1060,7 @@ impl Session {
         thread_extension_init.insert(codex_extension_api::ThreadOriginator(
             session_configuration.originator.clone(),
         ));
+        thread_extension_init.insert(Arc::clone(&models_manager));
         // Publish the already resolved model before extensions make startup decisions.
         // Turn construction refreshes this attachment when the selected model changes.
         thread_extension_init.insert(Arc::unwrap_or_clone(model_info.model));
@@ -1287,7 +1287,8 @@ impl Session {
                 error!("failed to initialize thread persistence: {e:#}");
                 e
             })?;
-        let session_result: anyhow::Result<Arc<Self>> = async {
+        // Keep the large initialization future out of callers' stack frames.
+        let session_result: anyhow::Result<Arc<Self>> = Box::pin(async {
             if let InitialHistory::Resumed(resumed) = &mut initial_history
                 && let Some(history) = resume_context
             {
@@ -1330,10 +1331,10 @@ impl Session {
                     .approval_policy
                     .value()
                     .to_string(),
-                sandbox_policy: format!(
-                    "{:?}",
-                    session_configuration.sandbox_policy(environment_selections)
-                ),
+                permissions_profile: session_configuration
+                    .materialized_permission_profile(environment_selections)
+                    .legacy_sandbox_policy_label(session_configuration.cwd())
+                    .to_string(),
             };
             let mut post_session_configured_events = Vec::<Event>::new();
 
@@ -1689,13 +1690,15 @@ impl Session {
                 &session_configuration.disabled_plugin_ids,
             )
             .await;
+            let hook_mcp_executor = Arc::new(CoreHookMcpExecutor {
+                runtime: Arc::clone(&mcp_runtime),
+                thread_id,
+                session: OnceLock::new(),
+            });
             let (hooks, async_hook_results) = Hooks::new(
                 hooks_config,
                 thread_id,
-                Arc::new(CoreHookMcpExecutor {
-                    runtime: Arc::clone(&mcp_runtime),
-                    thread_id,
-                }),
+                hook_mcp_executor.clone(),
             )?;
             for warning in hooks.startup_warnings() {
                 post_session_configured_events.push(Event {
@@ -1806,6 +1809,24 @@ impl Session {
                     // This placeholder is used only for teardown, before the session is published.
                     Err(err) => (AgentRuntimeServices::Controller, Some(err)),
                 };
+            let mut local_agent_runtime = local_agent_runtime;
+            let mut account = crate::rollout_budget::ThreadBudgetAccount::Shared(Arc::clone(
+                &local_agent_runtime.rollout_budget,
+            ));
+            if startup_error.is_none() && matches!(&agent_runtime, AgentRuntimeServices::Controller) {
+                if let Some(native) = agent_control.native_rollout_budget() {
+                    local_agent_runtime.rollout_budget = Arc::clone(&native);
+                    account = crate::rollout_budget::ThreadBudgetAccount::Native(native);
+                }
+            }
+            let budget_policy = crate::rollout_budget::ThreadBudgetPolicy::new(
+                account,
+            )
+            .unwrap_or_else(|err| {
+                startup_error = Some(err);
+                // Teardown needs a session. Its empty policy is never published.
+                Default::default()
+            });
             state.shared_service_tier_pending = parent_thread_id.is_none()
                 && match &agent_runtime {
                     AgentRuntimeServices::Controller => has_provided_agent_control,
@@ -1853,6 +1874,7 @@ impl Session {
                 workspace_routing.as_ref().clone(),
                 extensions.model_request_contributors().to_vec(),
             )
+            .with_budget_policy(budget_policy.clone())
             .with_executed_tool_calls(executed_tool_calls.clone())
             .with_restored_history(matches!(
                 &initial_history,
@@ -1884,7 +1906,7 @@ impl Session {
                     parent_rollout_thread_trace.start_child_thread_trace(trace_metadata)
                 }
             } else {
-                ThreadTraceContext::start_root(trace_metadata)
+                ThreadTraceContext::start_root(trace_metadata, config.rollout_trace_limits)
             };
             let rollout_thread_trace = rollout_thread_trace.unwrap_or_else(|err| {
                 startup_error.get_or_insert_with(|| {
@@ -1945,6 +1967,7 @@ impl Session {
                 mcp_thread_init,
                 client_mcp_extensions,
                 local_agent_runtime,
+                budget_policy,
                 agent_control,
                 network_proxy: arc_swap::ArcSwapOption::from(network_proxy.map(Arc::new)),
                 network_proxy_audit_metadata,
@@ -1987,6 +2010,7 @@ impl Session {
                 windows_sandbox_proxy_settings_mode,
                 multi_agent_version,
                 mcp_refresh: McpRefresh::new(),
+                cloud_catalog_preparation: Default::default(),
                 mcp_tool_approval_metadata: Default::default(),
                 mcp_elicitation_reviewer_handle: OnceLock::new(),
                 mcp_elicitation_lifecycle_handle: OnceLock::new(),
@@ -1997,7 +2021,7 @@ impl Session {
                 realtime_history: (session_configuration.history_mode
                     == ThreadHistoryMode::Paginated
                     && services.live_thread.is_some())
-                .then(|| Mutex::new(Default::default())),
+                .then(|| Mutex::new(crate::realtime_history::RealtimeHistoryState::default())),
                 active_turn: Mutex::new(None),
                 async_hook_results,
                 input_queue: InputQueue::with_controller(
@@ -2011,6 +2035,7 @@ impl Session {
                 forked_from_ordinal_exclusive,
                 next_internal_sub_id: AtomicU64::new(0),
             });
+            let _ = hook_mcp_executor.session.set(Arc::downgrade(&sess));
             if let Some(startup) = &startup {
                 startup.set_session(Arc::clone(&sess));
             }
@@ -2112,8 +2137,15 @@ impl Session {
                 &inherited_environments,
                 &session_configuration.environments,
             );
-            sess.schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::Base)
-                .await;
+            let (input, history_ready) = if sess.features().enabled(Feature::RestoredHistoryPrewarm)
+                && matches!(&initial_history, InitialHistory::Resumed(saved) if !saved.history.is_empty())
+            {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                (super::startup_prewarm::PrewarmInput::Restoring(receiver), Some(sender))
+            } else {
+                (super::startup_prewarm::PrewarmInput::Base, None)
+            };
+            sess.schedule_startup_prewarm(input).await;
             let session_start_source = match &initial_history {
                 InitialHistory::Forked(_) if forked_from_id.is_some() => {
                     codex_hooks::SessionStartSource::Fork
@@ -2129,6 +2161,7 @@ impl Session {
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
             Box::pin(sess.record_initial_history(initial_history)).await;
+            Box::pin(sess.record_inherited_items(inherited_items)).await?;
             if restore_child_window {
                 sess.state.lock().await.restore_auto_compact_window(
                     /*window_number*/ 0,
@@ -2144,8 +2177,11 @@ impl Session {
                 let mut state = sess.state.lock().await;
                 state.queue_pending_session_start_source(session_start_source);
             }
+            if let Some(sender) = history_ready {
+                let _ = sender.send(sess.clone_history().await);
+            }
             Ok(sess)
-        }
+        })
         .await;
         match session_result {
             Ok(sess) => {

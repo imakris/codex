@@ -115,7 +115,7 @@ impl ChatWidget {
             .as_ref()
             .is_some_and(|q| q.expanded);
         if self.fork_in_progress
-            || self.external_writer_view
+            || self.is_read_only_view()
             || self.bottom_pane.has_active_view()
             || (!questions_expanded && !self.bottom_pane.no_modal_or_popup_active())
             || (questions_expanded

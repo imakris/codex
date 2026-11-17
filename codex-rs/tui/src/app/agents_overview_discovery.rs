@@ -3,6 +3,8 @@
 
 use super::App;
 use crate::app_event::AppEvent;
+use crate::app_server_session::AppServerSession;
+use crate::backend_id::BackendId;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::ClientRequest;
@@ -50,6 +52,7 @@ pub(crate) async fn list_pinned_threads(
                     params: ThreadListParams {
                         include_attached_threads: false,
                         current_account_only: true,
+                        included_thread_ids: None,
                         excluded_thread_ids: None,
                         originators: None,
                         cursor: cursor.clone(),
@@ -204,6 +207,7 @@ impl SourcePage {
                     params: ThreadListParams {
                         include_attached_threads: false,
                         current_account_only: true,
+                        included_thread_ids: None,
                         excluded_thread_ids: None,
                         attached_to_thread_id: None,
                         originators: None,
@@ -270,15 +274,23 @@ pub(super) fn matches_query(thread: &Thread, query: &str) -> bool {
     format!("{name} {} {cwd}", thread.preview)
         .to_lowercase()
         .contains(query)
+        || thread.id.to_lowercase().contains(query)
+        || thread
+            .git_info
+            .as_ref()
+            .and_then(|git| git.branch.as_deref())
+            .is_some_and(|branch| branch.to_lowercase().contains(query))
 }
 
 impl App {
     pub(super) fn search_agents_overview(
         &mut self,
-        handle: AppServerRequestHandle,
+        app_server: &AppServerSession,
         id: Uuid,
         limit: usize,
     ) {
+        let backend_id = app_server.backend_id();
+        let handle = app_server.request_handle();
         let shared = &self.agents_overview.view_state;
         let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
         let query = state.search.to_lowercase();
@@ -310,6 +322,7 @@ impl App {
                 }
                 tx.send(AppEvent::AgentsOverviewSearchPage {
                     id,
+                    backend_id,
                     rows,
                     cursor,
                     ok,
@@ -322,6 +335,7 @@ impl App {
     pub(super) fn apply_agents_overview_search_page(
         &mut self,
         id: Uuid,
+        backend_id: BackendId,
         rows: Vec<(Thread, bool)>,
         cursor: AgentsOverviewDiscovery,
         ok: bool,
@@ -334,15 +348,14 @@ impl App {
         let Some(search) = state.history.as_mut().filter(|s| s.id == id) else {
             return;
         };
-        let backend_id = self.app_server_backend_id;
         for (thread, unread) in rows {
             if let Ok(id) = codex_protocol::ThreadId::from_string(&thread.id)
-                && self.backend_registry.owner(id).or(backend_id) == backend_id
                 && !overview.threads.get(&id).is_some_and(Option::is_some)
                 && !overview.removed_threads.contains(&id)
                 && !overview.hidden_threads.contains(&id)
                 && let std::collections::hash_map::Entry::Vacant(entry) =
                     overview.search_matches.entry(id)
+                && self.backend_registry.observe(backend_id, id)
             {
                 entry.insert(thread);
                 if unread {

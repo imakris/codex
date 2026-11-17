@@ -255,12 +255,8 @@ impl ChatComposer {
         width: u16,
         options: ComposerRenderOptions<'_>,
     ) -> u16 {
-        let rows = self.composer_rows(
-            width,
-            options.max_height.unwrap_or(u16::MAX),
-            /*bottom_y*/ None,
-            options,
-        );
+        let height = self.height_budget(width, options);
+        let rows = self.composer_rows(width, height, /*bottom_y*/ None, options);
         [
             rows.input,
             rows.above_input,
@@ -315,7 +311,7 @@ impl ChatComposer {
             || matches!(
                 self.footer_mode(),
                 FooterMode::HistorySearch
-                    | FooterMode::ShortcutOverlay
+                    | FooterMode::ShortcutOverlay(_)
                     | FooterMode::QuitShortcutReminder
                     | FooterMode::EscHint
             );

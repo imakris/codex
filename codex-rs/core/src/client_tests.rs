@@ -73,6 +73,7 @@ use codex_protocol_test_support::uuid_v7_item_id_generator_for_test;
 use codex_rollout_trace::ExecutionStatus;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_rollout_trace::RawPayloadKind;
 use codex_rollout_trace::RawTraceEventPayload;
 use codex_rollout_trace::RolloutTrace;
 use codex_rollout_trace::TraceWriter;
@@ -1477,9 +1478,12 @@ fn started_inference_attempt(temp: &TempDir) -> anyhow::Result<InferenceTraceAtt
             "content": [{"type": "input_text", "text": "hello"}]
         }],
     });
-    attempt.record_started(serde_json::to_vec(&request)?, Arc::new(request), || {
-        Ok(None)
-    });
+    attempt.record_started(
+        serde_json::to_vec(&request)?,
+        Arc::new(request),
+        Vec::new(),
+        || Ok(None),
+    );
     // Cancellation tests can start replaying as soon as this helper returns.
     writer.flush()?;
     Ok(attempt)
@@ -1510,6 +1514,15 @@ async fn replay_until_cancelled(temp: &TempDir) -> anyhow::Result<RolloutTrace> 
             .next()
             .expect("inference should be reduced");
         if inference.execution.status == ExecutionStatus::Cancelled {
+            // Cancellation publishes one partial response. Prepared prompts can index shared child records.
+            assert_eq!(
+                rollout
+                    .raw_payloads
+                    .values()
+                    .filter(|p| p.kind == RawPayloadKind::InferenceResponse)
+                    .count(),
+                1
+            );
             return Ok(rollout);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1691,10 +1704,11 @@ async fn untraced_http_stream_releases_completed_output_before_response_ends() {
         InferenceTraceAttempt::disabled(),
         &test_model_client(SessionSource::Cli).state,
         /*last_response_tx*/ None,
+        super::ResponseDelivery::default(),
     );
 
     assert!(matches!(
-        stream.next().await,
+        stream.next().await.map(|item| item.event),
         Some(Ok(ResponseEvent::OutputItemDone(_)))
     ));
     assert_eq!(payload.strong_count(), 0);
@@ -1733,8 +1747,9 @@ async fn incomplete_response_traces_attempted_call_without_streaming_it() -> any
             attempt,
             &test_model_client(SessionSource::Cli).state,
             /*last_response_tx*/ None,
+            super::ResponseDelivery::default(),
         );
-        assert!(matches!(stream.next().await, Some(Err(_))));
+        assert!(stream.next().await.is_some_and(|item| item.event.is_err()));
         assert!(stream.next().await.is_none());
 
         let rollout = replay_bundle(temp.path())?;
@@ -1778,12 +1793,14 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
         attempt,
         &test_model_client(SessionSource::Cli).state,
         /*last_response_tx*/ None,
+        super::ResponseDelivery::default(),
     );
 
     let observed = stream
         .next()
         .await
-        .expect("mapped stream should yield output item")?;
+        .expect("mapped stream should yield output item")
+        .event?;
     assert!(matches!(observed, ResponseEvent::OutputItemDone(_)));
 
     // Dropping the consumer is how turn interruption/preemption stops polling
@@ -1807,7 +1824,6 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
         rollout.threads["thread-root"].conversation_item_ids,
         inference.request_item_ids
     );
-    assert_eq!(rollout.raw_payloads.len(), 3);
 
     Ok(())
 }
@@ -1836,6 +1852,7 @@ async fn response_stream_records_last_model_feedback_ids() {
         InferenceTraceAttempt::disabled(),
         &test_model_client(SessionSource::Cli).state,
         /*last_response_tx*/ None,
+        super::ResponseDelivery::default(),
     );
 
     while stream.next().await.is_some() {}
@@ -2060,6 +2077,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         attempt,
         &test_model_client(SessionSource::Cli).state,
         /*last_response_tx*/ None,
+        super::ResponseDelivery::default(),
     );
 
     // Fill the mapper channel with non-terminal events, then yield one output
@@ -2078,7 +2096,6 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
 
     assert_eq!(inference.execution.status, ExecutionStatus::Cancelled);
     assert_eq!(inference.response_item_ids.len(), 1);
-    assert_eq!(rollout.raw_payloads.len(), 3);
 
     Ok(())
 }
@@ -2876,19 +2893,20 @@ async fn intercepted_output_reaches_trace_and_websocket_bookkeeping() -> anyhow:
         .await?;
     drop(tx_event);
     let (last_response_tx, last_response_rx) = tokio::sync::oneshot::channel();
-    let mut stream = super::map_response_stream(
-        codex_api::ResponseStream {
+    let mut stream = super::OpenedModelResponse {
+        stream: codex_api::ResponseStream {
             routing_affinity: None,
             rx_event,
             upstream_request_id: None,
             interrupt: None,
         },
-        test_session_telemetry(),
-        attempt,
-        &test_model_client(SessionSource::Cli).state,
-        vec![Box::new(ReplaceOutput)],
-        Some(last_response_tx),
-    );
+        telemetry: test_session_telemetry(),
+        trace: attempt,
+        client: Arc::clone(&test_model_client(SessionSource::Cli).state),
+        interceptors: vec![Box::new(ReplaceOutput)],
+        continuation: Some(last_response_tx),
+    }
+    .into_raw_stream()?;
     let mut delivered = Vec::new();
     while let Some(event) = stream.next().await {
         if let ResponseEvent::OutputItemDone(item) = event? {

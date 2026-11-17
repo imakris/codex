@@ -38,7 +38,7 @@ const AGENT_NAMES: &str = include_str!("../../../assets/agent/agent_names.txt");
 /// unrepresentable.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum SpawnInitialInput {
-    UserInput(Vec<UserInput>),
+    UserInput(Vec<ResolvedUserInput>),
     InterAgentCommunication(InterAgentCommunication, AgentCommunicationContext),
 }
 
@@ -208,7 +208,7 @@ impl LocalAgentControl {
     pub(crate) async fn spawn_agent(
         &self,
         config: Config,
-        initial_input: Vec<UserInput>,
+        initial_input: Vec<ResolvedUserInput>,
         session_source: Option<SessionSource>,
     ) -> CodexResult<ThreadId> {
         let (spawned_agent, _) = Box::pin(self.spawn_agent_internal(
@@ -546,6 +546,11 @@ impl LocalAgentControl {
         } else {
             None
         };
+        let request_country = if let Some(parent) = &inherited_parent {
+            parent.config_snapshot().await.request_country
+        } else {
+            codex_protocol::RequestCountry::UNKNOWN
+        };
         let prompt_cache_key = inherited_parent.as_ref().map(|parent| {
             parent
                 .session
@@ -603,6 +608,7 @@ impl LocalAgentControl {
         match state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
                 config,
+                request_country,
                 prompt_cache_key,
                 initial_history,
                 agent_control: self.clone(),
@@ -765,6 +771,7 @@ impl LocalAgentControl {
         // Capture child defaults once. Copying conversation history must not change
         // the capabilities of the turn which requested the spawn.
         let mut start_options = StartThreadOptions {
+            request_country: options.request_country.clone(),
             session_source: session_source.clone(),
             thread_source: session_source.as_ref().map(|_| ThreadSource::Subagent),
             environments: options
@@ -987,6 +994,7 @@ impl LocalAgentControl {
             turn_trigger: options.turn_trigger,
             root_turn_id: options.root_turn_id,
             cyber_access_program,
+            inherited_client_metadata: options.inherited_client_metadata,
             ..Default::default()
         };
         let input_admission_started_at = Instant::now();
@@ -1213,9 +1221,17 @@ impl LocalAgentControl {
         let inherited_exec_policy =
             inherited_exec_policy_for_source(&state, Some(&session_source), &config).await;
 
+        let request_country = match session_source.parent_thread_id() {
+            Some(parent_thread_id) => match state.get_thread(parent_thread_id).await {
+                Ok(parent) => parent.config_snapshot().await.request_country,
+                Err(_) => codex_protocol::RequestCountry::UNKNOWN,
+            },
+            None => Default::default(),
+        };
         let resumed_thread = state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
                 config: config.clone(),
+                request_country,
                 prompt_cache_key: None,
                 initial_history,
                 agent_control: self.clone(),

@@ -442,6 +442,10 @@ async fn cloud_model_selection_waits_for_native_admission() -> Result<()> {
 
         app.app_server_target = crate::AppServerTarget::Cloud;
         app.bind_backend_workspace(&server, app.config.cwd.to_path_buf());
+        app.chat_widget.setup_status_line(
+            vec![crate::bottom_pane::StatusLineItem::ModelWithReasoning],
+            /*use_theme_colors*/ false,
+        );
         app.chat_widget
             .set_feature_enabled(Feature::UltrafastMode, /*enabled*/ true);
         app.chat_widget.open_model_popup();
@@ -456,6 +460,7 @@ async fn cloud_model_selection_waits_for_native_admission() -> Result<()> {
             .iter_mut()
             .find(|model| model.model == "gpt-5.6-terra")
             .expect("Cloud model");
+        selected.display_name = "Cloud Terra".into();
         selected.default_service_tier = Some("ultrafast".into());
         selected.service_tiers = vec![codex_protocol::openai_models::ModelServiceTier {
             id: "ultrafast".into(),
@@ -465,6 +470,7 @@ async fn cloud_model_selection_waits_for_native_admission() -> Result<()> {
         assert!(app.chat_widget.on_models_loaded(request_id, Ok(models)));
         app.chat_widget.handle_key_event(KeyCode::Esc.into());
         while events.try_recv().is_ok() {}
+        let original_status_line = app.chat_widget.status_line_text();
 
         let event = AppEvent::ApplyModelSelection {
             model: "gpt-5.6-terra".into(),
@@ -473,6 +479,7 @@ async fn cloud_model_selection_waits_for_native_admission() -> Result<()> {
         Box::pin(app.handle_event(&mut tui, &mut server, event)).await?;
         assert!(commands.try_recv().is_err());
         assert!(app.chat_widget.cloud_picker_selection.is_none());
+        assert_eq!(app.chat_widget.status_line_text(), original_status_line);
         let messages = std::iter::from_fn(|| events.try_recv().ok())
             .filter_map(|event| match event {
                 AppEvent::InsertHistoryCell(cell) => {
@@ -484,7 +491,7 @@ async fn cloud_model_selection_waits_for_native_admission() -> Result<()> {
         insta::allow_duplicates! {
             insta::assert_snapshot!(
                 messages.join("\n"),
-                @"• Selected gpt-5.6-terra high for the next new turn in this conversation"
+                @"• Model changed to gpt-5.6-terra high for this session only"
             );
         }
         app.chat_widget.apply_external_edit("continue".into());
@@ -542,6 +549,45 @@ async fn cloud_model_selection_waits_for_native_admission() -> Result<()> {
             admitted.then_some(("gpt-5.6-terra", Some(ReasoningEffortConfig::High))),
         );
         if accepted.is_some() {
+            let status_line = app.chat_widget.status_line_text().expect("status line");
+            while events.try_recv().is_ok() {}
+            app.chat_widget
+                .dispatch_command(crate::slash_command::SlashCommand::Status);
+            let AppEvent::InsertHistoryCell(status) = events.try_recv()? else {
+                panic!("expected /status output");
+            };
+            let status = lines_to_single_string(&status.display_lines(/*width*/ 120));
+            let model = status
+                .lines()
+                .find_map(|line| line.split_once("Model:"))
+                .expect("model row in /status")
+                .1
+                .trim()
+                .trim_end_matches('│')
+                .trim_end();
+            insta::allow_duplicates! {
+                insta::assert_snapshot!(format!("{status_line}\nModel: {model}"), @r"
+                Cloud Terra high
+                Model: Cloud Terra (reasoning high)
+                ");
+            }
+            app.chat_widget
+                .apply_external_edit("/model --reasoning=medium".into());
+            app.chat_widget.handle_key_event(KeyCode::Esc.into());
+            app.chat_widget.handle_key_event(KeyCode::Enter.into());
+            let mut messages = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let AppEvent::InsertHistoryCell(cell) = &event {
+                    messages.push(lines_to_single_string(&cell.transcript_lines(/*width*/ 80)));
+                }
+                Box::pin(app.handle_event(&mut tui, &mut server, event)).await?;
+            }
+            insta::allow_duplicates! {
+                insta::assert_snapshot!(
+                    messages.join("\n"),
+                    @"• Model changed to gpt-5.6-terra medium for this session only"
+                );
+            }
             app.chat_widget.open_model_popup();
             let popup = render_bottom_popup(&app.chat_widget, /*width*/ 80);
             let label = popup.lines().find(|line| line.contains("Accepted for"));
@@ -554,6 +600,7 @@ async fn cloud_model_selection_waits_for_native_admission() -> Result<()> {
             ));
             assert!(app.chat_widget.cloud_picker_selection.is_none());
         }
+        assert_eq!(app.chat_widget.status_line_text(), original_status_line);
     }
     Ok(())
 }
@@ -696,5 +743,244 @@ async fn model_default_saves_report_server_outcomes_and_target_server_profile() 
         );
         server.shutdown().await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn changing_cloud_environment_carries_staged_settings_to_first_turn() -> Result<()> {
+    use crate::app::backend_selection::NewBackendSession;
+    use crate::app::backend_sessions::BackendSessions;
+    use codex_app_server_protocol::ClientRequest;
+
+    let (mut app, mut events, mut ops) = make_test_app_with_channels().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.pause_events();
+    let mut embedded = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let blank = embedded.start_thread(&app.config).await?;
+    let source = blank.session.thread_id;
+    let (client, mut commands, _server_events) =
+        codex_app_server_client::CloudClient::channel(/*capacity*/ 8);
+    let owner = crate::backend_id::BackendId::new();
+    let mut cloud = AppServerSession::new(
+        owner,
+        AppServerClient::Cloud(client),
+        crate::ThreadParamsMode::Cloud,
+    );
+    app.app_server_target = crate::AppServerTarget::Cloud;
+    app.bind_backend_workspace(&cloud, app.config.cwd.to_path_buf());
+    app.agents_overview
+        .blank_sessions
+        .insert(source, blank.clone());
+    app.enqueue_primary_thread_session(blank.session, blank.turns)
+        .await?;
+    app.chat_widget
+        .apply_external_edit("keep this draft".into());
+    let mut model = app.model_catalog.models[0].clone();
+    model.model = "model-selected-before-switch".into();
+    cloud
+        .stage_cloud_model_selection(source, &model, Some(ReasoningEffortConfig::High))
+        .expect("stage model");
+    cloud
+        .toggle_cloud_service_tier(source, /*current*/ None, "fast".into())
+        .expect("stage speed");
+
+    // Use the embedded server for ordinary bootstrap requests. Observe the native admission
+    // after the environment start to verify that pending choices moved to the new thread ID.
+    let proxy = embedded.request_handle();
+    let worker = tokio::spawn(async move {
+        let mut starts = Vec::new();
+        while let Some(command) = commands.recv().await {
+            let request = match command.operation {
+                CloudOperation::Request(request) => {
+                    if matches!(&*request, ClientRequest::ThreadStart { .. }) {
+                        starts.push(None);
+                    }
+                    *request
+                }
+                CloudOperation::StartThreadWithEnvironment {
+                    request_id,
+                    params,
+                    environment: codex_app_server_client::EnvironmentSelection::Saved(id),
+                } => {
+                    starts.push(Some(id));
+                    ClientRequest::ThreadStart {
+                        request_id,
+                        params: *params,
+                    }
+                }
+                CloudOperation::SubmitUserMessage(params) => {
+                    let turn = test_turn("first-turn", TurnStatus::InProgress, Vec::new());
+                    let receipt =
+                        serde_json::to_value(CloudUserMessageReceipt::Started(turn)).unwrap();
+                    command.response.send(Ok(Ok(receipt))).unwrap();
+                    return (starts, params);
+                }
+                _ => panic!("unexpected native operation before the first turn"),
+            };
+            let _ = command.response.send(proxy.request(request).await);
+        }
+        panic!("no native submission");
+    });
+
+    let mut backends = BackendSessions::from_initial(cloud, vec![]);
+    // Start Default without a project so the caller's Git checkout cannot affect routing.
+    app.backend_preference_context.local_cwd = None;
+    let default_switch = Box::pin(app.start_new_session_on_other_backend(
+        &mut tui,
+        &mut backends,
+        owner,
+        NewBackendSession::ChangeCloudEnvironment(None),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(30), default_switch)
+        .await?
+        .expect("switch to Default");
+    let saved = codex_app_server_client::SavedEnvironment {
+        id: "asenvcfg_saved".into(),
+        name: "Saved".into(),
+        workspace_shared: false,
+    };
+    let switch = Box::pin(app.start_new_session_on_other_backend(
+        &mut tui,
+        &mut backends,
+        owner,
+        NewBackendSession::ChangeCloudEnvironment(Some(saved)),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(30), switch)
+        .await?
+        .expect("switch environment");
+    let destination = app.chat_widget.thread_id().expect("new Cloud draft");
+    assert_ne!(source, destination);
+    assert!(!app.agents_overview.removed_threads.contains(&source));
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "keep this draft"
+    );
+    app.chat_widget.handle_key_event(KeyCode::Enter.into());
+    let op = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::CodexOp(op @ Op::UserTurn { .. })
+            | AppEvent::SubmitThreadOp {
+                op: op @ Op::UserTurn { .. },
+                ..
+            } => Some(op),
+            _ => None,
+        })
+        .unwrap_or_else(|| next_user_turn_op(&mut ops));
+    let submit = Box::pin(super::super::user_turn_submission::try_submit_user_turn(
+        &mut app,
+        backends.session_at_mut(backends.displayed),
+        destination,
+        &op,
+    ));
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), submit).await??);
+    let (starts, params) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker).await??;
+    assert_eq!(starts, vec![None, Some("asenvcfg_saved".to_string())]);
+    assert_eq!(
+        (
+            params.thread_id,
+            params.model,
+            params.effort,
+            params.service_tier
+        ),
+        (
+            destination.to_string(),
+            Some(model.model),
+            Some(ReasoningEffortConfig::High),
+            Some(Some("fast".into()))
+        )
+    );
+    embedded.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cycling_cloud_draft_through_local_reuses_its_saved_environment() -> Result<()> {
+    use crate::app::backend_selection::NewBackendSession;
+    use crate::app::backend_sessions::BackendSessions;
+    use codex_app_server_client::EnvironmentSelection;
+    use codex_app_server_protocol::ClientRequest;
+
+    let (mut app, _events, _ops) = make_test_app_with_channels().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.pause_events();
+    let mut local = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let local_owner = local.backend_id();
+    let local_settings = app.backend_settings();
+    let blank = local.start_thread(&app.config).await?;
+    let proxy = local.request_handle();
+
+    let (client, mut commands, _server_events) =
+        codex_app_server_client::CloudClient::channel(/*capacity*/ 8);
+    let cloud_owner = crate::backend_id::BackendId::new();
+    let cloud = AppServerSession::new(
+        cloud_owner,
+        AppServerClient::Cloud(client),
+        crate::ThreadParamsMode::Cloud,
+    );
+    app.app_server_target = crate::AppServerTarget::Cloud;
+    app.bind_backend_workspace(&cloud, app.config.cwd.to_path_buf());
+    app.enqueue_primary_thread_session(blank.session, blank.turns)
+        .await?;
+    app.chat_widget.apply_external_edit("carry me".into());
+
+    let mut backends = BackendSessions::from_initial(cloud, vec![local]);
+    backends.settings.insert(local_owner, local_settings);
+    let saved = codex_app_server_client::SavedEnvironment {
+        id: "asenvcfg_rust".into(),
+        name: "Rust".into(),
+        workspace_shared: false,
+    };
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker = tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            let request = match command.operation {
+                CloudOperation::Request(request) => {
+                    if matches!(&*request, ClientRequest::ThreadStart { .. }) {
+                        started_tx.send(None).unwrap();
+                    }
+                    *request
+                }
+                CloudOperation::StartThreadWithEnvironment {
+                    request_id,
+                    environment: EnvironmentSelection::Saved(id),
+                    params,
+                } => {
+                    started_tx.send(Some(id)).unwrap();
+                    ClientRequest::ThreadStart {
+                        request_id,
+                        params: *params,
+                    }
+                }
+                CloudOperation::Shutdown => {
+                    command
+                        .response
+                        .send(Ok(Ok(serde_json::Value::Null)))
+                        .unwrap();
+                    return;
+                }
+                _ => panic!("unexpected Cloud operation for this draft"),
+            };
+            let _ = command.response.send(proxy.request(request).await);
+        }
+    });
+    for (owner, selection) in [
+        (
+            cloud_owner,
+            NewBackendSession::ChangeCloudEnvironment(Some(saved.clone())),
+        ),
+        (local_owner, NewBackendSession::CarryDraft),
+        (cloud_owner, NewBackendSession::CarryDraft),
+    ] {
+        Box::pin(app.start_new_session_on_other_backend(&mut tui, &mut backends, owner, selection))
+            .await
+            .expect("carry draft");
+        assert_eq!(app.chat_widget.composer_text_with_pending(), "carry me");
+        if owner == cloud_owner {
+            assert_eq!(started_rx.try_recv()?, Some(saved.id.clone()));
+        }
+    }
+    backends.shutdown().await?;
+    worker.await?;
     Ok(())
 }

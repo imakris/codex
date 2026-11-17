@@ -64,8 +64,6 @@ use crate::request_user_input::RequestUserInputResponse;
 use crate::response_item_id::OptionalWireItemId;
 use crate::turn_input::CyberAccessProgram;
 use crate::turn_input::SuspendTurnOutcome;
-use crate::turn_input::TurnInputMode;
-use crate::turn_input::TurnInputRequest;
 use crate::turn_input::TurnInputSubmission;
 use crate::turn_input::TurnStartOptions;
 use codex_extension_items::image_generation::GeneratedImageRef;
@@ -560,6 +558,8 @@ pub struct ConversationSpeechParams {
 /// task kind. Child sessions and consumers of frozen initial settings are unchanged.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnSettingsUpdate {
+    /// Trusted host country. `None` preserves the current setting. Published for the named live turn's subsequent steps.
+    pub request_country: Option<crate::RequestCountry>,
     /// Changes the reviewer for subsequent approval requests, not pending reviews.
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     /// Replaces the selection for subsequent steps, without changing future turns.
@@ -601,6 +601,8 @@ pub enum TurnSettingsUpdateOutcome {
     }),
 )]
 pub struct ThreadSettingsOverrides {
+    /// Trusted host country. `None` preserves the current setting. Inherited by future turns on acceptance.
+    pub request_country: Option<crate::RequestCountry>,
     /// Updated fallback `cwd` and environments supplied together as a complete pair.
     pub environments: Option<TurnEnvironmentRequests>,
 
@@ -724,6 +726,9 @@ pub enum Op {
     /// This server sends [`EventMsg::TurnAborted`] in response.
     Interrupt,
 
+    /// Interrupt a spawned agent, respecting its configured sampling boundary.
+    InterruptAgent,
+
     /// Interrupt the named turn only if no input is queued for it.
     /// The decision is acknowledged before cancellation finishes.
     #[debug("InterruptIfNoPendingInput {{ turn_id: {turn_id:?} }}")]
@@ -778,14 +783,6 @@ pub enum Op {
 
     /// Request the list of voices supported by realtime conversation streams.
     RealtimeConversationListVoices,
-
-    /// Submit turn input using the requested routing behavior.
-    #[debug("TurnInput {{ requested_settings: {:?} }}", request.thread_settings)]
-    TurnInput {
-        request: Box<TurnInputRequest>,
-        mode: TurnInputMode,
-        reply: oneshot::Sender<CodexResult<TurnInputSubmission>>,
-    },
 
     /// Resume an interrupted regular turn.
     #[debug("RecoverTurn {{ requested_settings: {thread_settings:?} }}")]
@@ -1130,6 +1127,7 @@ impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Interrupt => "interrupt",
+            Self::InterruptAgent => "interrupt_agent",
             Self::InterruptIfNoPendingInput { .. } => "interrupt_if_no_pending_input",
             Self::CleanBackgroundTerminals => "clean_background_terminals",
             Self::RealtimeConversationStart(_) => "realtime_conversation_start",
@@ -1141,7 +1139,6 @@ impl Op {
             Self::RealtimeConversationClose => "realtime_conversation_close",
             Self::RealtimeConversationDetach { .. } => "realtime_conversation_detach",
             Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
-            Self::TurnInput { .. } => "turn_input",
             Self::RecoverTurn { .. } => "recover_turn",
             Self::SuspendTurnAndShutdown { .. } => "suspend_turn_and_shutdown",
             Self::ThreadSettings { .. } => "thread_settings",
@@ -1353,11 +1350,7 @@ impl WritableRoot {
             }
         }
 
-        if self.path_contains_protected_metadata_name(path) {
-            return false;
-        }
-
-        true
+        !self.path_contains_protected_metadata_name(path)
     }
 
     fn path_contains_protected_metadata_name(&self, path: &Path) -> bool {
@@ -2717,7 +2710,7 @@ impl FromStr for RateLimitReachedType {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
 pub struct RateLimitWindow {
-    /// Percentage (0-100) of the window that has been consumed.
+    /// Percentage of the allowance consumed during the window. Can exceed 100.
     pub used_percent: f64,
     /// Rolling window duration, in minutes.
     #[ts(type = "number | null")]

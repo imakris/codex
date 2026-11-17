@@ -511,7 +511,9 @@ impl App {
         self.chat_widget.local_settings.tui.status_line_provider =
             self.local_settings.tui.status_line_provider.clone();
         self.config = config;
+        self.refresh_transcript_document_links();
         self.chat_widget.sync_plugin_mentions_config(&self.config);
+        self.chat_widget.refresh_status_line();
         Ok(())
     }
 
@@ -1943,6 +1945,8 @@ enabled = false
         app.chat_widget
             .handle_thread_session(crate::session_state::ThreadSessionState {
                 read_only_history: false,
+                thread_settings_confirmed: true,
+                primary_environment_cwd: None,
                 daybreak_enabled: false,
                 windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
                 thread_id: ThreadId::new(),

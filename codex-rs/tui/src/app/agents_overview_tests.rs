@@ -146,7 +146,7 @@ use crate::test_support::test_path_display;
 use codex_app_server_client::AppServerClient;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::CloudClient;
-use codex_app_server_protocol::CurrentTimeReadParams;
+use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
@@ -220,6 +220,176 @@ async fn refreshing_one_backends_pins_preserves_cross_backend_rank() {
 }
 
 #[tokio::test]
+async fn overview_opens_a_search_only_task_on_the_search_backend() -> Result<()> {
+    let mut app = make_test_app().await;
+    let (client, _commands, _events) = CloudClient::channel(/*capacity*/ 1);
+    let mut displayed = AppServerSession::new(
+        BackendId::new(),
+        AppServerClient::Cloud(client),
+        ThreadParamsMode::Cloud,
+    );
+    let source = BackendId::new();
+    let [hit, collision] = std::array::from_fn(|_| ThreadId::new());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.app_event_tx = AppEventSender::new(tx);
+    app.app_server_backend_id = Some(displayed.backend_id());
+    assert!(
+        app.backend_registry
+            .observe(displayed.backend_id(), collision)
+    );
+
+    let mut view = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
+    view.handle_key_event(KeyCode::Char('/').into());
+    view.handle_paste("Older task".into());
+    let AppEvent::SearchAgentsOverview(search_id, _) = rx.try_recv()? else {
+        panic!("expected an older-history search");
+    };
+    app.agents_overview.search_id = search_id;
+    let row = |id| {
+        overview_thread(
+            id,
+            /*parent_thread_id*/ None,
+            "Older task",
+            ThreadStatus::NotLoaded,
+        )
+    };
+    let found = row(hit);
+    app.apply_agents_overview_search_page(
+        search_id,
+        source,
+        vec![(found.clone(), false), (row(collision), false)],
+        Default::default(),
+        /*ok*/ true,
+    );
+    assert_eq!(
+        app.backend_registry.owner(collision),
+        Some(displayed.backend_id())
+    );
+    assert!(!app.agents_overview.search_matches.contains_key(&collision));
+    assert!(!app.agents_overview.threads.contains_key(&hit));
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.select_agents_overview_thread(&mut tui, &mut displayed, hit)
+        .await?;
+    let AppEvent::ResumeBackendSession(target) = rx.try_recv()? else {
+        panic!("expected the search-only task to resume");
+    };
+    assert_eq!(
+        (
+            target.backend_id,
+            target.thread_id,
+            target.path,
+            target.cwd,
+            target.history_mode
+        ),
+        (
+            source,
+            hit,
+            found.path,
+            Some(found.cwd.to_path_buf()),
+            Some(found.history_mode)
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn late_overview_page_only_refills_its_own_backend() {
+    let mut app = make_test_app().await;
+    let displayed = BackendId::new();
+    let other = BackendId::new();
+    let (client, _commands, _events) = CloudClient::channel(/*capacity*/ 1);
+    let session = AppServerSession::new(
+        displayed,
+        AppServerClient::Cloud(client),
+        ThreadParamsMode::Cloud,
+    );
+    app.app_server_backend_id = Some(displayed);
+    let id = ThreadId::new();
+    assert!(app.backend_registry.observe(displayed, id));
+    app.agents_overview.threads.insert(
+        id,
+        Some(overview_thread(
+            id,
+            /*parent_thread_id*/ None,
+            "Removed",
+            ThreadStatus::Idle,
+        )),
+    );
+    app.remove_agents_overview_thread(id);
+
+    for owner in [other, displayed] {
+        let request_id = Uuid::new_v4();
+        let replacement = ThreadId::new();
+        let row = overview_thread(
+            replacement,
+            /*parent_thread_id*/ None,
+            "Replacement",
+            ThreadStatus::Idle,
+        );
+        app.agents_overview.active_refresh = Some((request_id, owner));
+        app.apply_agents_overview_thread_refresh(
+            &session,
+            request_id,
+            Ok(AgentsOverviewThreadRefresh {
+                cleared_unread: Vec::new(),
+                threads: HashMap::from([(replacement, Some((row, false, None)))]),
+                last_messages: HashMap::new(),
+                recent_seed_complete: true,
+                discovery: None,
+                pinned_thread_ids: None,
+            }),
+        );
+        assert_eq!(app.agents_overview.refill_count(other), 0);
+        assert_eq!(
+            app.agents_overview.refill_count(displayed),
+            usize::from(owner != displayed)
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_overview_page_survives_a_focus_change() {
+    let mut app = make_test_app().await;
+    let owner = BackendId::new();
+    let other = BackendId::new();
+    let (client, _commands, _events) = CloudClient::channel(/*capacity*/ 1);
+    let session = AppServerSession::new(
+        owner,
+        AppServerClient::Cloud(client),
+        ThreadParamsMode::Cloud,
+    );
+    app.backend_registry.connect(&session);
+    app.app_server_backend_id = Some(owner);
+    app.agents_overview.initialized.insert(owner);
+    app.agents_overview
+        .discovery
+        .insert(owner, Default::default());
+    app.agents_overview.active_refresh = Some((Uuid::new_v4(), other));
+    app.open_agents_overview(&session);
+    app.show_more_agents_overview(&session);
+
+    app.app_server_backend_id = Some(other);
+    app.agents_overview.active_refresh = None;
+    app.drain_agents_overview_refresh_queue();
+    assert_eq!(
+        app.agents_overview.pending_refresh_backends.front(),
+        Some(&owner)
+    );
+    assert!(app.agents_overview.active_refresh.is_none());
+
+    app.app_server_backend_id = Some(owner);
+    app.open_agents_overview(&session);
+    assert_eq!(
+        app.agents_overview.active_refresh.map(|(_, id)| id),
+        Some(owner)
+    );
+    assert!(app.agents_overview.pending_refresh_backends.is_empty());
+    assert!(app.agents_overview.refresh_show_more);
+    app.cancel_agents_overview_refresh(owner);
+}
+
+#[tokio::test]
 async fn overview_keeps_rows_and_routes_actions_to_the_owner() -> Result<()> {
     let mut app = make_test_app().await;
     let stub = |owner, mode| {
@@ -227,7 +397,7 @@ async fn overview_keeps_rows_and_routes_actions_to_the_owner() -> Result<()> {
         let session = AppServerSession::new(owner, AppServerClient::Cloud(client), mode);
         (session, (commands, events))
     };
-    let (mut displayed, _displayed_transport) = stub(BackendId::new(), ThreadParamsMode::Cloud);
+    let (mut displayed, (mut commands, _events)) = stub(BackendId::new(), ThreadParamsMode::Cloud);
     let remote_owner = BackendId::new();
     let [local_id, remote_id, colliding_id] = std::array::from_fn(|_| ThreadId::new());
     let [local, remote, colliding] = [
@@ -241,6 +411,7 @@ async fn overview_keeps_rows_and_routes_actions_to_the_owner() -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     app.app_event_tx = AppEventSender::new(tx);
     app.app_server_backend_id = Some(displayed.backend_id());
+    app.backend_registry.connect(&displayed);
     let local_reads = HashMap::from([(local_id, Some((local, false, None))), (remote_id, None)]);
     let remote_reads = HashMap::from([
         (remote_id, Some((remote.clone(), false, None))),
@@ -273,7 +444,7 @@ async fn overview_keeps_rows_and_routes_actions_to_the_owner() -> Result<()> {
                 threads: reads,
                 last_messages: HashMap::new(),
                 recent_seed_complete: owner == remote_owner,
-                discovery: (owner != displayed.backend_id()).then(Default::default),
+                discovery: (owner == remote_owner).then(Default::default),
                 pinned_thread_ids: Some(pins),
             }),
         );
@@ -313,17 +484,24 @@ async fn overview_keeps_rows_and_routes_actions_to_the_owner() -> Result<()> {
         Some(&remote)
     );
 
+    app.active_thread_id = Some(ThreadId::new());
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    assert!(matches!(
-        app.select_agents_overview_thread(&mut tui, &mut displayed, remote_id)
-            .await?,
-        AppRunControl::Continue
-    ));
-    assert!(matches!(
-        rx.try_recv()?,
-        AppEvent::ResumeBackendSession(target)
-            if target.backend_id == remote_owner && target.thread_id == remote_id
-    ));
+    for (owner, thread_id) in [
+        (remote_owner, remote_id),
+        (displayed.backend_id(), local_id),
+    ] {
+        let result = tokio::select! {
+            result = app.select_agents_overview_thread(&mut tui, &mut displayed, thread_id) => result?,
+            _ = commands.recv() => panic!("selecting a listed task must resume before reading it"),
+        };
+        assert!(matches!(result, AppRunControl::Continue));
+        assert!(matches!(
+            rx.try_recv()?,
+            AppEvent::ResumeBackendSession(target)
+                if target.backend_id == owner && target.thread_id == thread_id
+        ));
+    }
+    assert!(commands.try_recv().is_err());
     assert!(app.agents_overview.threads.contains_key(&local_id));
     let mut view = app.agents_overview_view(vec![remote], Some(remote_id));
     assert!(!view.pin_action_supported);
@@ -388,6 +566,37 @@ async fn overview_keeps_rows_and_routes_actions_to_the_owner() -> Result<()> {
         AppEvent::ToggleAgentsOverviewPin { thread_id, pinned: true } if thread_id == remote_id
     ));
     Ok(())
+}
+
+#[tokio::test]
+async fn overview_hides_show_more_when_only_paginated_backend_disconnects() {
+    let mut app = make_test_app().await;
+    let (client, _commands, _events) = CloudClient::channel(/*capacity*/ 1);
+    let session = AppServerSession::new(
+        BackendId::new(),
+        AppServerClient::Cloud(client),
+        crate::app_server_session::ThreadParamsMode::Cloud,
+    );
+    let owner = session.backend_id();
+    app.backend_registry.connect(&session);
+    app.agents_overview
+        .discovery
+        .insert(owner, Default::default());
+    app.agents_overview.view_state.lock().unwrap().has_more = true;
+
+    app.backend_registry.disconnect(owner);
+    app.cancel_agents_overview_refresh(owner);
+    app.reconnect.offline = true;
+    app.open_agents_overview(&session);
+
+    assert!(app.backend_registry.request_handle(owner).is_none());
+    assert!(
+        !app.agents_overview
+            .has_more_for(&app.backend_registry, owner)
+    );
+    assert!(!app.agents_overview.view_state.lock().unwrap().has_more);
+    app.show_more_agents_overview(&session);
+    assert!(app.agents_overview.active_refresh.is_none());
 }
 
 #[tokio::test]
@@ -524,7 +733,7 @@ pub(in crate::app) fn overview_thread(
 
 #[tokio::test]
 async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Result<()> {
-    let mut app = make_test_app().await;
+    let (mut app, mut events, _) = make_test_app_with_channels().await;
     let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let [retained, archived, deleted, created] = std::array::from_fn(|_| ThreadId::new());
@@ -614,26 +823,53 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
     retained_thread.name = Some("New name".to_string());
     retained_thread.status = ThreadStatus::NotLoaded;
     let expected = HashMap::from([
-        (retained, Some(retained_thread)),
+        (retained, Some(retained_thread.clone())),
         (created, Some(created_thread)),
     ]);
     assert_eq!(app.agents_overview.threads, expected);
 
     let request_id = Uuid::new_v4();
     app.agents_overview.active_refresh = Some((request_id, app_server.backend_id()));
+    let follow_up = ServerNotification::ItemCompleted(
+        codex_app_server_protocol::ItemCompletedNotification::new(
+            retained.to_string(),
+            "turn".into(),
+            ThreadItemPayload::UserMessage {
+                id: "prompt".into(),
+                client_id: None,
+                content: vec![codex_app_server_protocol::UserInput::Text {
+                    text: "Current request".into(),
+                    text_elements: Vec::new(),
+                }],
+            },
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        ),
+    );
+    app.track_agents_overview_notification(&follow_up);
     app.apply_agents_overview_thread_refresh(
         &app_server,
         request_id,
         Ok(AgentsOverviewThreadRefresh {
             cleared_unread: Vec::new(),
             last_messages: HashMap::new(),
-            threads: HashMap::from([(retained, None)]),
+            threads: HashMap::from([
+                (retained, Some((retained_thread, false, None))),
+                (created, None),
+            ]),
             recent_seed_complete: true,
             discovery: None,
             pinned_thread_ids: None,
         }),
     );
     assert_eq!(app.agents_overview.threads, expected);
+    assert_eq!(
+        app.agents_overview.activity[&retained]
+            .latest_prompt
+            .as_deref(),
+        Some("Current request")
+    );
+
     let request_id = Uuid::new_v4();
     app.agents_overview.active_refresh = Some((request_id, app_server.backend_id()));
     app.apply_agents_overview_thread_refresh(
@@ -667,6 +903,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
             "new-reasoning",
             "**Checking the revised task**",
         ));
+        app.track_agents_overview_notification(&follow_up);
         let current_request = app.agents_overview.active_refresh.unwrap().0;
         for (request_id, last_messages) in [
             (old_request, stale_messages.clone()),
@@ -687,8 +924,54 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
             assert!(app.agents_overview.last_messages.is_empty());
         }
         assert!(app.agents_overview.activity.contains_key(&retained));
+        assert_eq!(
+            app.agents_overview.activity[&retained]
+                .latest_prompt
+                .as_deref(),
+            Some("Current request")
+        );
         assert!(app.agents_overview.active_refresh.is_none());
     }
+
+    // Archive a retained task while its metadata refresh is in flight, then lose events.
+    app.backend_registry.connect(&app_server);
+    app.refresh_agents_overview_threads(&app_server);
+    let interrupted_request = app.agents_overview.active_refresh.unwrap().0;
+    app.handle_app_server_event(
+        &app_server,
+        AppServerEvent::ServerNotification(Box::new(ServerNotification::ThreadArchived(
+            ThreadArchivedNotification {
+                thread_id: retained.to_string(),
+            },
+        ))),
+    )
+    .await;
+    assert_eq!(
+        app.agents_overview.active_refresh.map(|(id, _)| id),
+        Some(interrupted_request)
+    );
+    assert!(app.agents_overview.removed_threads.contains(&retained));
+    assert!(
+        app.agents_overview
+            .active_refresh_thread_ids
+            .contains(&retained)
+    );
+
+    app.handle_app_server_event(&app_server, AppServerEvent::Lagged { skipped: 1 })
+        .await;
+    let restarted_request = app
+        .agents_overview
+        .active_refresh
+        .expect("lag starts a replacement refresh")
+        .0;
+    assert_ne!(restarted_request, interrupted_request);
+    // Check the replacement read targets before applying any results.
+    assert_eq!(
+        app.agents_overview.active_refresh_thread_ids,
+        HashSet::from([created])
+    );
+    finish_overview_refresh(&mut app, &app_server, &mut events).await;
+    assert!(!app.agents_overview.threads.contains_key(&retained));
     app_server.shutdown().await?;
     Ok(())
 }
@@ -770,6 +1053,7 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
     };
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     app.app_event_tx = crate::app_event_sender::AppEventSender::new(event_tx);
+    app.backend_registry.connect(&app_server);
     app.refresh_agents_overview_threads(&app_server);
     finish_overview_refresh(&mut app, &app_server, &mut event_rx).await;
     let recent_ids: HashSet<_> = ids[2..].iter().copied().collect();
@@ -777,10 +1061,7 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
     expected.insert(ids[0]);
     let retained: HashSet<_> = app.agents_overview.threads.keys().copied().collect();
     assert_eq!(retained, expected);
-    assert_eq!(
-        app.agents_overview.last_messages,
-        HashMap::from([(ids[10], "Found the regression in the parser.".to_string())])
-    );
+    assert!(app.agents_overview.last_messages.is_empty());
     let thread = app.agents_overview.threads[&ids[10]].as_ref().unwrap();
     assert_eq!(thread.status, ThreadStatus::NotLoaded);
 
@@ -860,6 +1141,7 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
     let app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     restarted.app_event_tx = crate::app_event_sender::AppEventSender::new(event_tx);
+    restarted.backend_registry.connect(&app_server);
     restarted.refresh_agents_overview_threads(&app_server);
     finish_overview_refresh(&mut restarted, &app_server, &mut event_rx).await;
     let retained: HashSet<_> = restarted.agents_overview.threads.keys().copied().collect();
@@ -872,7 +1154,11 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
         "agents_overview_recent_sessions",
         age.replace_all(&rendered, " [age]")
     );
-    assert!(restarted.agents_overview.has_more(app_server.backend_id()));
+    assert!(
+        restarted
+            .agents_overview
+            .has_more_for(&restarted.backend_registry, app_server.backend_id())
+    );
     // Opening starts a metadata refresh; Show more queues behind it.
     restarted.show_more_agents_overview(&app_server);
     finish_overview_refresh(&mut restarted, &app_server, &mut event_rx).await;
@@ -886,7 +1172,11 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
             .collect::<HashSet<_>>(),
         ids.into_iter().collect()
     );
-    assert!(!restarted.agents_overview.has_more(app_server.backend_id()));
+    assert!(
+        !restarted
+            .agents_overview
+            .has_more_for(&restarted.backend_registry, app_server.backend_id())
+    );
     app_server.shutdown().await?;
     Ok(())
 }
@@ -965,7 +1255,9 @@ async fn check_hidden_thread_does_not_refresh_shared_overview(source: &str) {
     assert_eq!(
         (
             app.agents_overview.active_refresh.map(|(id, _)| id),
-            app.agents_overview.refresh_pending,
+            app.agents_overview
+                .pending_refresh_backends
+                .contains(&app_server.backend_id()),
         ),
         (Some(request_id), false)
     );
@@ -996,7 +1288,9 @@ async fn check_hidden_thread_does_not_refresh_shared_overview(source: &str) {
     assert_eq!(
         (
             app.agents_overview.active_refresh.map(|(id, _)| id),
-            app.agents_overview.refresh_pending,
+            app.agents_overview
+                .pending_refresh_backends
+                .contains(&app_server.backend_id()),
         ),
         (Some(request_id), true)
     );
@@ -1190,6 +1484,18 @@ async fn agents_overview_details_render_markdown() {
         .draw(|frame| view.render(frame.area(), frame.buffer_mut()))
         .unwrap();
     assert_eq!(terminal.backend().to_string(), cached);
+    app.track_agents_overview_notification(&ServerNotification::ThreadClosed(
+        ThreadClosedNotification {
+            thread_id: thread_id.to_string(),
+        },
+    ));
+    assert_eq!(
+        app.agents_overview
+            .last_messages
+            .get(&thread_id)
+            .map(String::as_str),
+        Some(message)
+    );
 
     thread.preview = format!("```\n{}\n```", "long prompt ".repeat(25));
     app.agents_overview.activity.clear();
@@ -2016,10 +2322,15 @@ async fn root_switch_preserves_idle_root_with_running_subagent() -> Result<()> {
     );
     app.handle_app_server_event(
         &app_server,
-        AppServerEvent::ServerRequest(Box::new(ServerRequest::CurrentTimeRead {
+        AppServerEvent::ServerRequest(Box::new(ServerRequest::DynamicToolCall {
             request_id: RequestId::Integer(99),
-            params: CurrentTimeReadParams {
+            params: DynamicToolCallParams {
                 thread_id: idle_child_id.to_string(),
+                turn_id: "turn".into(),
+                call_id: "call".into(),
+                namespace: None,
+                tool: "test".into(),
+                arguments: serde_json::Value::Null,
             },
         })),
     )
@@ -3284,7 +3595,7 @@ async fn command_center_refresh_failure_is_inline_and_clears_on_success() -> Res
             threads: HashMap::new(),
             last_messages: HashMap::new(),
             recent_seed_complete: true,
-            discovery: None,
+            discovery: Some(Default::default()),
             pinned_thread_ids: None,
         }),
     );

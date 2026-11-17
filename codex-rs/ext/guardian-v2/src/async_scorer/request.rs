@@ -1,8 +1,13 @@
 //! Admits classifier requests before moving committed history, without advancing the cursor.
 //! The complete immutable prefix, setup and new evidence share the classifier input limit.
 //! Instruction and sync-review delivery metadata stay with history. Previously delivered
-//! evidence is omitted before budgeting, using the same instruction filtering as sync.
+//! evidence is omitted before budgeting. Elastic allocation selects only the new evidence,
+//! after accounting for setup, checkpoint and the complete immutable prefix.
 
+use codex_context_fragments::ContextualUserFragment;
+use codex_core::context::GuardianBudgetOmission;
+use codex_guardian_context::RequestBudget;
+use codex_guardian_context::ReservedElasticItemIds;
 use codex_guardian_context::TranscriptCursor;
 use codex_guardian_context::TruncationObservation;
 use codex_guardian_context::estimate_input_tokens;
@@ -44,21 +49,56 @@ impl LunaSamplingRequest {
             Vec::new()
         };
         let (mut context, _) = evidence.compose(cursor, history).ok()?;
-        context.retain_new_instructions(history);
+        if evidence.elastic.is_none() {
+            context.retain_new_instructions(history);
+        }
         context.retain_new_images(history.iter().map(|item| &item.item), |image, detail| {
             *detail = None;
             Some(Cow::Borrowed(image))
         });
-        let truncations = std::mem::take(&mut context.truncations);
-        let section_costs = context.section_costs().collect();
         let existing_context_tokens = history
             .iter()
             .map(|item| estimate_input_tokens(&item.item))
             .fold(0usize, usize::saturating_add);
-        let (mut input, new_input_tokens) =
-            LunaSampler::finish_input(self, setup, context.into_annotated_messages());
+        let setup_tokens = setup
+            .iter()
+            .map(|item| estimate_input_tokens(&item.item))
+            .fold(0usize, usize::saturating_add);
+        let maximum = max_input_tokens.saturating_sub(INPUT_TOKEN_MARGIN);
+        let ids = if let Some(policy) = &evidence.elastic {
+            let prepared = context
+                .prepare_elastic_entries(policy)
+                .ok()?
+                .prepare_delivery(history)
+                .ok()?;
+            let ids = ReservedElasticItemIds::reserve(&prepared, &self.item_id_generator);
+            context = prepared
+                .enforce_budget(
+                    RequestBudget {
+                        max_input_tokens: maximum,
+                        existing_context_tokens: existing_context_tokens
+                            .saturating_add(setup_tokens)
+                            .saturating_add(ids.tokens()),
+                    },
+                    GuardianBudgetOmission
+                        .render()
+                        .into_text()
+                        .unwrap_or_default(),
+                )
+                .ok()?;
+            Some(ids)
+        } else {
+            None
+        };
+        let truncations = std::mem::take(&mut context.truncations);
+        let section_costs = context.section_costs().collect();
+        let mut suffix = context.into_annotated_messages();
+        if let Some(ids) = ids {
+            ids.assign(&mut suffix).ok()?;
+        }
+        let (mut input, new_input_tokens) = LunaSampler::finish_input(self, setup, suffix);
         let input_tokens = existing_context_tokens.saturating_add(new_input_tokens);
-        if input_tokens > max_input_tokens.saturating_sub(INPUT_TOKEN_MARGIN) {
+        if input_tokens > maximum {
             return None;
         }
         if let Some(mut history) = conversation.take_history() {

@@ -147,6 +147,7 @@ impl App {
         };
         if let Some(pane) = self.sidebars.get_mut(&Some(active_id)) {
             pane.opening = None;
+            pane.cancel_hidden_document_primary(/*visible*/ false);
         }
         let input_state = self.chat_widget.capture_thread_input_state();
         let recap_progress = self.recap.progress();
@@ -165,13 +166,14 @@ impl App {
         }
     }
 
-    pub(super) fn retain_subscriptions_for_fork(&mut self) {
-        // Tasks can start while the fork RPC is pending.
+    pub(super) fn retain_thread_subscriptions(&mut self) {
+        // Keep approvals routable while leaving the current task.
         for id in self
             .thread_event_channels
             .keys()
             .copied()
             .chain(self.agent_navigation.tracked_thread_ids())
+            .chain(self.current_displayed_thread_id())
             .filter(|id| {
                 !self.side_threads.contains_key(id)
                     && !self
@@ -877,7 +879,11 @@ impl App {
             }
             AppCommand::SetThreadName { name } => {
                 let name = name.to_string();
-                app_server.thread_set_name(thread_id, name.clone()).await?;
+                if let Err(error) = app_server.thread_set_name(thread_id, name.clone()).await {
+                    self.chat_widget
+                        .add_error_message(format!("Failed to rename thread: {error}"));
+                    return Ok(true);
+                }
                 self.chat_widget.display_thread_name(thread_id, name);
                 self.cancel_thread_title_generation(thread_id);
                 Ok(true)
@@ -1137,6 +1143,7 @@ impl App {
             return Ok(());
         }
         self.track_side_chat_title(thread_id, &notification);
+        self.notice_sidebar_file_item(thread_id, &notification);
         if self.current_displayed_thread_id() == Some(thread_id)
             && let ServerNotification::TurnCompleted(notification) = &notification
         {
@@ -1175,6 +1182,7 @@ impl App {
         {
             return Ok(());
         }
+        archived_thread::update_archived_thread(self, thread_id, &notification);
         let mut confirmed_profile = None;
         if let ServerNotification::ThreadSettingsUpdated(notification) = &notification {
             self.apply_thread_settings_to_cached_session(thread_id, &notification.thread_settings)
@@ -1431,6 +1439,14 @@ impl App {
     ) -> Option<ThreadSessionState> {
         let mut session = self.primary_session_configured.clone()?;
         session.read_only_history = false;
+        session.thread_settings_confirmed = false;
+        session.primary_environment_cwd = crate::session_state::primary_environment_cwd(
+            notification
+                .thread
+                .environments
+                .as_deref()
+                .unwrap_or_default(),
+        );
         session.thread_id = thread_id;
         // The primary session supplies defaults. The new thread supplies its own fork parent.
         session.set_fork_parent(notification.thread.forked_from_id.as_deref());
@@ -1438,6 +1454,11 @@ impl App {
         session.windows_sandbox_host = crate::windows_sandbox::host_from_environments(
             notification.thread.environments.as_deref(),
         );
+        // A parent’s collaboration mode can override the child’s reported model and effort.
+        session.collaboration_mode = None;
+        session
+            .reasoning_effort
+            .clone_from(&notification.thread.reasoning_effort);
         session.thread_name = notification.thread.name.clone();
         session.model_provider_id = notification.thread.model_provider.clone();
         session
@@ -2229,18 +2250,7 @@ impl App {
             && let ServerNotification::ItemCompleted(notification) = notification.as_ref()
             && let ThreadItemPayload::UserMessage { content, .. } = &notification.item.payload
         {
-            Some(
-                content
-                    .iter()
-                    .filter_map(|item| match item {
-                        codex_app_server_protocol::UserInput::Text { text, .. } => {
-                            Some(crate::user_prompt::extract_prompt_request_with_offset(text).0)
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            )
+            super::thread_title::user_message_text(content)
         } else {
             None
         };
@@ -2248,7 +2258,6 @@ impl App {
         self.handle_thread_event_now_recovering_file_changes(event)
             .await;
         if let Some(user_message) = automatic_title_user_message
-            && !user_message.trim().is_empty()
             && let Some(thread_id) = self.active_thread_id
         {
             self.generate_thread_title(
@@ -2256,6 +2265,7 @@ impl App {
                 thread_id,
                 ThreadTitleDestination::Automatic,
                 &user_message,
+                /*expected_name*/ None,
             );
         }
         if !had_active_modal

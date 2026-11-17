@@ -61,6 +61,8 @@ use crate::rmcp_client::prepare_regular_mcp_tools_for_model;
 use crate::runtime::McpPublicationGate;
 use crate::runtime::McpRuntimeInput;
 use crate::runtime::McpStartupPolicy;
+use crate::sandbox_metadata;
+use crate::sandbox_metadata::SandboxState;
 use crate::server::McpServerConnectionIdentity;
 use crate::server::McpServerMetadata;
 use crate::tools::ToolFilter;
@@ -232,6 +234,13 @@ impl McpServerConnection {
         self.startup_trigger
             .as_ref()
             .is_some_and(|startup_trigger| !*startup_trigger.borrow())
+    }
+
+    fn is_dormant_and_private(&self) -> bool {
+        self.startup_is_dormant()
+            && !self.client.cancel_token.is_cancelled()
+            && self.client.connection_slot.is_none()
+            && self.legacy_fallback.is_none()
     }
 }
 
@@ -442,9 +451,9 @@ impl McpConnectionSet {
         let codex_home = config.codex_home.clone();
         let prefix_mcp_tool_names = config.prefix_mcp_tool_names;
         let non_prefixed_mcp_tool_servers = config.non_prefixed_mcp_tool_servers.clone();
-        let default_protocol_mode = config.protocol_mode;
+        let default_protocol_mode = config.client.protocol_mode;
         let host_owned_apps_protocol_mode = config.host_owned_apps_protocol_mode;
-        let client_elicitation_capability = config.client_elicitation_capability.clone();
+        let client_elicitation_capability = config.client.client_elicitation_capability.clone();
         let tool_plugin_context = crate::mcp::tool_plugin_context(&config);
         let auth = auth.as_ref();
         let mut servers = HashMap::new();
@@ -511,7 +520,8 @@ impl McpConnectionSet {
             .into_iter()
             .filter(|(_, server)| server.enabled())
         {
-            let server = server.with_read_only_mcp_tools(config.requires_read_only_mcp_tools);
+            let server =
+                server.with_read_only_mcp_tools(config.client.requires_read_only_mcp_tools);
             let registration = config.mcp_server_catalog.server(&server_key);
             let server_name = registration
                 .map_or(server_key.name(), |server| server.name())
@@ -527,7 +537,7 @@ impl McpConnectionSet {
                 &server_name,
                 registration,
                 network_policy_metadata.is_some(),
-                &config.chatgpt_base_url,
+                &config.client.chatgpt_base_url,
             );
             let is_host_owned_codex_apps = registration.is_some_and(|server| {
                 server
@@ -674,7 +684,7 @@ impl McpConnectionSet {
                         },
                     )
                 };
-            let discover_local_stdio = config.discover_local_stdio
+            let discover_local_stdio = config.client.discover_local_stdio
                 && server.can_discover_local_stdio(&server_name, runtime_auth_provider.as_ref());
             let protocol_mode = if discover_local_stdio {
                 McpProtocolMode::DiscoverLocalStdio
@@ -742,7 +752,7 @@ impl McpConnectionSet {
                     (&client_elicitation_capability, &client_mcp_extensions),
                     Some((&connection_identity, cache_mode, server.is_agent_plugin())),
                 )?;
-                context.track_tool_list_changes = config.mcp_tool_list_changed;
+                context.track_tool_list_changes = config.client.mcp_tool_list_changed;
                 context.before_stdio_discovery =
                     expected_protocol_mode == Some(McpProtocolMode::DiscoverLocalStdio);
                 Some(context)
@@ -809,7 +819,7 @@ impl McpConnectionSet {
                                 connection: Arc::clone(connection),
                                 protocol_mode,
                                 startup_readiness: configured_config.startup_readiness,
-                                refresh_tool_list: config.mcp_tool_list_changed,
+                                refresh_tool_list: config.client.mcp_tool_list_changed,
                                 refresh_timeout: startup_timeout,
                                 metadata,
                                 tool_filter: configured_tool_filter,
@@ -832,7 +842,7 @@ impl McpConnectionSet {
             let mut legacy_to_upgrade = None;
             if let Some(previous_view) =
                 reusable_previous.and_then(|previous| previous.servers.get(&server_key))
-                && previous_view.refresh_tool_list == config.mcp_tool_list_changed
+                && previous_view.refresh_tool_list == config.client.mcp_tool_list_changed
                 && (same_owner || !previous_view.connection.may_use_legacy_fallback())
             {
                 let connection = Arc::clone(&previous_view.connection);
@@ -885,7 +895,7 @@ impl McpConnectionSet {
                             connection,
                             protocol_mode,
                             startup_readiness: configured_config.startup_readiness,
-                            refresh_tool_list: config.mcp_tool_list_changed,
+                            refresh_tool_list: config.client.mcp_tool_list_changed,
                             refresh_timeout: startup_timeout,
                             metadata,
                             tool_filter: configured_tool_filter,
@@ -1041,7 +1051,7 @@ impl McpConnectionSet {
                     }),
                     protocol_mode,
                     startup_readiness: configured_config.startup_readiness,
-                    refresh_tool_list: config.mcp_tool_list_changed,
+                    refresh_tool_list: config.client.mcp_tool_list_changed,
                     refresh_timeout: startup_timeout,
                     metadata,
                     tool_filter: configured_tool_filter,
@@ -1292,14 +1302,18 @@ impl McpConnectionSet {
             .is_some_and(|(left, right)| Arc::ptr_eq(&left.connection, &right.connection))
     }
 
-    pub(crate) async fn authentication_failed_servers(&self) -> Vec<McpServerKey> {
+    pub(crate) async fn authentication_failed_servers(
+        &self,
+        include: impl Fn(&McpServerKey) -> bool,
+    ) -> Vec<McpServerKey> {
         let mut failed_servers = Vec::new();
         for (server_name, view) in &self.servers {
-            if view
-                .connection
-                .client
-                .startup_complete
-                .load(Ordering::Acquire)
+            if include(server_name)
+                && view
+                    .connection
+                    .client
+                    .startup_complete
+                    .load(Ordering::Acquire)
                 && let Err(error) = view.connection.client().await
                 && error.is_authentication_required()
             {
@@ -1314,7 +1328,7 @@ impl McpConnectionSet {
         config: &crate::McpConfig,
     ) -> Vec<McpServerKey> {
         let mut candidates = Vec::new();
-        for server_name in self.authentication_failed_servers().await {
+        for server_name in self.authentication_failed_servers(|_| true).await {
             if let Some(view) = self.servers.get(&server_name)
                 && let Some(identity) = view.connection.identity.as_ref()
                 && let Some(server) = config.mcp_server_catalog.server(&server_name)
@@ -1463,6 +1477,27 @@ impl McpConnectionSet {
         Ok(server_key)
     }
 
+    /// A private, configured local helper whose startup gate is still closed has no process.
+    pub(crate) fn is_dormant_private_stdio(&self, key: &McpServerKey) -> bool {
+        let view = &self.servers[key];
+        if !view.connection.is_dormant_and_private()
+            || view.protocol_mode != McpProtocolMode::Legacy
+        {
+            return false;
+        }
+        self.config
+            .as_ref()
+            .and_then(|config| config.mcp_server_catalog.server(key))
+            .is_some_and(|server| {
+                matches!(server.source(), McpServerSource::Config)
+                    && server.config().is_local_environment()
+                    && matches!(
+                        server.config().transport,
+                        McpServerTransportConfig::Stdio { .. }
+                    )
+            })
+    }
+
     /// Validates an exact client target before startup or execution.
     pub(crate) fn validate_tool_call(&self, server: &McpServerKey, tool: &str) -> Result<()> {
         let view = self
@@ -1512,9 +1547,39 @@ impl McpConnectionSet {
             }
             (server_timeout, requested_timeout) => server_timeout.or(requested_timeout),
         };
-        // Direct callers cannot supply host-owned entitlement metadata, even for unlisted tools.
-        if let Some(serde_json::Value::Object(meta)) = meta.as_mut() {
-            meta.remove(ENTITLEMENT_CONTEXT_KEY);
+        // Direct callers cannot set host-owned authority, even for unlisted tools.
+        if let Some(serde_json::Value::Object(metadata)) = meta.as_mut() {
+            metadata.remove(ENTITLEMENT_CONTEXT_KEY);
+            metadata.remove(sandbox_metadata::MCP_SANDBOX_STATE_CAPABILITY);
+            metadata.remove(sandbox_metadata::MCP_SANDBOX_STATE_META_CAPABILITY);
+            metadata.remove(sandbox_metadata::MCP_SANDBOX_LAUNCHER_META_KEY);
+        }
+        let environment_id = &view.metadata.environment_id;
+        let permission_profile = self
+            .config
+            .as_ref()
+            .and_then(|config| config.permission_profile_for_server(server_key));
+        if client.server_supports_sandbox_state_meta_capability
+            && let Some(config) = self.config.as_ref()
+            && let Some(permission_profile) = permission_profile
+            && let Some(sandbox_cwd) = config.environment_cwds.get(environment_id)
+        {
+            sandbox_metadata::augment_metadata(
+                &mut meta,
+                SandboxState {
+                    permission_profile: permission_profile.clone(),
+                    codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
+                    sandbox_cwd: sandbox_cwd.clone(),
+                    use_legacy_landlock: config.use_legacy_landlock,
+                    use_mxc: config
+                        .environment_use_mxc
+                        .get(environment_id)
+                        .copied()
+                        .unwrap_or(false),
+                },
+                sandbox_metadata::sandbox_codex_executable(config, server_key, environment_id)
+                    .await,
+            )?;
         }
         let result: rmcp::model::CallToolResult = client
             .call_tool(
@@ -1522,10 +1587,8 @@ impl McpConnectionSet {
                 arguments,
                 self.network_policy_meta_for_call(
                     &client,
-                    self.config
-                        .as_ref()
-                        .and_then(|config| config.permission_profile_for_server(server_key)),
-                    &view.metadata.environment_id,
+                    permission_profile,
+                    environment_id,
                     meta,
                 ),
                 effective_timeout,
