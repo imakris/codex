@@ -51,7 +51,9 @@ async fn pending_request(
         node_repl_images: None,
     })?;
     let (ready, score) = tokio::sync::oneshot::channel();
-    let authorization = ScoreAuthorization::current(&thread, &Default::default()).await;
+    let authorization = ScoreAuthorization::current(&thread, &Default::default())
+        .await
+        .expect("read Guardian authorization");
     let pending_score = PendingScore {
         progress: Arc::clone(
             &ConversationBackend::for_turn(
@@ -67,6 +69,11 @@ async fn pending_request(
     Ok((
         ConversationRequest {
             evidence,
+            max_input_tokens: thread
+                .thread_extension_data()
+                .get::<LunaSampler>()
+                .expect("test sampler")
+                .max_input_tokens(),
             reset_token_limit: config.async_classifier_conversation_token_limit,
             authorization,
             thread,
@@ -712,7 +719,9 @@ async fn delayed_classification_skips_after_newer_score_and_history_complete() -
     let history = fixture.test.codex.conversation_history_snapshot().await;
     let observe = |call_id, permissions| {
         fixture.registry.tool_lifecycle_contributors()[0].on_tool_start(ToolStartInput {
+            sampling_model: "gpt-5.5",
             serving_assessment: None,
+            guardian_probe: Some(true),
             permissions,
             session_store: &fixture.session_store,
             thread_store: store,

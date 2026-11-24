@@ -1,3 +1,4 @@
+use codex_thread_context_ids_test_support::thread_context_ids;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -47,7 +48,6 @@ use codex_protocol::protocol::UserMessageAudioKind;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::UserMessageImageKind;
 use codex_protocol::user_input::UserInput;
-use codex_protocol_test_support::uuid_v7_item_id_generator_for_test;
 use codex_rollout::CompactedItem;
 use codex_rollout::RetainedContextEvent;
 use codex_rollout::RolloutConfig;
@@ -384,15 +384,25 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
     assert_eq!(
         lines
             .iter()
-            .filter(|line| matches!(line.item, RolloutItem::EventMsg(EventMsg::ItemCompleted(_))))
+            .filter(|line| matches!(
+                line.item,
+                RolloutItem::EventMsg {
+                    event: EventMsg::ItemCompleted(_),
+                    ..
+                }
+            ))
             .count(),
         2
     );
     let user_item = lines.iter().find_map(|line| match &line.item {
-        RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
-            item: TurnItem::UserMessage(item),
+        RolloutItem::EventMsg {
+            event:
+                EventMsg::ItemCompleted(ItemCompletedEvent {
+                    item: TurnItem::UserMessage(item),
+                    ..
+                }),
             ..
-        })) => Some(item),
+        } => Some(item),
         _ => None,
     });
     let expected_content = vec![
@@ -567,6 +577,7 @@ async fn migration_preserves_image_generation_failure_metadata() {
         input_images: Vec::new(),
         imagegen_request_id: None,
         generation_id: None,
+        image_metadata: Default::default(),
     };
     let image_completion =
         RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
@@ -579,6 +590,7 @@ async fn migration_preserves_image_generation_failure_metadata() {
             saved_path: expected_item.saved_path.clone(),
             input_images: Vec::new(),
             generation_id: expected_item.generation_id.clone(),
+            image_metadata: expected_item.image_metadata.clone(),
         }));
     let path = write_rollout(
         home.path(),
@@ -600,7 +612,10 @@ async fn migration_preserves_image_generation_failure_metadata() {
     let migrated_item = read_rollout(&path)
         .into_iter()
         .find_map(|line| match line.item {
-            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => Some(event.item),
+            RolloutItem::EventMsg {
+                event: EventMsg::ItemCompleted(event),
+                ..
+            } => Some(event.item),
             _ => None,
         })
         .expect("migrated image completion");
@@ -631,6 +646,10 @@ async fn migration_preserves_image_generation_input_observations() {
         }],
         imagegen_request_id: None,
         generation_id: Some("gen-image-123".to_string()),
+        image_metadata: serde_json::Map::from_iter([(
+            "futureKey".to_string(),
+            json!({"nestedKey": [0, false, null]}),
+        )]),
     };
     let image_completion =
         RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
@@ -643,6 +662,7 @@ async fn migration_preserves_image_generation_input_observations() {
             saved_path: expected_item.saved_path.clone(),
             input_images: expected_item.input_images.clone(),
             generation_id: expected_item.generation_id.clone(),
+            image_metadata: expected_item.image_metadata.clone(),
         }));
     let path = write_rollout(
         home.path(),
@@ -664,7 +684,10 @@ async fn migration_preserves_image_generation_input_observations() {
     let migrated_item = read_rollout(&path)
         .into_iter()
         .find_map(|line| match line.item {
-            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => Some(event.item),
+            RolloutItem::EventMsg {
+                event: EventMsg::ItemCompleted(event),
+                ..
+            } => Some(event.item),
             _ => None,
         })
         .expect("migrated image completion");
@@ -714,7 +737,10 @@ async fn migration_keeps_late_completions_in_their_original_turn() {
     let started_turn_ids = read_rollout(&path)
         .into_iter()
         .filter_map(|line| match line.item {
-            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => Some(event.turn_id),
+            RolloutItem::EventMsg {
+                event: EventMsg::TurnStarted(event),
+                ..
+            } => Some(event.turn_id),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -838,7 +864,13 @@ async fn migration_preserves_valid_final_record_without_newline() {
     assert_eq!(
         read_rollout(&path)
             .iter()
-            .filter(|line| matches!(line.item, RolloutItem::EventMsg(EventMsg::ItemCompleted(_))))
+            .filter(|line| matches!(
+                line.item,
+                RolloutItem::EventMsg {
+                    event: EventMsg::ItemCompleted(_),
+                    ..
+                }
+            ))
             .count(),
         2
     );
@@ -883,7 +915,10 @@ async fn migration_applies_historical_rollbacks_before_sqlite_projection() {
     let lines = read_rollout(&path);
     assert!(!lines.iter().any(|line| matches!(
         line.item,
-        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))
+        RolloutItem::EventMsg {
+            event: EventMsg::ThreadRolledBack(_),
+            ..
+        }
     )));
     let turns = list_active_summary_turns(&store, thread_id).await;
     assert_eq!(
@@ -1172,26 +1207,26 @@ async fn migration_keeps_late_completions_for_surviving_turns_across_rollback() 
     let lines = read_rollout(&path);
     assert!(!lines.iter().any(|line| matches!(
         &line.item,
-        RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+        RolloutItem::EventMsg { event: EventMsg::ItemCompleted(event), .. }
             if event.item.id() == "call-remove"
     )));
     assert!(lines.iter().any(|line| matches!(
         &line.item,
-        RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+        RolloutItem::EventMsg { event: EventMsg::ItemCompleted(event), .. }
             if event.turn_id == "old" && event.item.id() == "call-old"
     )));
     assert!(lines.iter().any(|line| matches!(
         &line.item,
-        RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+        RolloutItem::EventMsg { event: EventMsg::ItemCompleted(event), .. }
             if event.turn_id == "old" && event.item.id() == "reason-old"
     )));
     assert!(lines.iter().any(|line| matches!(
         &line.item,
-        RolloutItem::EventMsg(EventMsg::TurnComplete(event)) if event.turn_id == "old"
+        RolloutItem::EventMsg { event: EventMsg::TurnComplete(event), .. } if event.turn_id == "old"
     )));
     assert!(!lines.iter().any(|line| matches!(
         &line.item,
-        RolloutItem::EventMsg(EventMsg::TurnComplete(event)) if event.turn_id == "remove"
+        RolloutItem::EventMsg { event: EventMsg::TurnComplete(event), .. } if event.turn_id == "remove"
     )));
     let turns = store
         .list_turns(ListTurnsParams {
@@ -1338,8 +1373,8 @@ async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
         .retained_context
         .as_mut()
         .expect("retained context");
-    context.record(&answer_event, &uuid_v7_item_id_generator_for_test());
-    context.record(&wake_answer_event, &uuid_v7_item_id_generator_for_test());
+    context.record(&answer_event, &thread_context_ids());
+    context.record(&wake_answer_event, &thread_context_ids());
     let path = write_rollout(
         home.path(),
         thread_id,
@@ -1437,7 +1472,7 @@ async fn migration_preserves_answers_before_a_rolled_back_steer() {
             .retained_context
             .as_mut()
             .expect("retained context")
-            .record(&answer, &uuid_v7_item_id_generator_for_test());
+            .record(&answer, &thread_context_ids());
         answers.push(answer);
     }
     // Delayed delivery must use the original call boundary, not the turn's latest steer.
@@ -1559,13 +1594,13 @@ async fn migration_rolls_back_nested_deliveries_by_acceptance_order() {
             }))
             .expect("retained instruction"),
             codex_rollout::RetainedInputSource::Local(Some(order)),
-            &uuid_v7_item_id_generator_for_test(),
+            &thread_context_ids(),
         );
     }
-    context.record(&deliveries[0], &uuid_v7_item_id_generator_for_test());
+    context.record(&deliveries[0], &thread_context_ids());
     let first_retained_message =
         serde_json::to_value(&*context).expect("retained context")["assistant_messages"][0].clone();
-    context.record(&deliveries[1], &uuid_v7_item_id_generator_for_test());
+    context.record(&deliveries[1], &thread_context_ids());
     let outer_call = serde_json::from_value(json!({
         "type": "function_call", "call_id": "exec", "name": "exec", "arguments": "{}"
     }))
@@ -1738,6 +1773,76 @@ async fn migration_preserves_reverse_replay_anchor_after_pre_compaction_rollback
         })
         .expect("retained compaction");
     assert!(replacement_history.is_empty());
+}
+
+#[tokio::test]
+async fn migration_does_not_count_session_end_input_in_checkpoint_rollback() {
+    let first = input_response_message("user", "first turn");
+    let tail = input_response_message(
+        "user",
+        "<environment_context>saved speech</environment_context>",
+    );
+    let next = input_response_message("user", "next turn");
+    let mut saved_tail = codex_rollout::ResponseItemEnvelope::new(tail.clone());
+    saved_tail
+        .metadata
+        .get_or_insert_default()
+        .realtime_session_end_input = true;
+
+    let migrated = migrate_after_rollback(vec![
+        rollout_response_item(first.clone()),
+        RolloutItem::ResponseItem(saved_tail.clone()),
+        rollout_response_item(next.clone()),
+    ])
+    .await;
+    assert!(migrated.iter().any(|item| {
+        matches!(item, RolloutItem::ResponseItem(response) if response == &saved_tail)
+    }));
+
+    for (before_checkpoint, after_checkpoint, expected) in [
+        (
+            vec![rollout_response_item(first.clone())],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            vec![rollout_response_item(first.clone())],
+            vec![
+                started("next-turn"),
+                rollout_response_item(next.clone()),
+                completed("next-turn"),
+            ],
+            vec![first.clone(), tail],
+        ),
+    ] {
+        let mut checkpoint = compacted(Vec::new());
+        let RolloutItem::Compacted(item) = &mut checkpoint else {
+            unreachable!();
+        };
+        item.replacement_history = Some(vec![first.clone().into(), saved_tail.clone()]);
+        let migrated = migrate_after_rollback(
+            before_checkpoint
+                .into_iter()
+                .chain([checkpoint])
+                .chain(after_checkpoint)
+                .collect(),
+        )
+        .await;
+        let replacement = migrated
+            .into_iter()
+            .find_map(|item| match item {
+                RolloutItem::Compacted(item) => item.replacement_history,
+                _ => None,
+            })
+            .expect("surviving checkpoint");
+        assert_eq!(
+            replacement
+                .into_iter()
+                .map(codex_rollout::ResponseItemEnvelope::into_item)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
 }
 
 #[tokio::test]
@@ -2089,7 +2194,10 @@ async fn migration_applies_cumulative_and_overflowing_rollbacks() {
     assert_eq!(turns.turns.len(), 1);
     assert!(!read_rollout(&path).iter().any(|line| matches!(
         line.item,
-        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))
+        RolloutItem::EventMsg {
+            event: EventMsg::ThreadRolledBack(_),
+            ..
+        }
     )));
 }
 
@@ -2322,7 +2430,13 @@ async fn migration_keeps_small_uncompacted_subagent_replay_as_prefix() {
     assert_eq!(
         lines
             .iter()
-            .filter(|line| matches!(line.item, RolloutItem::EventMsg(EventMsg::ItemCompleted(_))))
+            .filter(|line| matches!(
+                line.item,
+                RolloutItem::EventMsg {
+                    event: EventMsg::ItemCompleted(_),
+                    ..
+                }
+            ))
             .count(),
         2
     );

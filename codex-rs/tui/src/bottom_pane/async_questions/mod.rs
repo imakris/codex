@@ -12,7 +12,7 @@ use crate::bottom_pane::bottom_pane_view::BottomPaneView;
 use crate::bottom_pane::chat_composer::ComposerDraft;
 use crate::bottom_pane::scroll_state::ScrollState;
 use crate::bottom_pane::selection_popup_common::GenericDisplayRow;
-use crate::bottom_pane::selection_popup_common::measure_rows_height;
+use crate::bottom_pane::selection_popup_common::styled_row_lines;
 use crate::key_hint::KeyBindingListExt;
 use crate::keymap::KeymapContext;
 use crate::keymap::ListAction;
@@ -32,6 +32,7 @@ use unicode_width::UnicodeWidthStr;
 mod input;
 mod layout;
 mod mouse;
+mod options;
 mod render;
 mod state;
 mod text_selection;
@@ -72,7 +73,7 @@ pub(crate) struct AsyncQuestions {
     pub(crate) has_queued_messages: bool,
     pub(crate) delivery_enabled: bool,
     pub(crate) submission: Option<QuestionSubmission>,
-    visible_options: std::cell::Cell<(usize, usize)>,
+    option_viewport: std::cell::RefCell<options::OptionViewport>,
     text_selection: std::cell::RefCell<text_selection::QuestionTextSelection>,
     answer_mouse_ready: bool,
     keymap: RuntimeKeymap,
@@ -109,7 +110,7 @@ impl AsyncQuestions {
             has_queued_messages: false,
             delivery_enabled: true,
             submission: None,
-            visible_options: std::cell::Cell::new((0, 0)),
+            option_viewport: Default::default(),
             text_selection: std::cell::RefCell::default(),
             answer_mouse_ready: false,
             keymap,
@@ -170,14 +171,14 @@ impl AsyncQuestions {
         !self.has_options() || self.other_selected()
     }
 
-    pub(super) fn option_rows(&self, width: u16) -> Vec<GenericDisplayRow> {
+    pub(super) fn option_rows(&self, width: u16) -> Vec<Vec<HyperlinkLine>> {
         if !self.has_options() {
             return Vec::new();
-        };
+        }
         let other = self.other_label();
         self.options()
             .iter()
-            .chain(std::iter::once(&other))
+            .chain((!self.other_selected()).then_some(&other))
             .enumerate()
             .map(|(index, label)| {
                 let prefix = if self.selected_option_index() == Some(index) {
@@ -188,6 +189,7 @@ impl AsyncQuestions {
                 let number = index + 1;
                 let prefix = format!("{prefix} {number}. ");
                 let indent = prefix.width();
+                let gutter_bytes = prefix.len();
                 let is_choice = index < self.options().len();
                 let mut row = GenericDisplayRow {
                     name: format!("{prefix}{label}"),
@@ -200,30 +202,36 @@ impl AsyncQuestions {
                     row.wrapped_name =
                         prefix_hyperlink_lines(lines, prefix.into(), " ".repeat(indent).into());
                 }
-                row
+                let mut lines = styled_row_lines(
+                    &row,
+                    self.selected_option_index() == Some(index),
+                    /*desc_col*/ 0,
+                    width,
+                    Default::default(),
+                );
+                if is_choice && row.wrapped_name.is_empty() {
+                    mouse::exclude_gutter_from_selection(&mut lines, label, gutter_bytes);
+                }
+                lines
             })
             .collect()
     }
 
-    pub(super) fn options_required_height(&self, width: u16) -> u16 {
-        if !self.has_options() {
-            return 0;
-        }
-        let rows = self.option_rows(width);
-        if self.other_selected() {
+    pub(super) fn answer_height(&self, width: u16, lines: &[Vec<HyperlinkLine>]) -> u16 {
+        let named_height = lines.iter().map(Vec::len).sum::<usize>();
+        let input_height = if !self.has_options() {
+            self.composer.inline_input_height(width).clamp(1, 8)
+        } else if self.other_selected() {
             let prefix = self.other_prefix_width(width);
-            measure_rows_height(
-                &rows[..rows.len() - 1],
-                &ScrollState::default(),
-                rows.len(),
-                width,
-            ) + self
-                .composer
+            self.composer
                 .inline_input_height(width.saturating_sub(prefix).max(1))
                 .clamp(1, 8)
         } else {
-            measure_rows_height(&rows, &ScrollState::default(), rows.len(), width)
-        }
+            0
+        };
+        u16::try_from(named_height)
+            .unwrap_or(u16::MAX)
+            .saturating_add(input_height)
     }
 
     fn save_current_draft(&mut self) {
@@ -238,6 +246,7 @@ impl AsyncQuestions {
 
     fn restore_current_draft(&mut self) {
         self.text_selection.borrow_mut().clear();
+        self.option_viewport.take();
         self.sync_composer_placeholder();
         let draft = self
             .current_answer()

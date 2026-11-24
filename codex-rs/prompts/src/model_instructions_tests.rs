@@ -34,7 +34,6 @@ fn test_model(model_messages: Option<ModelMessages>) -> ModelInfo {
         default_verbosity: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        web_search_provider: None,
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_image_detail_original: false,
         context_window: None,
@@ -64,7 +63,7 @@ fn test_model(model_messages: Option<ModelMessages>) -> ModelInfo {
 fn renders_literal_templates() {
     let template = "Hello {{ personality }}\n\n# Personality\n\nFixed instructions";
     let model = test_model(Some(ModelMessages {
-        instructions_template: Some(template.to_string()),
+        instructions_template: Some(template.into()),
         ..Default::default()
     }));
     assert_eq!(
@@ -83,7 +82,7 @@ fn missing_and_empty_templates_render_empty_but_retain_presence() {
         (Some(ModelMessages::default()), None),
         (
             Some(ModelMessages {
-                instructions_template: Some(String::new()),
+                instructions_template: Some("".into()),
                 ..Default::default()
             }),
             Some(""),

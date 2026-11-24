@@ -46,6 +46,7 @@ use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::test_env;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -616,6 +617,10 @@ pub(super) async fn cached_stdio_first_use_scenario() -> anyhow::Result<Vec<Valu
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
         .with_config(move |config| {
             core_test_support::test_codex::configure_scenario_catalog(config);
+            config
+                .features
+                .disable(Feature::McpConnectionSharing)
+                .expect("use a cacheable legacy catalog");
             config.update_plan_enabled = true;
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
             config
@@ -688,19 +693,21 @@ pub(super) async fn cached_stdio_first_use_scenario() -> anyhow::Result<Vec<Valu
         &format!("Echo from {first_process}."),
     );
 
+    let mut eager_config = fixture.config.clone();
+    eager_config
+        .features
+        .disable(Feature::McpLazyStdioStartup)?;
     let control = fixture
         .thread_manager
-        .start_thread(StartThreadOptions::new(fixture.config.clone()))
+        .start_thread(StartThreadOptions::new(eager_config))
         .await?
         .thread;
     wait_for_mcp_server(&control, SERVER_NAME).await?;
     let control_pid = wait_for_new_pid(fs.as_ref(), &pid_file, Some(&first_pid)).await?;
     control.shutdown_and_wait().await?;
 
-    let mut treatment = fixture.config.clone();
-    treatment.features.enable(Feature::McpLazyStdioStartup)?;
-    // The flag must preserve a required live connection even when the catalog is warm.
-    let mut required_config = treatment.clone();
+    // A required server still needs a live connection even when the catalog is warm.
+    let mut required_config = fixture.config.clone();
     let mut servers = required_config.mcp_servers.get().clone();
     servers
         .get_mut(SERVER_NAME)
@@ -741,7 +748,7 @@ pub(super) async fn cached_stdio_first_use_scenario() -> anyhow::Result<Vec<Valu
         ..
     } = fixture
         .thread_manager
-        .start_thread(StartThreadOptions::new(treatment))
+        .start_thread(StartThreadOptions::new(fixture.config.clone()))
         .await?;
     second_thread.submit(Op::Interrupt).await?;
 
@@ -1118,6 +1125,7 @@ pub(super) async fn cached_stdio_first_use_scenario() -> anyhow::Result<Vec<Valu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_stdio_negotiates_sharing_on_first_use() -> anyhow::Result<()> {
+    const LEASE_OPEN_DELAY_MS: u64 = 100;
     skip_if_no_network!(Ok(()));
     core_test_support::skip_if_remote!(Ok(()), "the shared stdio fixture runs on the host");
     skip_if_wine_exec!(Ok(()), "requires the native stdio server");
@@ -1147,7 +1155,11 @@ async fn cached_stdio_negotiates_sharing_on_first_use() -> anyhow::Result<()> {
                         "cached_rmcp": {
                             "command": command,
                             "cwd": config.cwd,
-                            "env": { "MCP_TEST_DYNAMIC_SERVER_METADATA": "1" },
+                            "env": {
+                                "MCP_TEST_DYNAMIC_SERVER_METADATA": "1",
+                                "MCP_TEST_LEASE_EVENTS_FILE": config.codex_home.join("mcp-leases"),
+                                "MCP_TEST_LEASE_OPEN_DELAY_MS": LEASE_OPEN_DELAY_MS.to_string(),
+                            },
                             "enabled_tools": ["echo"]
                         }
                     }))
@@ -1198,6 +1210,24 @@ async fn cached_stdio_negotiates_sharing_on_first_use() -> anyhow::Result<()> {
     }
     assert_ne!(processes[0], processes[1]);
     assert_eq!(processes[1], processes[2]);
+
+    for (thread, started_process) in [(&first, true), (&second, false)] {
+        let duration_ms = wait_for_event_match(thread, |event| match event {
+            EventMsg::McpStartupUpdate(update)
+                if update.server == SERVER_NAME
+                    && matches!(update.status, McpStartupStatus::Ready) =>
+            {
+                Some(update.duration_ms)
+            }
+            _ => None,
+        })
+        .await;
+        if started_process {
+            assert!(duration_ms.is_some_and(|ms| ms >= LEASE_OPEN_DELAY_MS));
+        } else {
+            assert_eq!(duration_ms, None);
+        }
+    }
 
     let response =
         responses::mount_sse_once(&responses_server, responses::sse_completed("unrelated")).await;

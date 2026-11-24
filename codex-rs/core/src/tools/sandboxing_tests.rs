@@ -170,7 +170,7 @@ fn additional_permissions_allow_bypass_sandbox_first_attempt_when_execpolicy_ski
                 bypass_sandbox: true,
                 proposed_execpolicy_amendment: None,
             },
-            &FileSystemSandboxPolicy::default(),
+            /*has_denied_reads*/ false,
             /*already_approved*/ false,
         ),
         SandboxOverride::BypassSandboxFirstAttempt
@@ -186,7 +186,7 @@ fn guardian_bypasses_sandbox_for_explicit_escalation_on_first_attempt() {
                 bypass_sandbox: false,
                 proposed_execpolicy_amendment: None,
             },
-            &FileSystemSandboxPolicy::default(),
+            /*has_denied_reads*/ false,
             /*already_approved*/ true,
         ),
         SandboxOverride::BypassSandboxFirstAttempt
@@ -202,6 +202,7 @@ fn deny_read_preserves_the_sandbox_for_explicit_escalation_and_blocks_policy_byp
         access: FileSystemAccessMode::Deny,
         missing_path_behavior: None,
     }]);
+    let has_denied_reads = file_system_policy.has_denied_read_restrictions();
 
     assert_eq!(
         sandbox_override_for_first_attempt(
@@ -210,13 +211,12 @@ fn deny_read_preserves_the_sandbox_for_explicit_escalation_and_blocks_policy_byp
                 bypass_sandbox: false,
                 proposed_execpolicy_amendment: None,
             },
-            &file_system_policy,
+            has_denied_reads,
             /*already_approved*/ true,
         ),
         SandboxOverride::EscalatedSandboxWithRestrictions,
         "explicit escalation must widen the first attempt without dropping the sandbox",
     );
-    assert!(!unsandboxed_execution_allowed(&file_system_policy));
     assert!(matches!(
         ensure_native_sandbox(SandboxOverride::EscalatedSandboxWithRestrictions, SandboxType::None),
         Err(ToolError::Rejected(reason)) if reason.contains("requires an available filesystem sandbox"),
@@ -224,21 +224,21 @@ fn deny_read_preserves_the_sandbox_for_explicit_escalation_and_blocks_policy_byp
     assert_eq!(
         sandbox_permissions_preserving_denied_reads(
             SandboxPermissions::RequireEscalated,
-            &file_system_policy,
+            has_denied_reads,
         ),
         SandboxPermissions::UseDefault,
     );
     assert_eq!(
         sandbox_permissions_preserving_denied_reads(
             SandboxPermissions::WithAdditionalPermissions,
-            &file_system_policy,
+            has_denied_reads,
         ),
         SandboxPermissions::WithAdditionalPermissions,
     );
     assert_eq!(
         sandbox_permissions_preserving_denied_reads(
             SandboxPermissions::RequireEscalated,
-            &FileSystemSandboxPolicy::default(),
+            /*has_denied_reads*/ false,
         ),
         SandboxPermissions::RequireEscalated,
     );
@@ -249,7 +249,7 @@ fn deny_read_preserves_the_sandbox_for_explicit_escalation_and_blocks_policy_byp
                 bypass_sandbox: true,
                 proposed_execpolicy_amendment: None,
             },
-            &file_system_policy,
+            has_denied_reads,
             /*already_approved*/ true,
         ),
         SandboxOverride::NoOverride,
@@ -301,7 +301,7 @@ async fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backe
     let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
         sandbox_override: SandboxOverride::NoOverride,
-        sandbox: SandboxType::WindowsRestrictedToken,
+        local_selection: SandboxSelection::Explicit(SandboxType::WindowsRestrictedToken),
         sandbox_requested: true,
         permissions: &permissions,
         exec_server_permissions: &permissions,
@@ -340,6 +340,7 @@ async fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backe
         .expect("prepare elevated Windows sandbox request");
     let overrides = request
         .windows_sandbox_filesystem_overrides
+        .as_ref()
         .expect("elevated Windows sandbox should preserve deny-read overrides");
     assert_eq!(overrides.additional_deny_read_paths, vec![denied_path]);
     assert_eq!(request.windows_sandbox_workspace_roots, vec![cwd]);
@@ -376,7 +377,7 @@ async fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
         sandbox_override: SandboxOverride::NoOverride,
-        sandbox: SandboxType::None,
+        local_selection: SandboxSelection::Explicit(SandboxType::None),
         sandbox_requested: true,
         permissions: &permissions,
         exec_server_permissions: &exec_server_permissions,
@@ -427,9 +428,9 @@ async fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     .expect("prepare remote exec request");
     assert!(!attempt.is_escalated());
 
-    assert_eq!(request.command, argv);
-    assert_eq!(request.arg0, None);
-    assert_eq!(request.sandbox, SandboxType::None);
+    assert_eq!(request.argv(), argv);
+    assert_eq!(request.arg0(), &None);
+    assert_eq!(request.sandbox(), SandboxType::None);
     assert_eq!(
         request.exec_server_sandbox,
         Some(codex_exec_server::FileSystemSandboxContext {

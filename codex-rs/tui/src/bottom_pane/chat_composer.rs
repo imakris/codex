@@ -27,6 +27,7 @@
 //! Preset submenu hints borrow slots and reflow with the composer.
 //!
 //! Shell mode starts when input inserts a leading `!`, never when deletion exposes one.
+//! Completion menus stay closed in shell mode so shell syntax remains literal.
 //! Literal leading bangs remain ordinary messages on submission and during same-draft restoration.
 //! Vim Replace preserves the overwritten leading grapheme until Backspace removes an absorbed `!`.
 //! The plain-text preset keeps command prefixes literal, including `!`, so Enter and Tab
@@ -58,6 +59,7 @@
 //! popup-specific handler if a popup is visible and otherwise to
 //! [`ChatComposer::handle_key_event_without_popup`]. After every handled key, we call
 //! [`ChatComposer::sync_popups`] so UI state follows the latest buffer/cursor.
+//! The composer submit shortcut remains active while slash-argument suggestions are open.
 //! A pending backend handoff uses the basic editor and paste detection while holding submission.
 //! Redraws preserve the paste detector's window so trailing keys stay with the outgoing composer.
 //! Fresh Vim drafts start in Insert; Normal `/` and `?` search the composer.
@@ -84,7 +86,8 @@
 //! the Chinese closing book-title bracket (`》`), takes the place of a newly inserted separator.
 //! Existing whitespace stays part of the draft.
 //!
-//! `Esc` records the active token as dismissed. A completed value that begins with `@` or `$` is
+//! `Esc` records the active token as dismissed and resets any pending unified mention search.
+//! A completed value that begins with `@` or `$` is
 //! also re-dismissed before popup synchronization, because separator affinity can still identify
 //! the completed token to the left of the cursor. Synchronization keeps the popup hidden only while
 //! the query, complete token text, and ordinal among matching occurrences remain the same.
@@ -94,6 +97,8 @@
 //! Slash-command dismissal is tracked separately. Pressing `Esc` while the command popup is active
 //! records the first-line `/name` token and keeps the popup closed while that token is unchanged.
 //! Editing the command token clears the dismissal and allows the popup to reopen.
+//! Slash argument completion revalidates the live token before Tab replaces it; restricted
+//! command dispatch dismisses completion immediately when it clears the draft.
 //!
 //! # History Navigation (↑/↓)
 //!
@@ -119,9 +124,8 @@
 //! keeps prompt-history search; explicitly configured keybindings retain precedence.
 //! Vim queries stay draft-local.
 //!
-//! Slash commands are staged for local history instead of being recorded immediately. Command
-//! recall is a two-phase handoff: stage the submitted slash text here, then record it after
-//! `ChatWidget` dispatches the command.
+//! Slash history is staged here and recorded after `ChatWidget` dispatches the command.
+//! [`slash_argument`] handles positional and named completions, popup keys, and restricted routing.
 //!
 //! # Question Draft Recovery
 //!
@@ -166,6 +170,7 @@
 //! - Treats a leading `!` revealed only by paste expansion as literal model input, not shell input.
 //! - Prunes local attached images so only placeholders that survive expansion are sent.
 //! - Preserves remote image URLs as separate attachments even when text is empty.
+//! - Copies pasted image files into private temporary attachments before retaining their paths.
 //!
 //! When these paths clear the visible textarea after a successful submit or slash-command
 //! dispatch, they intentionally preserve the textarea kill buffer. That lets users `Ctrl+K` part
@@ -190,11 +195,16 @@
 //! navigation slash commands remain available so users can leave or manage the view.
 //! Exports and local display commands (`/title` and `/statusline`) also accept arguments.
 //!
-//! During reconnection, `handle_restricted_key` edits the draft directly without popup dispatch,
-//! composer shortcuts, or submission; `?` becomes literal input. Enter and Tab leave the draft
-//! intact until reconnection succeeds, except for `/warnings`, `/config`, `/quit`, and `/exit`.
+//! While disconnected, `handle_restricted_key` keeps the draft editable without submission.
+//! The slash popup supports navigation and configured submit keys for local commands.
+//! Tab completes without queuing. A connection change keeps the same selection or leaves
+//! the menu unselected if the command disappears.
+//! Local commands include `/warnings`, `/config`, `/rc` (alias `/remote`, including `stop`),
+//! `/feedback` (thread ID and reconnection guidance), `/quit`, and `/exit`. Searching for
+//! other commands shows that they require a server connection. `?` becomes literal input.
 //! When connected but the thread is unavailable, configured
 //! submit keys may dispatch explicitly allowed recovery and local commands; other drafts stay put.
+//! Escape dismisses command and argument popups while preserving the Vim Insert-to-Normal transition.
 //! Empty-prompt agents navigation remains available with its usual editor and draft guards.
 //! Collapsed pastes expand into editable text so the full draft can be copied before quitting.
 //!
@@ -341,6 +351,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
+use ratatui::widgets::Borders;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::Widget;
@@ -378,7 +389,6 @@ use super::footer::render_footer_hint_items;
 use super::footer::render_footer_line;
 use super::footer::reset_mode_after_activity;
 use super::footer::side_conversation_context_line;
-use super::footer::status_line_right_indicator_line;
 use super::footer::toggle_shortcut_mode;
 use super::mention_usage::MentionUsage;
 use super::mentions_v2::MentionV2Popup;
@@ -386,6 +396,7 @@ use super::mentions_v2::MentionV2Selection;
 use super::paste_burst::CharDecision;
 use super::paste_burst::PasteBurst;
 use super::prompt_args::parse_slash_name;
+use super::prompt_args::slash_args_elements;
 use super::skill_popup::MentionItem;
 use super::skill_popup::SkillPopup;
 use super::slash_commands::ServiceTierCommand;
@@ -425,8 +436,10 @@ mod passive_hints;
 mod paste_input;
 mod popup_state;
 mod reconnect;
+pub(crate) use reconnect::DisconnectedCommandState;
 pub(crate) use reconnect::RestrictedInputMode;
 mod edit_history;
+mod slash_argument;
 mod slash_input;
 mod sparkle;
 mod status_surface;
@@ -456,8 +469,6 @@ use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::textarea::TextArea;
-use crate::clipboard_paste::normalize_pasted_path;
-use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
 use crate::skills_helpers::skill_display_name;
 use crate::tui::FrameRequester;
@@ -527,7 +538,7 @@ pub enum InputResult {
 fn parent_owned_command_is_allowed(command: SlashCommand, args: &str) -> bool {
     if matches!(
         command,
-        SlashCommand::Export | SlashCommand::Title | SlashCommand::Statusline
+        SlashCommand::Export | SlashCommand::Title | SlashCommand::Statusline | SlashCommand::Rc
     ) {
         return true;
     }
@@ -813,6 +824,7 @@ impl ChatComposer {
                 ide_context_active: false,
                 status_line_value: None,
                 labeled_status_line: Default::default(),
+                status_line_area: std::cell::Cell::default(),
                 status_line_enabled: false,
                 side_conversation_context_label: None,
                 active_agent_label: None,
@@ -1169,10 +1181,22 @@ impl ChatComposer {
         }
         let undo_enabled = self.config.undo_enabled && !self.draft.textarea.is_vim_enabled();
         if self.popups.active() {
-            return if undo_enabled {
+            let contexts = if undo_enabled {
                 KeymapContextSet::composer_edit_only()
             } else {
                 KeymapContextSet::default()
+            };
+            let restricted_command = matches!(self.popups.active, ActivePopup::Command(_))
+                && matches!(
+                    self.popups.restricted_input_mode,
+                    Some(
+                        RestrictedInputMode::Disconnected | RestrictedInputMode::UnavailableThread
+                    )
+                );
+            return if matches!(self.popups.active, ActivePopup::Argument(_)) || restricted_command {
+                contexts.with_composer_submit()
+            } else {
+                contexts
             };
         }
         let contexts = self.draft.textarea.keymap_contexts();
@@ -1321,32 +1345,6 @@ impl ChatComposer {
 
     pub(crate) fn record_replayed_user_message_history(&mut self, entry: HistoryEntry) {
         self.history.record_replayed_submission(entry);
-    }
-
-    pub fn handle_paste_image_path(&mut self, pasted: &str) -> bool {
-        let Some(path_buf) = normalize_pasted_path(pasted) else {
-            return false;
-        };
-
-        // Opening a serial device or FIFO can block the input loop.
-        if !path_buf.is_file() {
-            return false;
-        }
-
-        match image::image_dimensions(&path_buf) {
-            Ok((width, height)) => {
-                tracing::info!("OK: {pasted}");
-                tracing::debug!("image dimensions={}x{}", width, height);
-                let format = pasted_image_format(&path_buf);
-                tracing::debug!("attached image format={}", format.label());
-                self.attach_image(path_buf);
-                true
-            }
-            Err(err) => {
-                tracing::trace!("ERR: {err}");
-                false
-            }
-        }
     }
 
     /// Replace the composer content with text from an external editor.
@@ -1516,29 +1514,6 @@ impl ChatComposer {
         self.draft.textarea.vim_mode_indicator_span()
     }
 
-    fn mode_indicator_line(&self, show_cycle_hint: bool) -> Option<Line<'static>> {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        if let Some(vim_mode) = self.vim_mode_indicator_span() {
-            spans.push(vim_mode);
-        }
-        if let Some(indicators) = status_line_right_indicator_line(
-            self.footer.collaboration_mode_indicator,
-            self.footer.goal_status_indicator.as_ref(),
-            self.footer.ide_context_active,
-            show_cycle_hint,
-        ) {
-            if !spans.is_empty() {
-                spans.push(" | ".dim());
-            }
-            spans.extend(indicators.spans);
-        }
-        if spans.is_empty() {
-            None
-        } else {
-            Some(Line::from(spans))
-        }
-    }
-
     fn right_footer_line_with_context(&self) -> Line<'static> {
         let mut line = if self.footer.context_window_hidden {
             Line::default()
@@ -1700,7 +1675,8 @@ impl ChatComposer {
         self.current_cursor()
     }
 
-    fn history_navigation_cursor(&self) -> usize {
+    /// Treat Vim's final block cursor as the end of the draft.
+    fn logical_cursor(&self) -> usize {
         if self.draft.is_bash_mode && self.draft.textarea.cursor() == 0 {
             0
         } else if self.draft.textarea.is_vim_normal_mode()
@@ -1808,6 +1784,7 @@ impl ChatComposer {
 
     pub(crate) fn set_parent_owned_thread(&mut self) {
         self.blocks_direct_input = true;
+        self.sync_slash_argument_popup(/*allow*/ true);
         self.placeholder_text = "Viewing sub-agent — direct input is disabled".to_string();
     }
 
@@ -1946,10 +1923,6 @@ impl ChatComposer {
         self.attachments.local_image_paths()
     }
 
-    pub(crate) fn status_line_content(&self) -> Option<&StatusLine> {
-        self.footer.status_line_value.as_ref()
-    }
-
     pub(crate) fn local_images(&self) -> &[LocalImageAttachment] {
         &self.attachments.local_images
     }
@@ -2078,6 +2051,7 @@ impl ChatComposer {
 
     /// Handle a key event coming from the main UI.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
+        self.set_restricted_input_mode(/*mode*/ None);
         if !self.draft.input_enabled {
             return (InputResult::None, false);
         }
@@ -2152,6 +2126,7 @@ impl ChatComposer {
                 key_event,
                 slash_input::SlashPopupInputMode::Normal,
             ),
+            ActivePopup::Argument(_) => self.handle_slash_argument_key(key_event),
             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
             ActivePopup::Skill(_) => self.handle_key_event_with_skill_popup(key_event),
             ActivePopup::MentionV2(_) => self.handle_key_event_with_mentions_v2_popup(key_event),
@@ -2513,6 +2488,10 @@ impl ChatComposer {
                 if let Some((range, query)) = self.current_mentions_v2_token_range() {
                     self.popups.dismissed_mention_token =
                         Some(DismissedToken::new(&self.draft.textarea, range, query));
+                }
+                if self.popups.current_file_query.take().is_some() {
+                    self.app_event_tx
+                        .send(AppEvent::StartFileSearch(String::new()));
                 }
                 self.popups.active = ActivePopup::None;
                 (InputResult::None, true)
@@ -3490,7 +3469,7 @@ impl ChatComposer {
             matches!(
                 self.slash_input().command(name),
                 Some(SlashCommandItem::Builtin(command))
-                    if name == command.command()
+                    if (name == command.command() || command == SlashCommand::Rc && name == "remote")
                         && parent_owned_command_is_allowed(command, args)
             )
         });
@@ -3538,7 +3517,7 @@ impl ChatComposer {
 
         self.stage_slash_command_history(&command);
 
-        let mut args_elements = slash_input::args_elements(
+        let mut args_elements = slash_args_elements(
             inline_command.rest,
             inline_command.rest_offset,
             &self.draft.textarea.text_elements(),
@@ -3572,7 +3551,7 @@ impl ChatComposer {
         let (prepared_text, prepared_elements) = self.prepare_submission_text(record_history)?;
         let (prepared_rest, prepared_rest_offset) = slash_input::prepared_args(&prepared_text)?;
         let mut args_elements =
-            slash_input::args_elements(prepared_rest, prepared_rest_offset, &prepared_elements);
+            slash_args_elements(prepared_rest, prepared_rest_offset, &prepared_elements);
         let trimmed_rest = prepared_rest.trim();
         args_elements = Self::trim_text_elements(prepared_rest, trimmed_rest, args_elements);
         self.draft.textarea.enter_vim_insert_mode();
@@ -3754,10 +3733,9 @@ impl ChatComposer {
         };
         if history_up_pressed || history_down_pressed {
             if self.draft.textarea.mouse_selection_range().is_none()
-                && self.history.should_handle_navigation(
-                    &self.current_text(),
-                    self.history_navigation_cursor(),
-                )
+                && self
+                    .history
+                    .should_handle_navigation(&self.current_text(), self.logical_cursor())
             {
                 let replace_entry = if history_up_pressed {
                     self.history.navigate_up(&self.app_event_tx)
@@ -4107,18 +4085,12 @@ impl ChatComposer {
             self.popups.active = ActivePopup::None;
             return;
         }
-        let mut mentions_v2_token = self.current_mentions_v2_token_range();
-        let mut file_token = if self.mentions_v2_enabled {
-            None
-        } else {
-            self.current_editable_at_token_range_with_options(/*allow_empty*/ false)
-        };
-        let browsing_history = self
-            .history
-            .should_handle_navigation(&self.current_text(), self.history_navigation_cursor());
-        // When browsing input history (shell-style Up/Down recall), skip all popup
-        // synchronization so nothing steals focus from continued history navigation.
-        if browsing_history {
+        // Suspend completion during shell input and history navigation, preserving dismissals.
+        if self.draft.is_bash_mode
+            || self
+                .history
+                .should_handle_navigation(&self.current_text(), self.logical_cursor())
+        {
             if self.popups.current_file_query.is_some() {
                 self.app_event_tx
                     .send(AppEvent::StartFileSearch(String::new()));
@@ -4127,6 +4099,12 @@ impl ChatComposer {
             self.popups.active = ActivePopup::None;
             return;
         }
+        let mut mentions_v2_token = self.current_mentions_v2_token_range();
+        let mut file_token = if self.mentions_v2_enabled {
+            None
+        } else {
+            self.current_editable_at_token_range_with_options(/*allow_empty*/ false)
+        };
         let mut mention_target = self.current_mention_target();
         let at_token_start = mentions_v2_token
             .as_ref()
@@ -4145,13 +4123,17 @@ impl ChatComposer {
         }
 
         let allow_command_popup = self.slash_commands_enabled()
-            && !self.draft.is_bash_mode
             && file_token.is_none()
             && mentions_v2_token.is_none()
             && mention_target.is_none();
-        self.sync_command_popup(allow_command_popup);
+        if !self.sync_slash_argument_popup(allow_command_popup) {
+            self.sync_command_popup(allow_command_popup);
+        }
 
-        if matches!(self.popups.active, ActivePopup::Command(_)) {
+        if matches!(
+            self.popups.active,
+            ActivePopup::Command(_) | ActivePopup::Argument(_)
+        ) {
             if self.popups.current_file_query.is_some() {
                 self.app_event_tx
                     .send(AppEvent::StartFileSearch(String::new()));
@@ -4223,13 +4205,17 @@ impl ChatComposer {
         let cursor = self.draft.textarea.cursor();
         let caret_on_first_line = cursor <= first_line_end;
 
-        let is_editing_slash_command_name = caret_on_first_line
-            && self
-                .slash_input()
-                .is_editing_command_name(first_line, cursor);
         let command_filter_text = caret_on_first_line
             .then(|| slash_input::command_popup_filter_text(first_line, cursor))
             .flatten();
+        let disconnected =
+            self.popups.restricted_input_mode == Some(RestrictedInputMode::Disconnected);
+        // Completing `/q` offline must not erase the rest of a draft like `/question`.
+        let is_editing_slash_command_name = caret_on_first_line
+            && (!disconnected || command_filter_text.as_deref() == Some(text.trim_end()))
+            && self
+                .slash_input()
+                .is_editing_command_name(first_line, cursor);
 
         // If the cursor is currently positioned within an `@token`, prefer the
         // file-search popup over the slash popup so users can insert a file path
@@ -4254,7 +4240,9 @@ impl ChatComposer {
                 if is_editing_slash_command_name
                     && let Some(command_filter_text) = command_filter_text.as_deref()
                 {
-                    let command_popup = self.slash_input().command_popup(command_filter_text);
+                    let command_popup = self
+                        .slash_input()
+                        .command_popup(command_filter_text, disconnected);
                     self.popups.active = ActivePopup::Command(command_popup);
                 }
             }
@@ -4761,7 +4749,7 @@ impl ChatComposer {
                 // Command and unified mention menus can render in a single row.
                 let height = if matches!(
                     self.popups.active,
-                    ActivePopup::Command(_) | ActivePopup::MentionV2(_)
+                    ActivePopup::Command(_) | ActivePopup::Argument(_) | ActivePopup::MentionV2(_)
                 ) || height > 2
                 {
                     height
@@ -4781,6 +4769,7 @@ impl ChatComposer {
             ratatui::widgets::Clear.render(popup_rect, buf);
             match &self.popups.active {
                 ActivePopup::Command(popup) => popup.render_ref(popup_rect, buf),
+                ActivePopup::Argument(popup) => popup.render_ref(popup_rect, buf),
                 ActivePopup::MentionV2(popup) => popup.render_ref(popup_rect, buf),
                 ActivePopup::File(popup) => popup.render_ref(popup_rect, buf),
                 ActivePopup::Skill(popup) => popup.render_ref(popup_rect, buf),
@@ -4924,7 +4913,17 @@ impl ChatComposer {
             selection.register(footer_rect.intersection(buf.area), changed);
         }
         let style = user_message_style();
-        Block::default().style(style).render(composer_rect, buf);
+        let mut block = Block::default().style(style);
+        // Mark the padding without guessing a fill that could hide the terminal's cursor.
+        if style.bg.is_none() && !textarea_rect.is_empty() {
+            let gray = crate::terminal_palette::best_color((128, 128, 128));
+            if gray != Color::Reset {
+                block = block
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .border_style(gray);
+            }
+        }
+        block.render(composer_rect, buf);
         if let Some(previews) = options.image_previews {
             previews.render(
                 thumbnails,
@@ -5168,17 +5167,17 @@ mod tests {
     }
 
     #[test]
-    fn light_terminal_palette_renders_light_composer_snapshot() {
+    fn composer_with_light_or_missing_palette() {
         let colors = crate::terminal_probe::DefaultColors {
             fg: (0x55, 0x57, 0x53),
             bg: (0xff, 0xff, 0xff),
         };
 
+        let (mut composer, _rx) = new_test_composer();
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 48, /*height*/ 6,
+        );
         crate::terminal_palette::with_test_default_colors(colors, || {
-            let (composer, _rx) = new_test_composer();
-            let area = Rect::new(
-                /*x*/ 0, /*y*/ 0, /*width*/ 48, /*height*/ 6,
-            );
             let mut buffer = Buffer::empty(area);
             composer.render(area, &mut buffer);
 
@@ -5187,6 +5186,14 @@ mod tests {
                 crate::terminal_palette::rgb_color((244, 244, 244))
             );
             insta::assert_snapshot!("light_terminal_palette_composer", format!("{buffer:?}"));
+        });
+        crate::terminal_palette::with_test_default_colors(/*colors*/ None, || {
+            composer.draft.textarea.insert_str("Explain ");
+            composer.draft.textarea.insert_element("@file.rs");
+            composer.set_remote_image_urls(vec!["https://example.com/image.png".to_string()]);
+            let mut buffer = Buffer::empty(area);
+            composer.render(area, &mut buffer);
+            insta::assert_snapshot!("missing_terminal_palette_composer", format!("{buffer:?}"));
         });
     }
 
@@ -5488,7 +5495,13 @@ mod tests {
                 composer.set_status_line(Some(
                     Line::from("gpt-5.4 high fast · ~/code/codex-1 · Context 0% used").into(),
                 ));
-                composer.set_text_content("!git status".to_string(), Vec::new(), Vec::new());
+                composer.set_skill_mentions(Some(vec![test_skill_metadata("available")]));
+                composer.set_text_content(
+                    "!echo $env:HTTP_PROXY".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                composer.move_cursor_to_end();
             },
         );
 
@@ -7931,14 +7944,18 @@ mod tests {
                                 title: "Review database migration".to_string(),
                                 label_style: crate::thread_label::ThreadLabelStyle::Cloud,
                                 cwd: "/workspace/project".to_string(),
-                                snippet: "database migration".to_string(),
                             },
                             crate::task_mentions::TaskMention {
                                 thread_id: "task-456".to_string(),
                                 title: "migration".to_string(),
                                 label_style: crate::thread_label::ThreadLabelStyle::Plain,
                                 cwd: "/another/project".to_string(),
-                                snippet: "migration".to_string(),
+                            },
+                            crate::task_mentions::TaskMention {
+                                thread_id: "task-789".to_string(),
+                                title: "Unrelated task".to_string(),
+                                label_style: crate::thread_label::ThreadLabelStyle::Plain,
+                                cwd: "/workspace/migration".to_string(),
                             },
                         ],
                     );
@@ -7971,7 +7988,6 @@ mod tests {
             title: format!("task\n\t{}é{}", "a".repeat(154), "é".repeat(200)),
             label_style: crate::thread_label::ThreadLabelStyle::Plain,
             cwd: "/workspace/project".to_string(),
-            snippet: String::new(),
         };
         composer.on_task_search_result("task", vec![task.clone()]);
         composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -8055,6 +8071,11 @@ mod tests {
         composer.on_file_search_result("foo".to_string(), Vec::new());
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(composer.popups.active, ActivePopup::None));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::StartFileSearch(query)) if query.is_empty()
+        ));
+        assert!(composer.popups.current_file_query.is_none());
 
         composer.draft.textarea.set_cursor("@foo @foo".len());
         composer.sync_popups();
@@ -8150,42 +8171,6 @@ mod tests {
                 }));
             },
         );
-    }
-
-    #[test]
-    fn set_connector_mentions_excludes_disabled_apps_from_mention_popup() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-        composer.set_connectors_enabled(/*enabled*/ true);
-        composer.set_text_content("$".to_string(), Vec::new(), Vec::new());
-
-        let connectors = vec![AppInfo {
-            id: "connector_1".to_string(),
-            name: "Notion".to_string(),
-            description: Some("Workspace docs".to_string()),
-            logo_url: None,
-            logo_url_dark: None,
-            icon_assets: None,
-            icon_dark_assets: None,
-            distribution_channel: None,
-            branding: None,
-            app_metadata: None,
-            labels: None,
-            install_url: Some("https://example.test/notion".to_string()),
-            is_accessible: true,
-            is_enabled: false,
-            plugin_display_names: Vec::new(),
-        }];
-        composer.set_connector_mentions(Some(ConnectorsSnapshot { connectors }));
-
-        assert!(matches!(composer.popups.active, ActivePopup::None));
     }
 
     #[test]
@@ -10107,34 +10092,6 @@ mod tests {
     }
 
     #[test]
-    fn slash_tab_completion_moves_cursor_to_end() {
-        use crossterm::event::KeyCode;
-        use crossterm::event::KeyEvent;
-        use crossterm::event::KeyModifiers;
-
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-
-        type_chars_humanlike(&mut composer, &['/', 'c']);
-
-        let (_result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-
-        assert_eq!(composer.draft.textarea.text(), "/compact ");
-        assert_eq!(
-            composer.draft.textarea.cursor(),
-            composer.draft.textarea.text().len()
-        );
-    }
-
-    #[test]
     fn slash_tab_completion_wins_over_queueing_while_task_running() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
@@ -10366,30 +10323,28 @@ mod tests {
     }
 
     #[test]
-    fn bang_prefixed_slash_text_submits_literal_shell_command() {
-        use crossterm::event::KeyCode;
-        use crossterm::event::KeyEvent;
-        use crossterm::event::KeyModifiers;
+    fn bang_commands_submit_literal_completion_tokens() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_skill_mentions(Some(vec![test_skill_metadata("available")]));
 
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-
-        type_chars_humanlike(&mut composer, &['!', '/', 'd', 'i', 'f', 'f']);
-
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert!(matches!(
-            result,
-            InputResult::Submitted { ref text, .. } if text == "!/diff"
-        ));
+        for command in [
+            "!/diff",
+            "!echo $env:HTTP_PROXY",
+            "!echo $avail",
+            "!echo @file",
+        ] {
+            type_chars_humanlike(&mut composer, &command.chars().collect::<Vec<_>>());
+            assert!(!composer.popup_active(), "{command}");
+            let (result, _) =
+                composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(
+                result,
+                InputResult::Submitted {
+                    text: command.to_string(),
+                    text_elements: Vec::new(),
+                }
+            );
+        }
     }
 
     #[test]
@@ -10705,7 +10660,7 @@ mod tests {
     }
 
     #[test]
-    fn dismissed_file_popup_tracks_token_across_leading_whitespace_edits() {
+    fn dismissed_file_popup_tracks_token_across_prefix_edits() {
         let (mut composer, _rx) = new_test_composer();
         composer.set_text_content("@ma".to_string(), Vec::new(), Vec::new());
         composer.draft.textarea.set_cursor("@ma".len());
@@ -10717,6 +10672,10 @@ mod tests {
         assert!(matches!(composer.popups.active, ActivePopup::None));
 
         composer.draft.textarea.set_cursor(/*pos*/ 0);
+        type_chars_humanlike(&mut composer, &['!']);
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(!composer.popup_active());
+
         composer.insert_str("   ");
         assert!(matches!(composer.popups.active, ActivePopup::None));
 
@@ -11906,32 +11865,6 @@ mod tests {
             "[Image #1]"
         );
         assert_eq!(composer.draft.textarea.text(), "[Image #1]");
-    }
-
-    #[test]
-    fn pasting_filepath_attaches_image() {
-        let tmp = tempdir().expect("create TempDir");
-        let tmp_path: PathBuf = tmp.path().join("codex_tui_test_paste_image.png");
-        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-            ImageBuffer::from_fn(3, 2, |_x, _y| Rgba([1, 2, 3, 255]));
-        img.save(&tmp_path).expect("failed to write temp png");
-
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-
-        let needs_redraw = composer.handle_paste(tmp_path.to_string_lossy().to_string());
-        assert!(needs_redraw);
-        assert!(composer.draft.textarea.text().starts_with("[Image #1] "));
-
-        let imgs = composer.take_recent_submission_images();
-        assert_eq!(imgs, vec![tmp_path]);
     }
 
     #[test]

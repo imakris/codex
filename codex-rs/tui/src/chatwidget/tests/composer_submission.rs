@@ -14,6 +14,57 @@ use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 
 #[tokio::test]
+async fn disconnected_tab_keeps_exact_exit_out_of_the_queue() {
+    let (mut chat, _events, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+    chat.queue_user_message("already queued".to_string().into());
+    chat.pause_for_disconnect();
+    assert!(chat.bottom_pane.is_task_running());
+    chat.apply_external_edit("/exit".into());
+    chat.handle_restricted_key(KeyCode::Tab.into(), RestrictedInputMode::Disconnected);
+    assert_eq!(chat.queued_user_message_texts(), ["already queued"]);
+    assert_eq!(chat.composer_text_with_pending(), "/exit");
+}
+
+#[tokio::test]
+async fn reconnect_keeps_a_split_command_unselected_in_the_new_widget() {
+    let (mut chat, _events, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.apply_external_edit("/exit".into());
+    for key in [KeyCode::End, KeyCode::Left, KeyCode::Left, KeyCode::Down] {
+        chat.handle_key_event(key.into());
+    }
+    chat.handle_restricted_key(KeyCode::Null.into(), RestrictedInputMode::Disconnected);
+    let mut input = chat.capture_thread_input_state().expect("offline draft");
+    input.reconnect_pending = true;
+
+    let (mut restored, _events, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    restored.restore_reconnected_input(Some(input), &[]);
+    restored.handle_key_event(KeyCode::Enter.into());
+    assert_eq!(
+        (
+            restored.composer_text_with_pending(),
+            restored.bottom_pane.composer_cursor()
+        ),
+        ("/exit".to_owned(), "/ex".len())
+    );
+}
+
+#[tokio::test]
+async fn reconnect_keeps_a_dismissed_command_popup_closed() {
+    let (mut chat, _events, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.apply_external_edit("/config".into());
+    chat.handle_restricted_key(KeyCode::Esc.into(), RestrictedInputMode::Disconnected);
+    let mut input = chat.capture_thread_input_state().expect("offline draft");
+    input.reconnect_pending = true;
+
+    let (mut restored, _events, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    restored.restore_reconnected_input(Some(input), &[]);
+    assert!(restored.bottom_pane.no_modal_or_popup_active());
+    restored.handle_key_event(KeyCode::Enter.into());
+    assert!(restored.has_active_view());
+}
+
+#[tokio::test]
 async fn reconnect_queues_enter_and_resumes_ordinary_next_turn_submission() {
     let (mut chat, mut events, _operations) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -233,7 +284,7 @@ async fn hidden_shell_paste_restored_after_image_rejection_submits_literal_promp
         .expect("current model")
         .input_modalities
         .retain(|modality| *modality != InputModality::Image);
-    chat.model_catalog = Arc::new(ModelCatalog::new(models));
+    set_test_model_catalog(&mut chat, models);
     chat.set_remote_image_urls(vec!["https://example.com/image.png".to_string()]);
     let payload = paste_hidden_shell_payload(&mut chat);
 
@@ -487,7 +538,7 @@ async fn handoff_image_survives_model_rejection_and_submission_failure() {
             .input_modalities
             .retain(|modality| *modality != InputModality::Image);
     }
-    source.model_catalog = Arc::new(ModelCatalog::new(models));
+    set_test_model_catalog(&mut source, models);
     source.sync_image_paste_enabled();
     let path = PathBuf::from("image.png");
     let action = source.handle_restricted_key(
@@ -537,7 +588,7 @@ async fn handoff_image_survives_model_rejection_and_submission_failure() {
             .input_modalities
             .retain(|modality| *modality != InputModality::Image);
     }
-    destination.model_catalog = Arc::new(ModelCatalog::new(unsupported_models));
+    set_test_model_catalog(&mut destination, unsupported_models);
     destination.handle_key_event(KeyCode::Enter.into());
     assert_no_submit_op(&mut destination_ops);
     assert_eq!(
@@ -549,7 +600,7 @@ async fn handoff_image_survives_model_rejection_and_submission_failure() {
     );
 
     // A capable destination admits the image; a subsequent submission failure restores it.
-    destination.model_catalog = Arc::new(ModelCatalog::new(supported_models));
+    set_test_model_catalog(&mut destination, supported_models);
     destination.handle_key_event(KeyCode::Enter.into());
     assert_matches!(next_submit_op(&mut destination_ops), Op::UserTurn { .. });
     let client_id = destination
@@ -645,7 +696,7 @@ async fn submission_preserves_text_elements_and_local_images() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -670,7 +721,10 @@ async fn submission_preserves_text_elements_and_local_images() {
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     let items = match next_submit_op(&mut op_rx) {
-        Op::UserTurn { items, .. } => items,
+        Op::UserTurn { items, summary, .. } => {
+            assert_eq!(summary, None);
+            items
+        }
         other => panic!("expected Op::UserTurn, got {other:?}"),
     };
     assert_eq!(items.len(), 2);
@@ -758,7 +812,7 @@ async fn submission_includes_configured_active_permission_profile() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: expected_permission_profile,
         active_permission_profile: Some(expected_active_permission_profile.clone()),
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -817,7 +871,7 @@ async fn submission_omits_active_permission_profile_for_legacy_snapshot() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: expected_permission_profile,
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -866,7 +920,7 @@ async fn submission_with_remote_and_local_images_keeps_local_placeholder_numberi
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -964,13 +1018,13 @@ async fn enter_with_only_remote_images_submits_user_turn() {
         fork_parent_title: None,
         thread_name: None,
         model: "test-model".to_string(),
-        model_provider_id: "test-provider".to_string(),
+        model_provider_id: "openai".to_string(),
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -1001,7 +1055,10 @@ async fn enter_with_only_remote_images_submits_user_turn() {
             detail: None,
         }]
     );
-    assert_eq!(summary, None);
+    assert_eq!(
+        summary,
+        Some(codex_protocol::config_types::ReasoningSummary::Auto)
+    );
     assert!(chat.remote_image_urls().is_empty());
 
     let mut user_cell = None;
@@ -1043,7 +1100,7 @@ async fn shift_enter_with_only_remote_images_does_not_submit_user_turn() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -1088,7 +1145,7 @@ async fn enter_with_only_remote_images_does_not_submit_when_modal_is_active() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -1133,7 +1190,7 @@ async fn enter_with_only_remote_images_does_not_submit_when_input_disabled() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -1181,7 +1238,7 @@ async fn submission_prefers_selected_duplicate_skill_path() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -3033,8 +3090,8 @@ async fn image_preparation_failure_restores_full_input_without_submitting() {
         let pixels = image::RgbImage::new(/*width*/ 2, /*height*/ 2);
         pixels.save(&path).unwrap();
         chat.set_remote_image_urls(vec!["https://example.com/remote.png".into()]);
-        chat.handle_paste(path.display().to_string());
-        chat.handle_paste("describe $file".into());
+        chat.bottom_pane.attach_image(path.clone());
+        chat.handle_paste(" describe $file".into());
         chat.bottom_pane.set_composer_text_with_mention_bindings(
             chat.bottom_pane.composer_text(),
             chat.bottom_pane.composer_text_elements(),
@@ -3220,7 +3277,7 @@ fn image_preparation_keeps_input_responsive_and_preserves_pending_input() {
                             .input_modalities
                             .retain(|modality| *modality != InputModality::Image);
                     }
-                    chat.model_catalog = Arc::new(ModelCatalog::new(models));
+                    set_test_model_catalog(&mut chat, models);
                     chat.on_images_prepared(id);
                     assert_eq!(chat.bottom_pane.composer_text(), "describe\nnew draft");
                 } else if scenario == "escape" || scenario == "ctrl_c" {
@@ -3260,8 +3317,13 @@ fn image_preparation_keeps_input_responsive_and_preserves_pending_input() {
                     assert_eq!(chat.bottom_pane.composer_text(), "earlier\ndescribe\nx");
                     chat.on_images_prepared(id);
                 } else if scenario == "disconnect" {
+                    chat.bottom_pane
+                        .reset_status_timer(std::time::Duration::from_secs(/*secs*/ 3600));
                     chat.pause_for_disconnect();
-                    chat.reconnect_failed();
+                    let reconnecting = render_bottom_popup(&chat, /*width*/ 80);
+                    assert!(reconnecting.contains("Reconnecting to server…"));
+                    assert!(!reconnecting.contains("1h"));
+                    chat.reconnect_failed(/*can_retry*/ true);
                     assert_eq!(chat.bottom_pane.composer_text(), "describe");
                     assert_eq!(
                         chat.bottom_pane.composer_draft_snapshot().local_images,

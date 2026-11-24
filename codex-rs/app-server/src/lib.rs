@@ -51,6 +51,7 @@ use crate::transport::start_websocket_acceptor;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol::MESSAGE_BOARD_CLIENT_NAME;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
@@ -608,7 +609,9 @@ pub async fn run_main_with_transport_options(
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
             .await
             .map_err(std::io::Error::other)?;
-    config_manager.update_managed_config_loader(auth_manager.clone(), &config);
+    config_manager
+        .update_managed_config_loader(auth_manager.clone(), &config)
+        .await;
     config_manager
         .sync_default_client_residency_requirement()
         .await;
@@ -1353,20 +1356,22 @@ pub async fn run_main_with_transport_options(
                     created = thread_created_rx.recv(), if listen_for_threads && !ready_to_exit => {
                         match created {
                             Ok(thread_id) => {
-                                let mut initialized_connection_ids = Vec::new();
+                                let mut subscriber_ids = Vec::new();
                                 for (connection_id, connection_state) in &connections {
-                                    if connection_state.session.initialized() {
-                                        initialized_connection_ids.push(*connection_id);
+                                    // The board only injects mail. Subscribing it keeps idle children loaded.
+                                    if connection_state
+                                        .session
+                                        .app_server_client_name()
+                                        .is_some_and(|name| name != MESSAGE_BOARD_CLIENT_NAME)
+                                    {
+                                        subscriber_ids.push(*connection_id);
                                     }
                                 }
                                 let processor = Arc::clone(&processor);
                                 // Attachment can wait on snapshot locks; keep force shutdown responsive.
                                 thread_listener_tasks.spawn(async move {
                                     processor
-                                        .try_attach_thread_listener(
-                                            thread_id,
-                                            initialized_connection_ids,
-                                        )
+                                        .try_attach_thread_listener(thread_id, subscriber_ids)
                                         .await;
                                 });
                             }

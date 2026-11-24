@@ -109,12 +109,22 @@ fn ambient_pet_footer_width_keeps_status_input_and_cursor_aligned() {
         footer: None,
         ..options
     };
+    // Without room for the reserved hint row, the status line is the clear final row.
+    let tight_area = Rect { height: 4, ..area };
+    let status = composer
+        .layout_with_options(tight_area, status_only_options)
+        .status;
+    assert_eq!(
+        (status.width, status.height, status.bottom()),
+        (78, 1, tight_area.bottom())
+    );
+    // The reserved hint row takes the final row, so the status line above it stays protected.
     let status = composer
         .layout_with_options(area, status_only_options)
         .status;
     assert_eq!(
         (status.width, status.height, status.bottom()),
-        (78, 1, area.bottom())
+        (67, 2, area.bottom() - 1)
     );
     let overlapping_options = ComposerRenderOptions {
         footer_image_rows: Some((status.y, status.bottom())),

@@ -123,6 +123,7 @@ use codex_plugin::PluginIdError;
 use codex_plugin::PluginTelemetryMetadata;
 use codex_plugin::app_connector_ids_from_declarations;
 use codex_plugin::prompt_safe_plugin_description;
+use codex_plugin_archive_verification::SigningKeyCache;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::Product;
@@ -164,7 +165,6 @@ const FEATURED_PLUGIN_IDS_CACHE_TTL: std::time::Duration =
     std::time::Duration::from_secs(60 * 60 * 3);
 const REMOTE_INSTALLED_PLUGIN_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const LOADED_PLUGINS_CACHE_CAPACITY: usize = 8;
-const TOOLING_STATE_REUSE_WINDOW: Duration = Duration::from_secs(1);
 
 type EffectivePluginsChangedCallback = Arc<dyn Fn(EffectivePluginsChange) + Send + Sync + 'static>;
 
@@ -243,6 +243,14 @@ impl PluginsConfigInput {
         &self,
         runtime_auth: Option<(RuntimeAuthSlot, RuntimeAuthMode)>,
     ) -> RemotePluginServiceConfig {
+        self.remote_plugin_service_config_with_signing_key_cache(runtime_auth, Arc::default())
+    }
+
+    pub(crate) fn remote_plugin_service_config_with_signing_key_cache(
+        &self,
+        runtime_auth: Option<(RuntimeAuthSlot, RuntimeAuthMode)>,
+        signing_key_cache: Arc<SigningKeyCache>,
+    ) -> RemotePluginServiceConfig {
         let runtime_auth = runtime_auth.filter(|_| {
             codex_http_client::classify_openai_api_url(&self.chatgpt_base_url)
                 != codex_http_client::OpenAiDestination::Other
@@ -273,6 +281,7 @@ impl PluginsConfigInput {
                 .unwrap_or_else(|| CODEX_PRODUCT_SKU.to_string()),
             http_clients: Arc::clone(http_clients),
             runtime_auth,
+            signing_key_cache,
         }
     }
 }
@@ -305,23 +314,34 @@ pub struct RecommendedPluginCandidatesInput<'a> {
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct PluginServiceCacheKey {
     product_sku: String,
+    scope: PluginServiceScope,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct PluginServiceScope {
     chatgpt_base_url: String,
     account_id: Option<String>,
     chatgpt_user_id: Option<String>,
     is_workspace_account: bool,
 }
 
-#[derive(Clone)]
-struct CachedRecommendations {
-    mode: RecommendedPluginsMode,
-    tooling_changed_at: Option<String>,
-    checked_at: Instant,
-}
-
 #[derive(Default)]
 struct RecommendationCacheEntry {
-    cached: Option<CachedRecommendations>,
-    in_flight: Option<Arc<OnceCell<RecommendedPluginsMode>>>,
+    fetch_result: OnceCell<Result<RecommendedPluginsMode, ()>>,
+    fallback: RecommendedPluginsMode,
+}
+
+impl RecommendationCacheEntry {
+    fn for_refresh(&self) -> Arc<Self> {
+        let fallback = match self.fetch_result.get() {
+            Some(Ok(mode)) => mode,
+            Some(Err(())) | None => &self.fallback,
+        };
+        Arc::new(Self {
+            fetch_result: OnceCell::new(),
+            fallback: fallback.clone(),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -354,6 +374,8 @@ impl RemoteInstalledPluginsAuthIdentity {
 struct RemoteInstalledPluginsCache {
     generation: u64,
     auth_identity: Option<RemoteInstalledPluginsAuthIdentity>,
+    // The installed cache is shared across backends; compare inventories only within this scope.
+    snapshot_scope: Option<PluginServiceScope>,
     reconciliation: ReconciliationState,
     plugins: Option<Vec<RemoteInstalledPlugin>>,
     pending_runtime_change: Option<uuid::Uuid>,
@@ -531,11 +553,33 @@ fn plugin_service_cache_key(
             .as_deref()
             .unwrap_or(CODEX_PRODUCT_SKU)
             .to_owned(),
-        chatgpt_base_url: config.chatgpt_base_url.clone(),
+        scope: plugin_service_scope(&config.chatgpt_base_url, auth),
+    }
+}
+
+fn plugin_service_scope(chatgpt_base_url: &str, auth: Option<&CodexAuth>) -> PluginServiceScope {
+    PluginServiceScope {
+        chatgpt_base_url: chatgpt_base_url.trim_end_matches('/').to_owned(),
         account_id: auth.and_then(CodexAuth::get_account_id),
         chatgpt_user_id: auth.and_then(CodexAuth::get_chatgpt_user_id),
         is_workspace_account: auth.is_some_and(CodexAuth::is_workspace_account),
     }
+}
+
+fn installed_plugin_recommendation_state(
+    plugins: &[RemoteInstalledPlugin],
+) -> HashSet<(&str, &str, &str, bool)> {
+    plugins
+        .iter()
+        .map(|plugin| {
+            (
+                plugin.marketplace_name.as_str(),
+                plugin.name.as_str(),
+                plugin.id.as_str(),
+                plugin.enabled,
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -664,7 +708,7 @@ pub struct PluginsManager {
     codex_home: PathBuf,
     store: PluginStore,
     featured_plugin_ids_cache: RwLock<Option<CachedFeaturedPluginIds>>,
-    recommended_plugins_cache: Mutex<HashMap<PluginServiceCacheKey, RecommendationCacheEntry>>,
+    recommended_plugins_cache: Mutex<HashMap<PluginServiceCacheKey, Arc<RecommendationCacheEntry>>>,
     configured_marketplace_upgrade_state: RwLock<ConfiguredMarketplaceUpgradeState>,
     non_curated_cache_refresh_lock: Semaphore,
     non_curated_cache_refresh_state: RwLock<NonCuratedCacheRefreshState>,
@@ -678,6 +722,7 @@ pub struct PluginsManager {
     remote_installed_plugin_bundle_sync_gate: Arc<Semaphore>,
     remote_installed_plugins_cache_refresh_state: RwLock<RemoteInstalledPluginsCacheRefreshState>,
     remote_catalog_cache_refresh_state: RwLock<RemoteCatalogCacheRefreshState>,
+    signing_key_cache: Arc<SigningKeyCache>,
     restriction_product: Option<Product>,
     auth_manager: Arc<AuthManager>,
     runtime_auth: RuntimeAuthSlot,
@@ -795,10 +840,11 @@ impl PluginsManager {
         &self,
         config: &PluginsConfigInput,
     ) -> RemotePluginServiceConfig {
-        config.remote_plugin_service_config(
+        config.remote_plugin_service_config_with_signing_key_cache(
             config
                 .runtime_auth_mode
                 .map(|mode| (Arc::clone(&self.runtime_auth), mode)),
+            Arc::clone(&self.signing_key_cache),
         )
     }
 
@@ -905,6 +951,7 @@ impl PluginsManager {
             remote_catalog_cache_refresh_state: RwLock::new(
                 RemoteCatalogCacheRefreshState::default(),
             ),
+            signing_key_cache: Arc::default(),
             restriction_product,
             auth_manager,
             runtime_auth,
@@ -1138,6 +1185,27 @@ impl PluginsManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+    }
+
+    /// Reload the affected actors' SKU-specific catalogs on demand after a known tooling change.
+    pub fn invalidate_recommendations_for_actors<'a>(
+        &self,
+        chatgpt_base_url: &str,
+        actors: impl IntoIterator<Item = &'a CodexAuth>,
+    ) {
+        let scopes = actors
+            .into_iter()
+            .map(|auth| plugin_service_scope(chatgpt_base_url, Some(auth)))
+            .collect::<Vec<_>>();
+        let mut cache = self
+            .recommended_plugins_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (key, entry) in cache.iter_mut() {
+            if scopes.contains(&key.scope) {
+                *entry = entry.for_refresh();
+            }
+        }
     }
 
     fn clear_loaded_plugins_cache(&self) {
@@ -1531,6 +1599,7 @@ impl PluginsManager {
             generation,
             plugins,
             auth,
+            Some(&config.chatgpt_base_url),
             RemoteInstalledPluginsCachePublication::Refresh(display_assets),
         ) else {
             let auth_identity = RemoteInstalledPluginsAuthIdentity::from_auth(auth);
@@ -1577,6 +1646,7 @@ impl PluginsManager {
         let cache_changed = if cache.auth_identity.as_ref() != Some(&auth_identity) {
             cache.generation = cache.generation.wrapping_add(1);
             cache.auth_identity = Some(auth_identity);
+            cache.snapshot_scope = None;
             cache.reconciliation = ReconciliationState::Idle;
             cache.pending_runtime_change = None;
             cache.plugins.take().is_some()
@@ -1666,6 +1736,7 @@ impl PluginsManager {
         generation: u64,
         mut plugins: Vec<RemoteInstalledPlugin>,
         auth: Option<&CodexAuth>,
+        chatgpt_base_url: Option<&str>,
         publication: RemoteInstalledPluginsCachePublication,
     ) -> Option<InstalledPluginCacheUpdate> {
         let auth_identity = RemoteInstalledPluginsAuthIdentity::from_auth(auth);
@@ -1713,6 +1784,14 @@ impl PluginsManager {
         }
         let previous = cache.plugins.as_deref();
         let payload_changed = previous != Some(plugins.as_slice());
+        let snapshot_scope = chatgpt_base_url.map(|url| plugin_service_scope(url, auth));
+        let installed_state_changed = snapshot_scope.is_some()
+            && (cache.snapshot_scope != snapshot_scope
+                || payload_changed
+                    && previous.is_none_or(|old| {
+                        installed_plugin_recommendation_state(old)
+                            != installed_plugin_recommendation_state(&plugins)
+                    }));
         let metadata_changed = payload_changed
             && previous.is_none_or(|old| {
                 !crate::remote_metadata::installed_plugin_metadata_eq(old, &plugins)
@@ -1734,7 +1813,11 @@ impl PluginsManager {
         if payload_changed {
             cache.plugins = Some(plugins);
         }
+        cache.snapshot_scope = snapshot_scope;
         drop(cache);
+        if installed_state_changed && let Some(chatgpt_base_url) = chatgpt_base_url {
+            self.invalidate_recommendations_for_actors(chatgpt_base_url, auth);
+        }
         if let Some(change_id) = metadata_change_id {
             tracing::info!(%change_id, ?changes, initial_snapshot, reconciliation_retry = needs_effective_plugins_refresh, is_reconcile, "installed plugin runtime metadata invalidated");
             self.clear_loaded_plugins_cache();
@@ -1760,6 +1843,7 @@ impl PluginsManager {
             generation,
             plugins,
             auth.as_ref(),
+            /*chatgpt_base_url*/ None,
             RemoteInstalledPluginsCachePublication::Refresh(InstalledPluginDisplayAssets::Include),
         )
         .expect("test cache generation should remain current")
@@ -1774,6 +1858,7 @@ impl PluginsManager {
         };
         cache.generation = cache.generation.wrapping_add(1);
         cache.auth_identity = None;
+        cache.snapshot_scope = None;
         cache.reconciliation = ReconciliationState::Idle;
         cache.pending_runtime_change = None;
         if cache.plugins.take().is_none() {
@@ -1794,6 +1879,7 @@ impl PluginsManager {
         }
         cache.generation = cache.generation.wrapping_add(1);
         cache.auth_identity = None;
+        cache.snapshot_scope = None;
         cache.reconciliation = ReconciliationState::Idle;
         cache.pending_runtime_change = None;
         if cache.plugins.take().is_none() {
@@ -1837,6 +1923,7 @@ impl PluginsManager {
         auth: Option<CodexAuth>,
         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
     ) {
+        self.invalidate_recommendations_for_actors(&config.chatgpt_base_url, auth.iter());
         self.maybe_start_remote_installed_plugins_cache_refresh_with_notify(
             config,
             auth,
@@ -2090,6 +2177,7 @@ impl PluginsManager {
             generation,
             result.installed_plugins,
             auth,
+            Some(&config.chatgpt_base_url),
             RemoteInstalledPluginsCachePublication::Reconcile,
         ) else {
             return Err(RemoteInstalledPluginBundleSyncError::Superseded);
@@ -2233,50 +2321,37 @@ impl PluginsManager {
         }
 
         let cache_key = plugin_service_cache_key(config, auth);
-        let (cached, refresh) = {
+        let entry = {
             let mut cache = self
                 .recommended_plugins_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry = cache.entry(cache_key.clone()).or_default();
-            if let Some(cached) = &entry.cached
-                && cached.checked_at.elapsed() < TOOLING_STATE_REUSE_WINDOW
-            {
-                return cached.mode.clone();
+            let entry = cache.entry(cache_key).or_default();
+            // Existing waiters share the failed attempt. The next lookup starts a new one.
+            if entry.fetch_result.get().is_some_and(Result::is_err) {
+                *entry = entry.for_refresh();
             }
-            (
-                entry.cached.clone(),
-                Arc::clone(entry.in_flight.get_or_insert_default()),
-            )
+            Arc::clone(entry)
         };
 
-        refresh
+        entry
+            .fetch_result
             .get_or_init(|| async {
-                let updated = self.refresh_recommendations(config, auth, cached).await;
-                let mode = updated
-                    .as_ref()
-                    .map_or(RecommendedPluginsMode::Legacy, |cached| cached.mode.clone());
-                let mut cache = self
-                    .recommended_plugins_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // A clear may have discarded this request while it was in flight.
-                if let Some(entry) = cache.get_mut(&cache_key)
-                    && entry
-                        .in_flight
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(current, &refresh))
-                {
-                    if let Some(cached) = updated {
-                        entry.cached = Some(cached);
-                        entry.in_flight = None;
-                    } else {
-                        cache.remove(&cache_key);
-                    }
-                }
-                mode
+                crate::remote::fetch_recommended_plugins(
+                    &self.remote_plugin_service_config(config),
+                    auth,
+                )
+                .await
+                .map_err(|err| {
+                    warn!(
+                        sub_error_type = err.sub_error_type(),
+                        "failed to load recommended plugins"
+                    );
+                })
             })
             .await
+            .as_ref()
+            .unwrap_or(&entry.fallback)
             .clone()
     }
 
@@ -2323,47 +2398,6 @@ impl PluginsManager {
             candidates,
             input.app_server_client_name,
         ))
-    }
-
-    async fn refresh_recommendations(
-        &self,
-        config: &PluginsConfigInput,
-        auth: Option<&CodexAuth>,
-        mut cached: Option<CachedRecommendations>,
-    ) -> Option<CachedRecommendations> {
-        let remote = self.remote_plugin_service_config(config);
-        // Observe the marker first so a change during the catalog read is seen on the next poll.
-        let marker = crate::remote::fetch_tooling_changed_at(&remote, auth)
-            .await
-            .unwrap_or_else(|err| {
-                tracing::debug!(
-                    sub_error_type = err.sub_error_type(),
-                    "failed to read recommendation tooling state"
-                );
-                None
-            });
-        let checked_at = Instant::now();
-        if let Some(entry) = &mut cached {
-            entry.checked_at = checked_at;
-            if marker.is_none() || marker == entry.tooling_changed_at {
-                return cached;
-            }
-        }
-        match crate::remote::fetch_recommended_plugins(&remote, auth).await {
-            Ok(mode) => Some(CachedRecommendations {
-                mode,
-                tooling_changed_at: marker,
-                checked_at,
-            }),
-            Err(err) => {
-                warn!(
-                    sub_error_type = err.sub_error_type(),
-                    "failed to load recommended plugins"
-                );
-                // Keep the previous marker so the next poll retries the changed catalog.
-                cached
-            }
-        }
     }
 
     pub async fn install_plugin(
@@ -3653,6 +3687,7 @@ impl PluginsManager {
                         request.generation,
                         plugins,
                         request.auth.as_ref(),
+                        Some(&request.service_config.chatgpt_base_url),
                         RemoteInstalledPluginsCachePublication::Refresh(
                             InstalledPluginDisplayAssets::Include,
                         ),

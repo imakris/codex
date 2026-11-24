@@ -106,7 +106,9 @@ pub(crate) fn footer(
     let visible = choice_is_visible(area, tabs, choice);
     let movement = [ListAction::MoveUp, ListAction::MoveDown]
         .into_iter()
-        .filter(|_| new_chat == NewChatState::Available || !tabs.files.is_empty())
+        .filter(|_| {
+            new_chat == NewChatState::Available || !tabs.files.is_empty() || !tabs.agents.is_empty()
+        })
         .filter_map(hint)
         .collect::<Vec<_>>()
         .join("/");
@@ -117,7 +119,10 @@ pub(crate) fn footer(
         (
             hint(ListAction::Accept)
                 .filter(|_| {
-                    visible && (new_chat == NewChatState::Available || selected_file.is_some())
+                    visible
+                        && (new_chat == NewChatState::Available
+                            || selected_file.is_some()
+                            || tabs.agent(choice).is_some())
                 })
                 .filter(|_| selected_file.is_none() || tabs.file_preview_unavailable.is_none()),
             if tabs.retry_row(choice)
@@ -195,6 +200,14 @@ pub(crate) enum OpenState {
     Failed(String),
 }
 
+/// An agent displayed in the shared sidebar chooser.
+pub(crate) struct AgentRow {
+    pub(crate) id: ThreadId,
+    pub(crate) name: String,
+    pub(crate) symbol: &'static str,
+    pub(crate) status: &'static str,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ChatTabs<'a> {
     pub(crate) label_style: ThreadLabelStyle,
@@ -203,6 +216,8 @@ pub(crate) struct ChatTabs<'a> {
     pub(crate) ids: &'a [SidebarTab],
     // Chooser index zero is reserved for New side chat.
     pub(crate) choices: &'a [SideChat],
+    pub(crate) agents: &'a [AgentRow],
+    pub(crate) agent_title: Option<&'a str>,
     pub(crate) latest_prompts: &'a HashMap<ThreadId, String>,
     pub(crate) selected: Option<SidebarTab>,
     pub(crate) files: &'a [FileLink],
@@ -224,8 +239,24 @@ impl<'a> ChatTabs<'a> {
         self.file_start() + self.files.len()
     }
 
+    pub(crate) fn agent(self, index: usize) -> Option<&'a AgentRow> {
+        self.agents.get(index.checked_sub(self.first_agent())?)
+    }
+
+    pub(crate) fn agent_index(self, id: ThreadId) -> Option<usize> {
+        self.agents
+            .iter()
+            .position(|agent| agent.id == id)
+            .map(|offset| self.first_agent() + offset)
+    }
+
+    fn first_agent(self) -> usize {
+        let end = self.choices.len() + 1;
+        end + usize::from(self.retry_row(end))
+    }
+
     pub(crate) fn file_start(self) -> usize {
-        self.choices.len() + 1 + usize::from(self.retry_row(self.choices.len() + 1))
+        self.first_agent() + self.agents.len()
     }
 
     pub(crate) fn file_offset(self, index: usize) -> Option<usize> {
@@ -281,13 +312,20 @@ pub(crate) fn tab_strip(
         let width = usize::from(area.width.saturating_sub(1));
         let mut title = match id {
             SidebarTab::Document(id) => Line::from(document_title(id, width)),
+            SidebarTab::Subagents => Line::from(middle_label(
+                tabs.agent_title.unwrap_or("Agent transcript"),
+                width.saturating_sub(1),
+            )),
             SidebarTab::Chat(id) => {
                 let name = match tabs.choice_index(id) {
-                    Some(number) => match side_chat_label(&tabs.choices[number - 1]) {
-                        Some(name) => name.to_owned(),
-                        None if tabs.choices.len() > 1 => format!("Side {number}"),
-                        None => "Side chat".to_owned(),
-                    },
+                    Some(index) => {
+                        let ordinal = index - 1;
+                        match side_chat_label(&tabs.choices[ordinal]) {
+                            Some(name) => name.to_owned(),
+                            None if tabs.choices.len() > 1 => format!("Side {}", ordinal + 1),
+                            None => "Side chat".to_owned(),
+                        }
+                    }
                     None => "Side chat".to_owned(),
                 };
                 tabs.label_style.render(Line::from(name), width)
@@ -320,17 +358,20 @@ struct ChoiceRows {
     wide: bool,
     height: usize,
     chats_header: Option<usize>,
+    agents_header: Option<usize>,
     files_header: Option<usize>,
     choices: Vec<Range<usize>>,
 }
 
 impl ChoiceRows {
     fn new(area: Rect, tabs: ChatTabs<'_>) -> Self {
-        let wide = body_row(area, area.y).width >= WIDE_WIDTH;
+        let width = body_row(area, area.y).width;
+        let wide = width >= WIDE_WIDTH;
         let height = usize::from(area.height.saturating_sub(3));
         let mut row = FIRST_CHOICE_ROW;
         let file_start = tabs.file_start();
         let mut chats_header = None;
+        let mut agents_header = None;
         let mut files_header = None;
         let choices = (0..tabs.choice_count())
             .map(|index| {
@@ -340,13 +381,18 @@ impl ChoiceRows {
                 } else if index == 1 && tabs.retry_row(index) {
                     row += 2;
                 }
-                let file = index >= file_start;
-                if index == file_start {
+                let file = tabs.file_offset(index).is_some();
+                let agent = tabs.agent(index).is_some();
+                if agent && index == tabs.first_agent() {
+                    agents_header = Some(row + 1);
+                    row += 3;
+                }
+                if file && index == file_start {
                     files_header = Some(row + 1);
                     row += 3;
                 }
                 let start = row;
-                let subtitle = if index == 0 || file {
+                let subtitle = if index == 0 || file || agent {
                     !wide
                 } else {
                     tabs.prompt(index).is_some()
@@ -359,6 +405,7 @@ impl ChoiceRows {
             wide,
             height,
             chats_header,
+            agents_header,
             files_header,
             choices,
         }
@@ -497,7 +544,7 @@ pub(crate) fn row_targets(
             (first < last
                 && match tabs.file(index) {
                     Some(_) => tabs.file_preview_unavailable.is_none(),
-                    None => new_chat == NewChatState::Available,
+                    None => new_chat == NewChatState::Available || tabs.agent(index).is_some(),
                 })
             .then(|| Rect {
                 height: (last - first) as u16,
@@ -535,8 +582,8 @@ pub(crate) fn file_path_key_available(keymap: &RuntimeKeymap) -> bool {
         .is_none()
 }
 
-pub(crate) fn scroll_file_path(area: Rect, path: &str, top: usize, action: ListAction) -> usize {
-    let (path_rows, height) = file_path_layout(area, path);
+pub(crate) fn scroll_file_path(body: Rect, path: &str, top: usize, action: ListAction) -> usize {
+    let (path_rows, height) = file_path_layout(body, path);
     let limit = path_rows.len().saturating_sub(height);
     let top = top.min(limit);
     match action {
@@ -550,15 +597,44 @@ pub(crate) fn scroll_file_path(area: Rect, path: &str, top: usize, action: ListA
     }
 }
 
-fn file_path_layout(area: Rect, path: &str) -> (Vec<std::borrow::Cow<'_, str>>, usize) {
-    let body = area
-        .height
-        .saturating_sub(u16::from(area.height > 2) * 2 + 1);
-    let visible = usize::from(body.saturating_sub(u16::from(body > 2) * 2));
-    (
-        textwrap::wrap(path, usize::from(body_row(area, area.y).width.max(1))),
-        visible,
-    )
+pub(crate) fn file_path_areas(area: Rect) -> [Rect; 2] {
+    let footer_height = area.height.min(1);
+    let top = footer_height + u16::from(area.height > 3);
+    [
+        Rect {
+            height: area.height.saturating_sub(top + footer_height),
+            ..body_row(area, area.y + top)
+        },
+        Rect {
+            height: footer_height,
+            ..body_row(area, area.bottom() - footer_height)
+        },
+    ]
+}
+
+fn file_path_layout(body: Rect, path: &str) -> (Vec<std::borrow::Cow<'_, str>>, usize) {
+    let visible = usize::from(body.height.saturating_sub(u16::from(body.height > 2) * 2));
+    let options = textwrap::Options::new(usize::from(body.width.max(1)))
+        .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation)
+        .word_separator(textwrap::WordSeparator::Custom(|path| {
+            Box::new(
+                path.split_inclusive(['/', '\\'])
+                    .map(textwrap::core::Word::from),
+            )
+        }));
+    (textwrap::wrap(path, options), visible)
+}
+
+pub(crate) fn paint_file_path(body: Rect, path: &str, top: usize, buf: &mut Buffer) {
+    let mut lines = Vec::new();
+    if body.height > 2 {
+        lines.extend([Line::from("File path").bold(), Line::default()]);
+    }
+    let (path, visible) = file_path_layout(body, path);
+    let top = top.min(path.len().saturating_sub(visible));
+    lines.extend(path.into_iter().skip(top).take(visible).map(Line::from));
+    ratatui::widgets::Paragraph::new(lines).render(body, buf);
 }
 
 pub(crate) struct SidebarStyle<'a> {
@@ -590,28 +666,18 @@ pub(crate) fn paint(
         crate::style::quiet_workspace_style()
     };
     let row = |y| body_row(area, y);
+    let width = usize::from(row(area.y).width.saturating_sub(1));
     let footer_y = area.bottom() - 1;
     if let Some(path) = sidebar_style.full_path {
-        let mut body = body_row(area, area.y + u16::from(area.height > 2) * 2);
-        body.height = area
-            .height
-            .saturating_sub(u16::from(area.height > 2) * 2 + 1);
-        let mut lines = Vec::new();
-        if body.height > 2 {
-            lines.extend([Line::from("File path").bold(), Line::default()]);
-        }
-        let (path, visible) = file_path_layout(area, path);
-        let top = sidebar_style
-            .path_scroll
-            .min(path.len().saturating_sub(visible));
-        lines.extend(path.into_iter().skip(top).take(visible).map(Line::from));
-        ratatui::widgets::Paragraph::new(lines).render(body, buf);
-        footer.render(row(footer_y), buf);
+        let [body, footer_area] = file_path_areas(area);
+        paint_file_path(body, path, sidebar_style.path_scroll, buf);
+        footer.render(footer_area, buf);
         return;
     }
     let rows = ChoiceRows::new(area, tabs);
-    let waiting =
-        sidebar_style.new_chat == NewChatState::WaitingForMainMessage && tabs.files.is_empty();
+    let waiting = sidebar_style.new_chat == NewChatState::WaitingForMainMessage
+        && tabs.files.is_empty()
+        && tabs.agents.is_empty();
     let top = if waiting {
         0
     } else {
@@ -621,14 +687,27 @@ pub(crate) fn paint(
         if let Some(y) = offset.checked_sub(top)
             && (CHOOSER_BODY_START..CHOOSER_BODY_START + rows.height).contains(&y)
         {
-            line.render(row(area.y + y as u16), buf);
+            let mut content = row(area.y + y as u16);
+            if content.width > 0 {
+                content.width -= 1;
+                buf.set_style(
+                    Rect::new(
+                        content.right(),
+                        content.y,
+                        /*width*/ 1,
+                        /*height*/ 1,
+                    ),
+                    line.style,
+                );
+            }
+            line.render(content, buf);
         }
     };
     paint(2, Line::from("Open in sidebar").bold());
     if waiting {
         for (offset, text) in (FIRST_CHOICE_ROW..).zip(textwrap::wrap(
             "You can start a side chat after your first message in the main chat.",
-            usize::from(row(area.y).width.max(1)),
+            width.max(1),
         )) {
             paint(offset, Line::from(text).dim());
         }
@@ -674,11 +753,11 @@ pub(crate) fn paint(
         let title = format!("{marker} + New side chat");
         let detail = match sidebar_style.new_chat {
             NewChatState::Available => "Start from this conversation",
-            NewChatState::WaitingForMainMessage => "Available after your first message",
+            NewChatState::WaitingForMainMessage => "Available after first message",
         };
         let detail = Span::styled(detail, subtitle);
         if rows.wide {
-            let pad = usize::from(row(area.y).width - 1) - detail.width();
+            let pad = width - detail.width();
             paint(
                 y,
                 Line::from(vec![format!("{title:<pad$}").into(), detail]).style(fill),
@@ -693,6 +772,13 @@ pub(crate) fn paint(
         paint(
             y,
             Line::from(format!("Side chats  {total}")).style(secondary),
+        );
+    }
+    if let Some(y) = rows.agents_header {
+        let total = tabs.agents.len();
+        paint(
+            y,
+            Line::from(format!("Subagents  {total}")).style(secondary),
         );
     }
     if let Some(y) = rows.files_header
@@ -710,12 +796,31 @@ pub(crate) fn paint(
         };
         paint(y, Line::from(format!("{group}  {total}")).style(secondary));
     }
-    let width = usize::from(row(area.y).width);
     for (index, lines) in rows
         .visible_choices(tabs.scroll, choice)
         .skip_while(|(index, _)| *index == 0)
     {
         let (marker, fill, subtitle) = row_style(index);
+        if let Some(agent) = tabs.agent(index) {
+            let name = format!("{marker} {} {}", agent.symbol, agent.name);
+            let status = agent.status;
+            if rows.wide {
+                let title_width = width.saturating_sub(crate::width::display_width(status) + 2);
+                let mut line = truncate_line_with_ellipsis_if_overflow(name.into(), title_width);
+                let gap = title_width.saturating_sub(line.width()) + 2;
+                line.spans
+                    .push(format!("{:gap$}{status}", "").set_style(subtitle));
+                paint(lines.start, line.style(fill));
+            } else {
+                let title = truncate_line_with_ellipsis_if_overflow(name.into(), width);
+                paint(lines.start, title.style(fill));
+                paint(
+                    lines.start + 1,
+                    Line::from(format!("    {status}")).style(subtitle),
+                );
+            }
+            continue;
+        }
         if tabs.retry_row(index) {
             let label = if tabs.discovery.request().is_some() {
                 "Retrying…"
@@ -766,7 +871,8 @@ pub(crate) fn paint(
             }
             continue;
         }
-        let chat = &tabs.choices[index - 1];
+        let ordinal = index - 1;
+        let chat = &tabs.choices[ordinal];
         let selected = index == choice && focused;
         let label = side_chat_label(chat);
         let title = if let Some(label) = label {
@@ -774,7 +880,7 @@ pub(crate) fn paint(
         } else if tabs.choices.len() == 1 {
             "Side chat".to_string()
         } else {
-            format!("Side chat {index}")
+            format!("Side chat {}", ordinal + 1)
         };
         let title = if sidebar_style.use_theme_colors && !selected {
             let identity = crate::thread_color::thread_color(chat.id);
@@ -803,7 +909,7 @@ pub(crate) fn paint(
                 OpenState::Loading(_) => "Opening…".dim(),
                 OpenState::Failed(error) => format!("Retry · {error}").red(),
             };
-            let width = usize::from(row(area.y).width.saturating_sub(6));
+            let width = width.saturating_sub(6);
             let title = label_style.render(
                 Line::from(title),
                 width.saturating_sub(status.width()).max(width / 3),

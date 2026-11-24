@@ -22,6 +22,7 @@ use uuid::Uuid;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
 use wiremock::matchers::path;
 
 #[tokio::test]
@@ -53,7 +54,13 @@ async fn plugin_runtime_auth_shares_registration_and_strips_cross_origin_auth() 
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "plugins": [], "pagination": {"next_page_token": null},
             })))
-            .expect(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/backend-api/ps/plugins/signing-keys"))
+            .and(header(OAI_PRODUCT_SKU_HEADER, CODEX_PRODUCT_SKU))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(path("/backend-api/plugins/featured"))
@@ -175,24 +182,20 @@ async fn plugin_runtime_auth_shares_registration_and_strips_cross_origin_auth() 
                 .contains_key("x-openai-agent-assertion")
         );
         destination.verify().await;
-        let url = format!("{}/backend-api/ps/plugins/list", server.uri());
-        let pending = config
-            .authenticated_request(Method::GET, &url, &auth)
+        let url = format!("{}/backend-api/ps/plugins/signing-keys", server.uri());
+        let (pending, headers) = prepare_signing_key_request(&config, url.clone(), Some(&auth))
             .await
             .unwrap();
         policy.invalidate();
         assert!(controller.publish(policy.revision(), DestinationPolicy::Unrestricted));
         assert!(matches!(
-            pending.send().await,
+            pending.headers(headers).send().await,
             Err(RouteAwareRequestError::Policy(NetworkPolicyDenied::Revoked))
         ));
-        let response = config
-            .authenticated_request(Method::GET, &url, &auth)
-            .await
-            .unwrap()
-            .send()
+        let (request, headers) = prepare_signing_key_request(&config, url, Some(&auth))
             .await
             .unwrap();
+        let response = request.headers(headers).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let requests = server.received_requests().await.unwrap();
         let mut proof_ids = HashSet::new();
@@ -226,50 +229,6 @@ async fn plugin_runtime_auth_shares_registration_and_strips_cross_origin_auth() 
         assert_eq!(proof_ids.len(), 4);
         server.verify().await;
     }
-}
-
-#[tokio::test]
-async fn tooling_state_deadline_includes_pending_runtime_registration() {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let runtime = Arc::new(RuntimeAuthManager::new(
-        AuthManager::from_auth_for_testing(auth.clone()),
-        AgentHostAuthorization::InstallationId {
-            installation_id: Uuid::nil(),
-        },
-        RuntimeRegistrationMetadata {
-            harness: Some("codex".into()),
-            harness_version: None,
-            role: RuntimeRole::Orchestrator,
-        },
-        format!("{base}/register").parse().unwrap(),
-    ));
-    let config = RemotePluginServiceConfig::new_with_selected_runtime_auth(
-        format!("{base}/backend-api"),
-        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-        /*product_sku*/ None,
-        (
-            Arc::new(std::sync::OnceLock::from(Arc::clone(&runtime))),
-            RuntimeAuthMode::DualHeader,
-        ),
-    );
-    // Hold registration open before starting the marker clock.
-    let registration = runtime.auth();
-    tokio::pin!(registration);
-    let (_connection, _) = tokio::select! {
-        connection = listener.accept() => connection.unwrap(),
-        _ = &mut registration => panic!("registration finished before receiving a response"),
-    };
-    tokio::time::pause();
-    let poll = fetch_tooling_changed_at(&config, Some(&auth));
-    let marker = tokio::time::timeout(TOOLING_STATE_TIMEOUT * 2, poll)
-        .await
-        .expect("the marker deadline must include runtime registration")
-        .unwrap();
-    assert_eq!(marker, None);
 }
 
 #[tokio::test]

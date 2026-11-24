@@ -2,6 +2,45 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_thread_store::ThreadStoreError;
 use pretty_assertions::assert_eq;
 
+#[cfg(unix)]
+#[test]
+fn thread_cwd_rejects_invalid_utf8() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(OsStr::from_bytes(
+        b"/workspace-\xFF",
+    ))
+    .expect("absolute native path");
+    assert_eq!(
+        super::thread_cwd_for_api(&cwd).expect_err("cwd cannot be represented as a wire string"),
+        JSONRPCErrorError {
+            code: crate::error_code::INTERNAL_ERROR_CODE,
+            message: "cannot encode thread cwd: path contains invalid UTF-8".into(),
+            data: None,
+        }
+    );
+}
+
+#[test]
+fn runtime_workspace_roots_reject_home_relative_paths() {
+    use codex_utils_absolute_path::AbsolutePathBufGuard;
+    use codex_utils_path_uri::LegacyAppPathString;
+
+    let home = std::env::current_dir().expect("current directory");
+    let result = AbsolutePathBufGuard::with_home_directory(&home, || {
+        super::native_runtime_workspace_roots(vec![LegacyAppPathString::from_string("~/extra")])
+    });
+    assert_eq!(
+        result.expect_err("runtime workspace root must be absolute"),
+        JSONRPCErrorError {
+            code: crate::error_code::INVALID_REQUEST_ERROR_CODE,
+            message: "invalid runtimeWorkspaceRoots: path is not absolute: ~/extra".into(),
+            data: None,
+        }
+    );
+}
+
 #[test]
 fn storage_failure_classification_does_not_change_mutation_error_policy() {
     for error in [
@@ -183,6 +222,127 @@ mod thread_processor_behavior_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn full_resume_restores_only_recoverable_mcp_results() -> Result<()> {
+        use codex_protocol::protocol::HasLegacyEvent;
+        use core_test_support::responses;
+
+        let server = responses::start_mock_server().await;
+        responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("seed"),
+                responses::ev_completed("seed"),
+            ]),
+        )
+        .await;
+        let test = core_test_support::test_codex::test_codex()
+            .with_history_mode(ThreadHistoryMode::Paginated)
+            .build_with_auto_env(&server)
+            .await?;
+        test.submit_turn("seed history").await?;
+        let store = test.thread_store.as_ref();
+        let thread_id = test.session_configured.thread_id;
+        let started: EventMsg =
+            serde_json::from_value(json!({"type": "turn_started", "turn_id": "turn"}))?;
+        let mut live = ThreadHistoryBuilder::new();
+        live.handle_live_paginated_event(&started);
+        let mut saved = vec![RolloutItem::EventMsg(started)];
+        let completion = |id: &str, text: &str, view: &str| -> serde_json::Result<EventMsg> {
+            serde_json::from_value(json!({
+                "type": "item_completed", "thread_id": thread_id, "turn_id": "turn",
+                "started_at_ms": 2000, "completed_at_ms": 2007,
+                "item": {
+                    "type": "McpToolCall", "id": id, "server": "docs", "tool": "read",
+                    "arguments": {}, "status": if id == "failed" { "failed" } else { "completed" },
+                    "duration": {"secs": 0, "nanos": 7000000},
+                    "result": {"content": [{"type": "text", "text": text}], "isError": id == "failed",
+                               "structuredContent": {"id": id}, "_meta": {"view": view}}
+                }
+            }))
+        };
+        let deliver = |live: &mut ThreadHistoryBuilder, event: &EventMsg| {
+            live.handle_live_paginated_event(event);
+            for legacy in event.as_legacy_events(/*show_raw_agent_reasoning*/ false) {
+                live.handle_live_paginated_event(&legacy);
+            }
+        };
+
+        // The prepared full page predates a correction to this same call ID.
+        let old = completion("exact", "old result", "detail")?;
+        deliver(&mut live, &old);
+        saved.push(RolloutItem::EventMsg(old));
+        let mut page = live.active_turn_snapshot().expect("prepared turn");
+        let ids = ["exact", "preview", "metadata", "missing", "failed"];
+        let oversized = "x".repeat(200_000);
+        for id in ids {
+            let text = if id == "preview" {
+                &oversized
+            } else {
+                "full result"
+            };
+            let event = completion(id, text, "detail")?;
+            deliver(&mut live, &event);
+            match id {
+                "missing" => {}
+                "metadata" => saved.push(RolloutItem::EventMsg(completion(id, text, "summary")?)),
+                _ => saved.push(RolloutItem::EventMsg(event)),
+            }
+        }
+        store
+            .append_items(codex_thread_store::AppendThreadItemsParams {
+                thread_id,
+                items: saved,
+            })
+            .await?;
+        let rows = ThreadRequestProcessor::read_thread_items(
+            store,
+            ThreadItemsReadParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn".to_string(),
+                item_ids: ids.map(str::to_string).into(),
+            },
+        )
+        .await
+        .expect("read saved results");
+        assert_eq!(
+            rows.data
+                .iter()
+                .map(|entry| entry.item.id())
+                .collect::<Vec<_>>(),
+            ["exact", "preview", "metadata", "failed"]
+        );
+
+        let expected = live.active_turn_snapshot().expect("full turn");
+        assert_eq!(
+            expected
+                .items
+                .iter()
+                .map(ThreadItem::id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        live.release_saved_mcp_results(&rows.data);
+        let mut resumed = live.active_turn_snapshot().expect("evicted turn");
+        let mut evicted = expected.clone();
+        let ThreadItemPayload::McpToolCall { result, .. } = &mut evicted.items[0].payload else {
+            panic!("expected MCP call")
+        };
+        assert!(result.take().is_some());
+        assert_eq!(resumed, evicted);
+
+        crate::request_processors::thread_lifecycle::restore_evicted_payloads(
+            store,
+            thread_id,
+            &mut resumed,
+            std::iter::once(&mut page),
+        )
+        .await
+        .expect("full reconnect");
+        assert_eq!(resumed, expected);
+        Ok(())
+    }
 
     fn dynamic_tool(
         namespace: Option<&str>,
@@ -494,7 +654,7 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
-    fn summary_from_stored_thread_preserves_millisecond_precision() {
+    fn stored_thread_conversions_preserve_timestamps_and_agent_metadata() {
         let created_at =
             DateTime::parse_from_rfc3339("2025-01-02T03:04:05.678Z").expect("valid timestamp");
         let updated_at =
@@ -527,11 +687,17 @@ mod thread_processor_behavior_tests {
             daybreak_enabled: None,
             cwd: PathBuf::from("/tmp"),
             cli_version: "0.0.0".to_string(),
-            source: SessionSource::Cli,
+            source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::new(),
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
             history_mode: Default::default(),
-            thread_source: Some(codex_protocol::protocol::ThreadSource::User),
-            agent_nickname: None,
-            agent_role: None,
+            thread_source: Some(codex_protocol::protocol::ThreadSource::Subagent),
+            agent_nickname: Some("atlas".to_string()),
+            agent_role: Some("explorer".to_string()),
             agent_path: None,
             git_info: None,
             approval_mode: AskForApproval::OnRequest,
@@ -541,7 +707,25 @@ mod thread_processor_behavior_tests {
             history: None,
         };
 
+        let fallback_cwd = AbsolutePathBuf::current_dir().expect("current directory");
+        let (thread, _) =
+            thread_from_stored_thread(stored_thread.clone(), "fallback", &fallback_cwd)
+                .expect("stored thread should convert");
         let summary = summary_from_stored_thread(stored_thread, "fallback");
+        assert_eq!(
+            (
+                thread.agent_nickname.as_deref(),
+                thread.agent_role.as_deref()
+            ),
+            (Some("atlas"), Some("explorer")),
+        );
+        assert_eq!(
+            (
+                summary.source.get_nickname(),
+                summary.source.get_agent_role()
+            ),
+            (Some("atlas".to_string()), Some("explorer".to_string())),
+        );
 
         assert_eq!(
             summary.timestamp.as_deref(),
@@ -771,7 +955,8 @@ mod thread_processor_behavior_tests {
                 &request,
                 &config_snapshot,
                 /* selected_service_tier */ Some("flex"),
-            ),
+            )
+            .unwrap(),
             vec!["service_tier requested=Some(\"priority\") active=Some(\"flex\")".to_string()]
         );
     }
@@ -792,22 +977,6 @@ mod thread_processor_behavior_tests {
         metadata.model = model.map(ToString::to_string);
         metadata.reasoning_effort = reasoning_effort;
         Ok(metadata)
-    }
-
-    #[test]
-    fn summary_from_thread_metadata_formats_protocol_timestamps_as_seconds() -> Result<()> {
-        let mut metadata =
-            test_thread_metadata(/*model*/ None, /*reasoning_effort*/ None)?;
-        metadata.created_at =
-            DateTime::parse_from_rfc3339("2025-09-05T16:53:11.123Z")?.with_timezone(&Utc);
-        metadata.updated_at =
-            DateTime::parse_from_rfc3339("2025-09-05T16:53:12.456Z")?.with_timezone(&Utc);
-
-        let summary = summary_from_thread_metadata(&metadata);
-
-        assert_eq!(summary.timestamp, Some("2025-09-05T16:53:11Z".to_string()));
-        assert_eq!(summary.updated_at, Some("2025-09-05T16:53:12Z".to_string()));
-        Ok(())
     }
 
     #[test]
@@ -981,116 +1150,6 @@ mod thread_processor_behavior_tests {
             Some("mock_provider".to_string())
         );
         assert_eq!(request_overrides, None);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() -> Result<()> {
-        use codex_protocol::protocol::SessionMetaLine;
-        use codex_rollout::RolloutItem;
-        use codex_rollout::RolloutLine;
-        use std::fs;
-        use std::fs::FileTimes;
-
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().join("rollout.jsonl");
-
-        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
-        let timestamp = "2025-09-05T16:53:11.850Z".to_string();
-
-        let session_meta = SessionMeta {
-            session_id: conversation_id.into(),
-            id: conversation_id,
-            timestamp: timestamp.clone(),
-            model_provider: None,
-            ..SessionMeta::default()
-        };
-
-        let line = RolloutLine {
-            timestamp: timestamp.clone(),
-            ordinal: None,
-            item: RolloutItem::SessionMeta(Box::new(SessionMetaLine {
-                meta: session_meta.clone(),
-                git: None,
-            })),
-        };
-
-        fs::write(&path, format!("{}\n", serde_json::to_string(&line)?))?;
-        let parsed = chrono::DateTime::parse_from_rfc3339(&timestamp)?.with_timezone(&Utc);
-        let times = FileTimes::new().set_modified(parsed.into());
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)?
-            .set_times(times)?;
-
-        let summary = read_summary_from_rollout(path.as_path(), "fallback").await?;
-
-        let expected = ConversationSummary {
-            conversation_id,
-            timestamp: Some(timestamp.clone()),
-            updated_at: Some(timestamp),
-            path: path.clone(),
-            preview: String::new(),
-            model_provider: "fallback".to_string(),
-            cwd: PathBuf::new(),
-            cli_version: String::new(),
-            source: SessionSource::VSCode,
-            git_info: None,
-        };
-
-        assert_eq!(summary, expected);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_summary_from_rollout_preserves_agent_nickname() -> Result<()> {
-        use codex_protocol::protocol::SessionMetaLine;
-        use codex_rollout::RolloutItem;
-        use codex_rollout::RolloutLine;
-        use std::fs;
-
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().join("rollout.jsonl");
-
-        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
-        let parent_thread_id = ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?;
-        let timestamp = "2025-09-05T16:53:11.850Z".to_string();
-
-        let session_meta = SessionMeta {
-            session_id: parent_thread_id.into(),
-            id: conversation_id,
-            timestamp: timestamp.clone(),
-            source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth: 1,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: None,
-            }),
-            thread_source: Some(codex_protocol::protocol::ThreadSource::Subagent),
-            agent_nickname: Some("atlas".to_string()),
-            agent_role: Some("explorer".to_string()),
-            model_provider: Some("test-provider".to_string()),
-            ..SessionMeta::default()
-        };
-
-        let line = RolloutLine {
-            timestamp,
-            ordinal: None,
-            item: RolloutItem::SessionMeta(Box::new(SessionMetaLine {
-                meta: session_meta,
-                git: None,
-            })),
-        };
-        fs::write(&path, format!("{}\n", serde_json::to_string(&line)?))?;
-
-        let summary = read_summary_from_rollout(path.as_path(), "fallback").await?;
-        let fallback_cwd = AbsolutePathBuf::from_absolute_path("/")?;
-        let thread = summary_to_thread(summary, &fallback_cwd);
-
-        assert_eq!(thread.agent_nickname, Some("atlas".to_string()));
-        assert_eq!(thread.agent_role, Some("explorer".to_string()));
-        assert_eq!(thread.thread_source, None);
         Ok(())
     }
 
@@ -1286,6 +1345,7 @@ mod thread_processor_behavior_tests {
         ensure_conversation_listener(
             ListenerTaskContext {
                 thread_manager: test.thread_manager.clone(),
+                thread_store: Arc::clone(&test.thread_store),
                 thread_state_manager,
                 outgoing: outgoing.clone(),
                 pending_thread_unloads: Default::default(),
@@ -1407,45 +1467,6 @@ mod thread_processor_behavior_tests {
         );
         test.codex.shutdown_and_wait().await?;
         skills_watcher.shutdown();
-        Ok(())
-    }
-
-    #[test]
-    fn summary_from_state_db_metadata_preserves_agent_nickname() -> Result<()> {
-        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
-        let source =
-            serde_json::to_string(&SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id: ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?,
-                depth: 1,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: None,
-            }))?;
-
-        let summary = summary_from_state_db_metadata(
-            conversation_id,
-            PathBuf::from("/tmp/rollout.jsonl"),
-            Some("hi".to_string()),
-            /*preview*/ None,
-            "2025-09-05T16:53:11Z".to_string(),
-            "2025-09-05T16:53:12Z".to_string(),
-            "test-provider".to_string(),
-            PathBuf::from("/"),
-            "0.0.0".to_string(),
-            source,
-            Some(codex_protocol::protocol::ThreadSource::Subagent),
-            Some("atlas".to_string()),
-            Some("explorer".to_string()),
-            /*git_sha*/ None,
-            /*git_branch*/ None,
-            /*git_origin_url*/ None,
-        );
-
-        let fallback_cwd = AbsolutePathBuf::from_absolute_path("/")?;
-        let thread = summary_to_thread(summary, &fallback_cwd);
-
-        assert_eq!(thread.agent_nickname, Some("atlas".to_string()));
-        assert_eq!(thread.agent_role, Some("explorer".to_string()));
         Ok(())
     }
 
@@ -1711,4 +1732,19 @@ mod thread_processor_behavior_tests {
         );
         Ok(())
     }
+}
+
+#[test]
+fn preview_from_rollout_items_prefers_plain_user_messages() {
+    use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+    use codex_rollout::RolloutItem;
+    use core_test_support::responses::user_message_item;
+
+    let items = [
+        "# AGENTS.md instructions for project\n\n<INSTRUCTIONS>\n<AGENTS.md contents>\n</INSTRUCTIONS>",
+        &format!("<prior context> {USER_MESSAGE_BEGIN}Count to 5"),
+    ]
+    .map(|text| RolloutItem::ResponseItem(user_message_item(text).into()));
+
+    assert_eq!(super::preview_from_rollout_items(&items), "Count to 5");
 }

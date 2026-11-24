@@ -11,8 +11,6 @@ use crate::render::highlight::MAX_HIGHLIGHT_LINE_BYTES;
 use crate::session_state::ThreadSessionState;
 use crate::wrapping::word_wrap_lines;
 use codex_app_server_protocol::AskForApproval;
-use codex_app_server_protocol::McpAuthStatus;
-use codex_config::types::McpServerConfig;
 use codex_otel::RuntimeMetricTotals;
 use codex_otel::RuntimeMetricsSummary;
 use codex_protocol::ThreadId;
@@ -53,6 +51,7 @@ fn connected_server_version_notice_snapshot() {
     let (notice, _) = crate::status::remote_connection::pending_server_version_notice(
         &settings,
         &target,
+        /*daemon_updates_allowed*/ true,
         /*server_home*/ None,
         "0.153.0",
         Some("0.152.1"),
@@ -78,14 +77,26 @@ fn local_daemon_version_notice_snapshot() {
         show_server_version_notice: true,
         ..Default::default()
     };
-    for (client, server, snapshot) in [
-        ("0.153.0", "0.152.1", "local_daemon_version_notice_snapshot"),
-        ("0.155.0-alpha.12", "0.156.0", "local_daemon_alpha_mismatch"),
-        ("0.0.0", "0.156.0", "local_daemon_source_mismatch"),
+    for (client, server, updates_allowed, snapshot) in [
+        (
+            "0.153.0",
+            "0.152.1",
+            true,
+            "local_daemon_version_notice_snapshot",
+        ),
+        (
+            "0.155.0-alpha.12",
+            "0.156.0",
+            true,
+            "local_daemon_alpha_mismatch",
+        ),
+        ("0.0.0", "0.156.0", true, "local_daemon_source_mismatch"),
+        ("0.153.0", "0.152.1", false, "local_daemon_updates_disabled"),
     ] {
         let (notice, _) = crate::status::remote_connection::pending_server_version_notice(
             &settings,
             &target,
+            updates_allowed,
             /*server_home*/ None,
             client,
             Some(server),
@@ -135,88 +146,6 @@ fn streaming_agent_tail_blank_line_uses_one_viewport_row() {
 
   second");
     assert_eq!(cell.desired_height(/*width*/ 80), 3);
-}
-
-fn stdio_server_config(
-    command: &str,
-    args: Vec<&str>,
-    env: Option<HashMap<String, String>>,
-    env_vars: Vec<&str>,
-) -> McpServerConfig {
-    let mut table = toml::Table::new();
-    table.insert(
-        "command".to_string(),
-        toml::Value::String(command.to_string()),
-    );
-    if !args.is_empty() {
-        table.insert(
-            "args".to_string(),
-            toml::Value::Array(
-                args.into_iter()
-                    .map(|arg| toml::Value::String(arg.to_string()))
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(env) = env {
-        table.insert("env".to_string(), string_map_to_toml_value(env));
-    }
-    if !env_vars.is_empty() {
-        table.insert(
-            "env_vars".to_string(),
-            toml::Value::Array(
-                env_vars
-                    .into_iter()
-                    .map(|name| toml::Value::String(name.to_string()))
-                    .collect(),
-            ),
-        );
-    }
-
-    toml::Value::Table(table)
-        .try_into()
-        .expect("test stdio MCP config should deserialize")
-}
-
-fn streamable_http_server_config(
-    url: &str,
-    bearer_token_env_var: Option<&str>,
-    http_headers: Option<HashMap<String, String>>,
-    env_http_headers: Option<HashMap<String, String>>,
-) -> McpServerConfig {
-    let mut table = toml::Table::new();
-    table.insert("url".to_string(), toml::Value::String(url.to_string()));
-    if let Some(bearer_token_env_var) = bearer_token_env_var {
-        table.insert(
-            "bearer_token_env_var".to_string(),
-            toml::Value::String(bearer_token_env_var.to_string()),
-        );
-    }
-    if let Some(http_headers) = http_headers {
-        table.insert(
-            "http_headers".to_string(),
-            string_map_to_toml_value(http_headers),
-        );
-    }
-    if let Some(env_http_headers) = env_http_headers {
-        table.insert(
-            "env_http_headers".to_string(),
-            string_map_to_toml_value(env_http_headers),
-        );
-    }
-
-    toml::Value::Table(table)
-        .try_into()
-        .expect("test streamable_http MCP config should deserialize")
-}
-
-fn string_map_to_toml_value(entries: HashMap<String, String>) -> toml::Value {
-    toml::Value::Table(
-        entries
-            .into_iter()
-            .map(|(key, value)| (key, toml::Value::String(value)))
-            .collect(),
-    )
 }
 
 fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
@@ -652,7 +581,7 @@ fn session_configured_event(model: &str) -> ThreadSessionState {
         approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/tmp/project").abs(),
+        cwd: codex_utils_path_uri::PathUri::parse("file:///tmp/project").unwrap(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: None,
@@ -790,13 +719,8 @@ async fn session_info_uses_availability_nux_tooltip_override() {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "snapshot path rendering differs on Windows"
-)]
 async fn session_info_availability_nux_tooltip_snapshot() {
-    let mut config = test_config().await;
-    config.cwd = test_path_buf("/tmp/project").abs();
+    let config = test_config().await;
     let cell = new_session_info(
         &config,
         &crate::local_settings::LocalSettings::from(&config),
@@ -1065,112 +989,6 @@ unset it, then restart Codex"
     };
     let cell = new_error_event(error.to_string());
     let rendered = render_lines(&cell.display_lines(/*width*/ 100)).join("\n");
-
-    insta::assert_snapshot!(rendered);
-}
-
-#[tokio::test]
-async fn mcp_tools_output_masks_sensitive_values() {
-    let mut config = test_config().await;
-    let mut env = HashMap::new();
-    env.insert("TOKEN".to_string(), "secret".to_string());
-    let stdio_config = stdio_server_config("docs-server", vec![], Some(env), vec!["APP_TOKEN"]);
-    let mut servers = config.mcp_servers.get().clone();
-    servers.insert("docs".to_string(), stdio_config);
-
-    let mut headers = HashMap::new();
-    headers.insert("Authorization".to_string(), "Bearer secret".to_string());
-    let mut env_headers = HashMap::new();
-    env_headers.insert("X-API-Key".to_string(), "API_KEY_ENV".to_string());
-    let http_config = streamable_http_server_config(
-        "https://example.com/mcp",
-        Some("MCP_TOKEN"),
-        Some(headers),
-        Some(env_headers),
-    );
-    servers.insert("http".to_string(), http_config);
-    config
-        .mcp_servers
-        .set(servers)
-        .expect("test mcp servers should accept any configuration");
-
-    let mut tools: HashMap<String, Tool> = HashMap::new();
-    tools.insert(
-        "mcp__docs__list".to_string(),
-        Tool {
-            description: None,
-            name: "list".to_string(),
-            title: None,
-            input_schema: serde_json::json!({"type": "object", "properties": {}}),
-            output_schema: None,
-            annotations: None,
-            icons: None,
-            meta: None,
-        },
-    );
-    tools.insert(
-        "mcp__http__ping".to_string(),
-        Tool {
-            description: None,
-            name: "ping".to_string(),
-            title: None,
-            input_schema: serde_json::json!({"type": "object", "properties": {}}),
-            output_schema: None,
-            annotations: None,
-            icons: None,
-            meta: None,
-        },
-    );
-
-    let auth_statuses: HashMap<String, McpAuthStatus> = HashMap::new();
-    let cell = new_mcp_tools_output(
-        &config,
-        tools,
-        HashMap::new(),
-        HashMap::new(),
-        &auth_statuses,
-    );
-    let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
-
-    insta::assert_snapshot!(rendered);
-}
-
-#[tokio::test]
-async fn mcp_tools_output_lists_tools_for_hyphenated_server_names() {
-    let mut config = test_config().await;
-    let mut servers = config.mcp_servers.get().clone();
-    servers.insert(
-        "some-server".to_string(),
-        stdio_server_config("docs-server", vec!["--stdio"], /*env*/ None, vec![]),
-    );
-    config
-        .mcp_servers
-        .set(servers)
-        .expect("test mcp servers should accept any configuration");
-
-    let tools = HashMap::from([(
-        "mcp__some_server__lookup".to_string(),
-        Tool {
-            description: None,
-            name: "lookup".to_string(),
-            title: None,
-            input_schema: serde_json::json!({"type": "object", "properties": {}}),
-            output_schema: None,
-            annotations: None,
-            icons: None,
-            meta: None,
-        },
-    )]);
-
-    let auth_statuses: HashMap<String, McpAuthStatus> = HashMap::new();
-    let cell = new_mcp_tools_output(
-        &config,
-        tools,
-        HashMap::new(),
-        HashMap::new(),
-        &auth_statuses,
-    );
-    let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
 
     insta::assert_snapshot!(rendered);
 }

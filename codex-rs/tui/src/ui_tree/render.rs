@@ -1,14 +1,17 @@
-//! Lay out prepared text and nested rows within a terminal viewport.
+//! Lay out prepared text, rows, and columns within a terminal viewport.
 
 mod prepare;
 mod text;
 
 use self::prepare::NodeKind;
 use self::prepare::PreparedNode;
+use self::prepare::RowPaint;
 use self::text::Chunk;
 use self::text::Paint;
 use self::text::visit_chunks;
 use super::MAX_TEXT_BYTES;
+use super::RowJustify;
+use super::RowProps;
 use super::RowWrap;
 use super::TextProps;
 use super::TextWeight;
@@ -77,20 +80,32 @@ impl PreparedUiTree {
 #[derive(Clone, Copy)]
 enum Fragment<'a> {
     Text(&'a [Chunk], usize),
+    Padding(usize, &'a Paint),
     Gap(usize, &'a Paint),
+    /// The visible background of a flex item counts even on an otherwise blank line.
+    Background(usize, &'a Paint),
+    /// A vertical gap takes up a line without advancing the horizontal position.
+    BlankLine,
 }
 
 impl<'a> Fragment<'a> {
     fn width(self) -> usize {
         match self {
-            Self::Text(_, width) | Self::Gap(width, _) => width,
+            Self::Text(_, width)
+            | Self::Padding(width, _)
+            | Self::Gap(width, _)
+            | Self::Background(width, _) => width,
+            Self::BlankLine => 0,
         }
     }
 
     fn visit(self, limit: usize, mut draw: impl FnMut(usize, &str, usize, &'a Paint)) -> usize {
         match self {
-            Self::Text(chunks, _) => visit_chunks(chunks, limit, draw),
-            Self::Gap(width, paint) => {
+            Self::Text(chunks, width) => visit_chunks(chunks, limit.min(width), draw),
+            Self::BlankLine => 0,
+            Self::Padding(width, paint)
+            | Self::Gap(width, paint)
+            | Self::Background(width, paint) => {
                 const SPACES: &str = "                                ";
                 let end = width.min(limit);
                 for start in (0..end).step_by(SPACES.len()) {
@@ -115,6 +130,16 @@ struct Row<'a> {
 
 type Draw<'a> = dyn FnMut(usize, usize, &str, usize, &Paint) + 'a;
 
+#[derive(Clone, Copy)]
+struct AvailableWidth {
+    cells: usize,
+    // Cells remaining in the viewport after ancestor offsets, before flex sizing.
+    visible: usize,
+    in_aligned_row: bool,
+    // A row used as a flex item has an allocated width, unlike the root viewport.
+    fill_background: bool,
+}
+
 fn layout(root: Option<&PreparedNode>, bounds: Size, mut draw: Option<&mut Draw<'_>>) -> Size {
     let Some(root) = root else {
         return Size::default();
@@ -125,10 +150,13 @@ fn layout(root: Option<&PreparedNode>, bounds: Size, mut draw: Option<&mut Draw<
         return Size::default();
     }
     let mut rows = Vec::<Row>::new();
-    let total = layout_node(root, width, height + 1, &mut |y, fragment| {
-        if y >= height {
-            return;
-        }
+    let available = AvailableWidth {
+        cells: width,
+        visible: width,
+        in_aligned_row: false,
+        fill_background: false,
+    };
+    let total = layout_visible(root, available, height, &mut |y, fragment| {
         if rows.len() <= y {
             rows.resize_with(y + 1, Row::default);
         }
@@ -179,35 +207,100 @@ fn layout(root: Option<&PreparedNode>, bounds: Size, mut draw: Option<&mut Draw<
     measured
 }
 
+// On the last visible line, alignment padding can give up a cell for the vertical
+// overflow marker. Defer the suffix starting at that padding until we see the next line.
+fn layout_visible<'a>(
+    root: &'a PreparedNode,
+    width: AvailableWidth,
+    height: usize,
+    visit: &mut Visit<'a, '_>,
+) -> usize {
+    let mut tail = Vec::new();
+    let mut padding = None;
+    let mut last_width = 0;
+    let total = layout_node(root, width, height + 1, &mut |y, fragment| {
+        if y >= height {
+            return;
+        }
+        if y + 1 == height {
+            last_width += fragment.width();
+            if matches!(fragment, Fragment::Padding(..)) {
+                padding = Some(tail.len());
+            }
+            if padding.is_some() {
+                tail.push(fragment);
+                return;
+            }
+        }
+        visit(y, fragment);
+    });
+    if total > height
+        && last_width == width.cells
+        && let Some(index) = padding
+        && let Fragment::Padding(cells, _) = &mut tail[index]
+    {
+        *cells -= 1;
+    }
+    for fragment in tail {
+        visit(height - 1, fragment);
+    }
+    total
+}
+
 fn layout_node<'a>(
     node: &'a PreparedNode,
-    width: usize,
+    width: AvailableWidth,
     limit: usize,
     visit: &mut Visit<'a, '_>,
 ) -> usize {
     match &node.kind {
+        NodeKind::Empty => 0,
         NodeKind::Text(text) => text.layout(width, limit, visit),
+        NodeKind::Col { children, gap } => {
+            let gap = (*gap).min(limit as u64) as usize;
+            let mut y = 0;
+            for (index, child) in children.iter().enumerate() {
+                if index > 0 {
+                    let end = (y + gap).min(limit);
+                    for row in y..end {
+                        visit(row, Fragment::BlankLine);
+                    }
+                    y = end;
+                }
+                if y == limit {
+                    break;
+                }
+                y += layout_node(child, width, limit - y, &mut |row, part| {
+                    visit(y + row, part)
+                });
+            }
+            y
+        }
         NodeKind::Row {
             children,
-            gap,
-            wrap,
+            props,
             paint,
         } => {
-            let gap = (*gap).min((width + 1) as u64) as usize;
+            let gap = props.gap.min((width.cells + 1) as u64) as usize;
+            let mut place_band = |children: &'a [PreparedNode], used, y| {
+                layout_band(
+                    children,
+                    width,
+                    limit - y,
+                    props,
+                    width.cells.saturating_sub(used),
+                    paint,
+                    &mut |row, part| visit(y + row, part),
+                )
+            };
             let mut y = 0;
             let mut start = 0;
             let mut used = 0;
             for (i, child) in children.iter().enumerate() {
-                let preferred = child.widths.preferred.min((width + 1) as u64) as usize;
-                if *wrap == RowWrap::Wrap && i > start && used + gap + preferred > width {
-                    y += layout_band(
-                        &children[start..i],
-                        width,
-                        limit - y,
-                        gap,
-                        paint,
-                        &mut |row, part| visit(y + row, part),
-                    );
+                let preferred = child.widths.preferred.min((width.cells + 1) as u64) as usize;
+                if props.wrap == RowWrap::Wrap && i > start && used + gap + preferred > width.cells
+                {
+                    y += place_band(&children[start..i], used, y);
                     if y == limit {
                         return y;
                     }
@@ -219,59 +312,138 @@ fn layout_node<'a>(
                 }
                 used += preferred;
             }
-            y + layout_band(
-                &children[start..],
-                width,
-                limit - y,
-                gap,
-                paint,
-                &mut |row, part| visit(y + row, part),
-            )
+            y + place_band(&children[start..], used, y)
         }
     }
 }
 
 fn layout_band<'a>(
     children: &'a [PreparedNode],
-    width: usize,
+    width: AvailableWidth,
     limit: usize,
-    gap: usize,
-    paint: &'a Paint,
+    props: &RowProps,
+    spare: usize,
+    paint: &'a RowPaint,
     visit: &mut Visit<'a, '_>,
 ) -> usize {
-    let bounded = |cells: u64| cells.min((width + 1) as u64) as usize;
+    let bounded = |cells: u64| cells.min((width.cells + 1) as u64) as usize;
+    let gap = bounded(props.gap);
+    let (leading, between) = match props.justify.unwrap_or_default() {
+        RowJustify::Start => (0, 0),
+        RowJustify::Center => (spare / 2, 0),
+        RowJustify::End => (spare, 0),
+        RowJustify::Between => (0, spare),
+    };
+    let gaps = children.len().saturating_sub(1);
+    // Round each item's cumulative share to the nearest cell, keeping both edges fixed.
+    let share = |i: usize| {
+        (i * between + gaps / 2)
+            .checked_div(gaps)
+            .unwrap_or_default()
+    };
     let mut reserved = children
         .iter()
         .map(|c| bounded(c.widths.minimum))
         .sum::<usize>()
-        + gap * children.len().saturating_sub(1);
-    let mut offset = 0usize;
-    let mut ends = Vec::new();
-    for child in children {
+        + gap * gaps
+        + share(gaps);
+    let mut offset = leading;
+    let aligned = matches!(props.justify, Some(RowJustify::Center | RowJustify::End));
+    let background_width = if width.fill_background && props.background.is_some() {
+        width.cells.min(width.visible)
+    } else {
+        0
+    };
+    let suppress_blank = aligned && !width.in_aligned_row && background_width == 0;
+    let mut lines = Vec::new();
+    for (i, child) in children.iter().enumerate() {
         let minimum = bounded(child.widths.minimum);
         reserved -= minimum;
         let available = bounded(child.widths.preferred)
-            .min(width.saturating_sub(offset + reserved))
+            .min(width.cells.saturating_sub(offset + reserved))
             .max(minimum);
-        layout_node(child, available.clamp(1, width), limit, &mut |y, part| {
-            if y >= ends.len() {
-                ends.resize(y + 1, 0);
+        let child_width = AvailableWidth {
+            cells: available.min(width.cells),
+            visible: width.visible.saturating_sub(offset),
+            in_aligned_row: width.in_aligned_row || aligned,
+            fill_background: true,
+        };
+        layout_node(child, child_width, limit, &mut |y, part| {
+            if y >= lines.len() {
+                lines.resize_with(y + 1, || (0, suppress_blank.then(Vec::new)));
             }
-            let end = &mut ends[y];
-            let start = offset.min(width + 1);
+            if matches!(part, Fragment::BlankLine) {
+                visit(y, part);
+                return;
+            }
+            // Unpainted alignment and gaps alone do not make a blank line visible.
+            let (end, pending) = &mut lines[y];
+            if part.width() > 0
+                && !matches!(part, Fragment::Padding(..) | Fragment::Gap(..))
+                && let Some(gaps) = pending.take()
+            {
+                for gap in gaps {
+                    visit(y, gap);
+                }
+            }
+            let mut emit = |fragment: Fragment<'a>| {
+                if let Some(gaps) = pending
+                    && fragment.width() > 0
+                {
+                    gaps.push(fragment);
+                } else {
+                    visit(y, fragment);
+                }
+            };
+            // A gap before an empty fragment can paint to the edge, but
+            // only content beyond that edge should trigger overflow.
+            let start = if part.width() == 0 {
+                offset.min(width.visible).min(width.cells)
+            } else {
+                offset.min(width.cells + 1)
+            };
+            if *end == 0 && leading > 0 && start > 0 {
+                let padding = leading.min(start);
+                emit(if padding == background_width {
+                    Fragment::Background(padding, &paint.leading)
+                } else {
+                    Fragment::Padding(padding, &paint.leading)
+                });
+                *end = padding;
+            }
             if start > *end {
-                visit(y, Fragment::Gap(start - *end, paint));
+                emit(if background_width > 0 {
+                    Fragment::Background(start - *end, &paint.gap)
+                } else {
+                    Fragment::Gap(start - *end, &paint.gap)
+                });
                 *end = start;
             }
-            if offset <= width {
-                visit(y, part);
-                *end += part.width();
-            }
+            // Forward blank lines so ancestors count them toward the height limit.
+            emit(part);
+            *end += part.width();
         });
-        offset += available + gap;
-        reserved = reserved.saturating_sub(gap);
+        let next_gap = if i < gaps {
+            gap + share(i + 1) - share(i)
+        } else {
+            0
+        };
+        offset += available + next_gap;
+        reserved = reserved.saturating_sub(next_gap);
     }
-    ends.len()
+    // Fill the rest of each visible line of an explicitly colored flex item,
+    // including blank continuations. Never take cells from the next sibling.
+    if background_width > 0 {
+        for (y, (end, _)) in lines.iter().enumerate() {
+            if *end < background_width {
+                visit(
+                    y,
+                    Fragment::Background(background_width - end, &paint.leading),
+                );
+            }
+        }
+    }
+    lines.len()
 }
 
 pub(crate) fn sanitize_leaf(mut raw: String) -> String {

@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::app::owned_transcript::tests::buffer_text;
 use crate::markdown_render::SourceLocation;
 use crate::sidebar_chooser;
 use crate::sidebar_chooser::NewChatState;
@@ -57,11 +58,17 @@ fn sidebar_files_chooser_matches_the_grouped_file_inventory() -> color_eyre::eyr
     files.promote(entries.into_iter().rev());
     let mut pane = super::super::sidebar::SidebarPane::default();
     pane.files = Some(files);
+    pane.agents.rows.push(sidebar_chooser::AgentRow {
+        id: ThreadId::new(),
+        name: "Reviewer".into(),
+        symbol: "○",
+        status: "Completed",
+    });
     pane.choice = pane.chat_tabs().file_start();
     pane.update_saved_chats(vec![ThreadId::new().into()]);
     assert_eq!(pane.chat_tabs().file_offset(pane.choice), Some(0));
     let area = Rect::new(
-        /*x*/ 0, /*y*/ 0, /*width*/ 50, /*height*/ 23,
+        /*x*/ 0, /*y*/ 0, /*width*/ 50, /*height*/ 30,
     );
     let mut buffer = Buffer::empty(area);
     sidebar_chooser::paint(
@@ -98,6 +105,11 @@ fn sidebar_files_chooser_matches_the_grouped_file_inventory() -> color_eyre::eyr
 
     ○ Side chat
 
+    Subagents  1
+
+    ○ Reviewer
+    Completed
+
     Files  4
 
     › · Makefile
@@ -119,7 +131,7 @@ fn sidebar_files_chooser_matches_the_grouped_file_inventory() -> color_eyre::eyr
             location: None,
         }]);
     let wide = Rect::new(
-        /*x*/ 0, /*y*/ 0, /*width*/ 75, /*height*/ 20,
+        /*x*/ 0, /*y*/ 0, /*width*/ 75, /*height*/ 24,
     );
     let mut wide_buffer = Buffer::empty(wide);
     let frames = tui::FrameRequester::test_dummy();
@@ -152,8 +164,9 @@ fn sidebar_files_chooser_matches_the_grouped_file_inventory() -> color_eyre::eyr
     insta::assert_snapshot!(file_rows, @"
      › · Makefile  Project root
        · guide.md  notes
-       · guide.md  /Users/example/workspaces/re…ect-name/codex-rs/tui/src/app
+       · guide.md  /Users/example/workspaces/re…ct-name/codex-rs/tui/src/app
     ");
+    let right_padding = usize::from(sidebar_chooser::body_row(wide, wide.y).right() - 1);
     let [selected, hovered]: [_; 2] = wide_buffer
         .content
         .chunks(usize::from(wide.width))
@@ -161,7 +174,13 @@ fn sidebar_files_chooser_matches_the_grouped_file_inventory() -> color_eyre::eyr
             let text = cells.iter().map(Cell::symbol).collect::<String>();
             text.contains("Makefile") || text.contains("/Users/example")
         })
-        .map(|row| (row[2].bg, row[2].modifier))
+        .map(|row| {
+            assert_eq!(
+                (row[right_padding].symbol(), row[right_padding].bg),
+                (" ", row[2].bg)
+            );
+            (row[2].bg, row[2].modifier)
+        })
         .collect::<Vec<_>>()
         .try_into()
         .expect("selected and hovered files");
@@ -193,12 +212,23 @@ fn sidebar_files_chooser_matches_the_grouped_file_inventory() -> color_eyre::eyr
         .collect::<Vec<_>>();
     assert_eq!(path_screen[0], "File path");
     assert_eq!(path_screen[1..].join(""), long_path);
+    let edge_path = "/tmp/2026-11-22-something-with-many-parts-and-text.md";
+    let edge = Rect::new(
+        /*x*/ 0, /*y*/ 0, /*width*/ 52, /*height*/ 2,
+    );
+    let mut edge_buffer = Buffer::empty(edge);
+    sidebar_chooser::paint_file_path(edge, edge_path, /*top*/ 0, &mut edge_buffer);
+    assert_eq!(
+        buffer_text(&edge_buffer).lines().collect::<String>(),
+        edge_path
+    );
+
     let narrow_path = Rect::new(
         /*x*/ 0, /*y*/ 0, /*width*/ 18, /*height*/ 7,
     );
     let mut narrow_buffer = Buffer::empty(narrow_path);
     let bottom = sidebar_chooser::scroll_file_path(
-        narrow_path,
+        sidebar_chooser::file_path_areas(narrow_path)[0],
         long_path,
         /*top*/ 0,
         crate::keymap::ListAction::JumpBottom,
@@ -228,7 +258,7 @@ fn sidebar_files_chooser_matches_the_grouped_file_inventory() -> color_eyre::eyr
     let tabs = pane.chat_tabs();
     let targets: Vec<_> =
         sidebar_chooser::row_targets(area, tabs, pane.choice, NewChatState::Available).collect();
-    for row in 10..=12 {
+    for row in (10..=12).chain(15..=17) {
         assert!(
             targets
                 .iter()
@@ -239,6 +269,14 @@ fn sidebar_files_chooser_matches_the_grouped_file_inventory() -> color_eyre::eyr
         targets
             .iter()
             .find(|(_, area)| area.contains((1, 13).into()))
+            .and_then(|(index, _)| tabs.agent(*index))
+            .map(|agent| agent.name.as_str()),
+        Some("Reviewer"),
+    );
+    assert_eq!(
+        targets
+            .iter()
+            .find(|(_, area)| area.contains((1, 18).into()))
             .and_then(|(index, _)| tabs.file(*index)),
         tabs.file(pane.choice),
     );

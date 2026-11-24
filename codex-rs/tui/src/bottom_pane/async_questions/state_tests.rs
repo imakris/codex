@@ -264,16 +264,17 @@ fn clipped_other_cross_block_copy_excludes_hidden_choices() {
             editor.copy_selection(
                 &crate::tui::TuiEvent::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL)),
                 |text| {
-                    assert_eq!(text, "Question?\n\nSecond");
+                    // Line scrolling paints the first choice's final row above the second.
+                    assert_eq!(text, "Question?\n\nrows\nSecond");
                     Ok(crate::clipboard_copy::CopyStatus::Unconfirmed)
                 },
             ),
-            Some((17, Ok(crate::clipboard_copy::CopyStatus::Unconfirmed)))
+            Some((22, Ok(crate::clipboard_copy::CopyStatus::Unconfirmed)))
         );
-        // Newly visible choices were outside the gesture's painted coverage.
+        // Newly visible choice rows were outside the gesture's painted coverage.
         let expanded = render_editor(&editor, 32, 18);
         assert!(buffer_text(&expanded).contains("First"));
-        question_copy(&mut editor, "Question?\n\nSecond");
+        question_copy(&mut editor, "Question?\n\nrows\nSecond");
         assert_eq!(editor.selected_option_index(), Some(2));
         assert_eq!(editor.composer.current_text(), "");
         assert!(editor.submission.is_none());
@@ -475,12 +476,12 @@ fn clipped_other_option_copy_uses_painted_rows() {
     let buffer = render_editor(&editor, 32, 11);
     assert!(!buffer_text(&buffer).contains("First"));
     assert!(buffer_text(&buffer).contains("Second choice spans two"));
-    assert_eq!(editor.visible_options.get(), (1, 1));
+    assert_eq!(editor.option_viewport.borrow().visible, 1..2);
     for word in ["Second", "rows"] {
         select_word(&mut editor, word, 32, 11);
         assert_eq!(editor.selected_option_index(), Some(2));
         assert_eq!(editor.composer.current_text(), "");
-        assert_eq!(editor.visible_options.get(), (1, 1));
+        assert_eq!(editor.option_viewport.borrow().visible, 1..2);
         assert!(editor.submission.is_none());
     }
 
@@ -783,6 +784,17 @@ fn selected_other_renders_as_a_dim_placeholder() {
     assert_eq!(editor.composer.current_text(), "");
 }
 
+fn page_to(editor: &mut AsyncQuestions, buffer: &mut Buffer, end: &str) {
+    for _ in 0..12 {
+        if buffer_text(buffer).contains(end) {
+            return;
+        }
+        editor.handle_key_event(KeyCode::PageDown.into());
+        editor.render(buffer.area, buffer);
+    }
+    panic!("paging did not reveal {end}");
+}
+
 fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
     (buffer.area.y..buffer.area.bottom())
         .map(|y| {
@@ -819,7 +831,7 @@ fn question_choice_remaps_paging_and_inline_feedback() {
     assert_eq!(editor.selected_option_index(), Some(1));
     let mut buffer = render_editor(&editor, /*width*/ 50, /*height*/ 12);
     let area = buffer.area;
-    let visible = editor.visible_options.get().1;
+    let visible = editor.option_viewport.borrow().visible.len();
     assert_eq!(visible, 2);
     editor.handle_key_event(KeyEvent::from(KeyCode::PageDown));
     assert_eq!(editor.selected_option_index(), Some(1 + visible));
@@ -878,6 +890,30 @@ fn question_other_remains_visible_at_nine_columns_and_distinguishes_named_other(
 }
 
 #[test]
+fn horizontally_clipped_choice_cannot_be_submitted() {
+    let mut editor = editor();
+    editor.state.pending.remove(/*index*/ 0);
+    editor.state.pending[0].question.options = Some(vec!["界".into(), "x".into()]);
+    editor.restore_current_draft();
+
+    let area = Rect::new(0, 0, 6, 4);
+    let mut buffer = Buffer::empty(area);
+    editor.render_scrollable_options(area, &mut buffer, &editor.option_rows(area.width));
+    editor.go_next_or_submit();
+    assert!(editor.submission.is_none());
+    // A numbered shortcut still submits another choice that was fully painted.
+    editor.handle_key_event(KeyCode::Char('2').into());
+    assert!(editor.submission.take().is_some());
+
+    editor.select_option(/*index*/ 0);
+    let area = Rect::new(0, 0, 8, 4);
+    let mut buffer = Buffer::empty(area);
+    editor.render_scrollable_options(area, &mut buffer, &editor.option_rows(area.width));
+    editor.go_next_or_submit();
+    assert!(editor.submission.is_some());
+}
+
+#[test]
 fn question_options_reserve_wrapped_height_at_the_width_boundary() {
     let mut editor = editor();
     editor.state.pending.remove(/*index*/ 0);
@@ -888,18 +924,19 @@ fn question_options_reserve_wrapped_height_at_the_width_boundary() {
     // The five-column option prefix makes each named choice exactly 21 columns.
     assert_eq!(
         (
-            editor.options_required_height(/*width*/ 20),
-            editor.options_required_height(/*width*/ 21),
+            editor.answer_height(/*width*/ 20, &editor.option_rows(/*width*/ 20)),
+            editor.answer_height(/*width*/ 21, &editor.option_rows(/*width*/ 21)),
         ),
         (5, 3)
     );
     let width = 24;
     let buffer = render_editor(&editor, width, editor.desired_height(width));
-    assert_eq!(editor.visible_options.get(), (0, 3));
+    assert_eq!(editor.option_viewport.borrow().visible, 0..3);
 
+    editor.restore_current_draft();
     // Two padding rows and the question leave only one line of the selected two-line option.
     let clipped = render_editor(&editor, width, /*height*/ 4);
-    assert_eq!(editor.visible_options.get(), (0, 0));
+    assert_eq!(editor.option_viewport.borrow().visible, 0..0);
     editor.go_next_or_submit();
     assert!(editor.submission.is_none());
     insta::assert_snapshot!(
@@ -925,14 +962,8 @@ fn question_other_excludes_clipped_options_at_the_width_boundary() {
         /*x*/ 0, /*y*/ 0, /*width*/ 20, /*height*/ 2,
     );
     let mut buffer = Buffer::empty(area);
-    let rows = editor.option_rows(area.width);
-    editor.prepare_text_selection_layout(
-        &editor.wrapped_question_lines(area.width),
-        &rows,
-        area.width,
-    );
-    editor.render_inline_options(area, &mut buffer, &rows);
-    assert_eq!(editor.visible_options.get(), (0, 0));
+    editor.render_inline_options(area, &mut buffer, &editor.option_rows(area.width));
+    assert_eq!(editor.option_viewport.borrow().visible, 0..0);
     insta::assert_snapshot!(
         "question_other_clipped_width_boundary",
         buffer_text(&buffer)
@@ -980,19 +1011,22 @@ fn question_wrapped_options_and_other_share_the_text_indent() {
     assert_eq!(editor.options().len(), 32);
     render_editor(&editor, /*width*/ 50, /*height*/ 10);
     let height = editor.desired_height(/*width*/ 50);
-    assert_eq!(editor.visible_options.get().1, 2);
+    assert_eq!(editor.option_viewport.borrow().visible.len(), 2);
     editor.handle_key_event(KeyEvent::from(KeyCode::End));
     assert_eq!(editor.desired_height(/*width*/ 50), height);
     assert_eq!(
         editor.current_answer().unwrap().options_state,
         ScrollState {
             selected_idx: Some(editor.options_len() - 1),
-            scroll_top: editor.options_len() - editor.visible_options.get().1,
+            scroll_top: editor.options_len() - editor.option_viewport.borrow().visible.len(),
         }
     );
     editor.handle_key_event(KeyEvent::from(KeyCode::Up));
     render_editor(&editor, /*width*/ 80, /*height*/ 80);
-    assert_eq!(editor.visible_options.get(), (0, editor.options_len()));
+    assert_eq!(
+        editor.option_viewport.borrow().visible,
+        0..editor.options_len()
+    );
     editor.state.pending[editor.state.current_idx]
         .question
         .title = "Long question ".repeat(3 * 65_536);
@@ -1129,6 +1163,17 @@ fn named_choices_share_selection_while_other_keeps_its_inline_cursor() {
 }
 
 #[test]
+fn resolving_another_question_preserves_the_displayed_choice() {
+    let mut editor = editor();
+    editor.navigate(/*forward*/ true);
+    render_editor(&editor, /*width*/ 40, /*height*/ 12);
+    let first_id = editor.state.pending[0].question_id.clone();
+    assert!(!editor.resolve_answers(&[first_id]));
+    editor.go_next_or_submit();
+    assert!(editor.submission.is_some());
+}
+
+#[test]
 fn answered_questions_do_not_reopen_when_history_precedes_local_drafts() {
     let mut original = editor();
     let saved = original.capture();
@@ -1167,4 +1212,74 @@ fn oversized_question_ids_keep_questions_answerable_without_echoing_the_id() {
         panic!("submitted answer");
     };
     assert_eq!(reply, "> Question\n\nAnswer");
+}
+
+#[test]
+fn scrolling_an_oversized_choice_preserves_selection_and_requires_reading_every_line() {
+    let mut editor = editor();
+    editor.accept_answer();
+    editor.state.pending[0].question.options = Some(vec![
+        "Preceding choice".into(),
+        format!("Line 1.\n\n{}End of choice.", "More.\n\n".repeat(12)),
+        "Second choice".into(),
+    ]);
+    editor.select_option(/*index*/ 1);
+    let mut buffer = render_editor(&editor, /*width*/ 40, /*height*/ 12);
+    let area = buffer.area;
+    // Repeated page keys before painting must not authorize skipped middle lines.
+    for _ in 0..2 {
+        editor.handle_key_event(KeyCode::PageDown.into());
+    }
+    editor.render(area, &mut buffer);
+    editor.go_next_or_submit();
+    assert!(editor.submission.is_none());
+
+    for _ in 0..2 {
+        editor.handle_key_event(KeyCode::PageUp.into());
+    }
+    editor.render(area, &mut buffer);
+    editor.handle_key_event(KeyCode::PageDown.into());
+    editor.render(area, &mut buffer);
+    assert!(!buffer_text(&buffer).contains("Line 1."));
+    page_to(&mut editor, &mut buffer, "End of choice.");
+    assert_eq!(editor.selected_option_index(), Some(1));
+    // Returning to the start must not scroll above this choice and revoke submission.
+    for _ in 0..12 {
+        if buffer_text(&buffer).contains("Line 1.") {
+            break;
+        }
+        editor.handle_key_event(KeyCode::PageUp.into());
+        editor.render(area, &mut buffer);
+    }
+    assert!(buffer_text(&buffer).contains("Line 1."));
+    // A taller terminal does not invalidate lines already read at the same width.
+    render_editor(&editor, /*width*/ 40, /*height*/ 13);
+    editor.go_next_or_submit();
+    assert!(editor.submission.take().is_some());
+
+    editor.select_option(editor.options().len());
+    editor.handle_paste("My answer".into());
+    editor.render(area, &mut buffer);
+    editor.handle_key_event(KeyCode::PageUp.into());
+    editor.render(area, &mut buffer);
+    assert!(buffer_text(&buffer).contains("My answer"));
+    assert!(editor.cursor_pos(area).is_some());
+}
+
+#[test]
+fn paging_waits_for_the_current_choice_to_be_rendered() {
+    let mut editor = editor();
+    editor.accept_answer();
+    editor.state.pending[0].question.options = Some(vec![
+        "First choice".into(),
+        "Oversized choice.\n\n".repeat(20),
+        "Third choice".into(),
+    ]);
+    let mut buffer = render_editor(&editor, /*width*/ 40, /*height*/ 12);
+    editor.handle_key_event(KeyCode::Down.into());
+    editor.handle_key_event(KeyCode::PageDown.into());
+    assert_eq!(editor.selected_option_index(), Some(1));
+    editor.render(buffer.area, &mut buffer);
+    editor.handle_key_event(KeyCode::PageDown.into());
+    assert_eq!(editor.selected_option_index(), Some(1));
 }

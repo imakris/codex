@@ -2,6 +2,8 @@ use super::*;
 use crate::config::Constrained;
 use crate::exec_policy::ExecPolicyManager;
 use crate::guardian::GUARDIAN_REVIEWER_NAME;
+use crate::guardian_review::PendingReviewWrites;
+use crate::guardian_review::ReviewPreparationError;
 use crate::plugins::plugins_manager_for_config;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::step_context::StepContext;
@@ -71,6 +73,37 @@ use tempfile::tempdir;
 use test_case::test_case;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn guardian_rejects_failed_append_of_forwarded_user_instructions() {
+    let (mut session, turn) = make_session_and_context().await;
+    attach_thread_persistence(&mut session).await;
+    session.live_thread().unwrap().shutdown().await.unwrap();
+    let writes = Arc::new(PendingReviewWrites::default());
+    session.pending_review_writes = Some(Arc::clone(&writes));
+    let delivery = ResponseItemEnvelope {
+        item: serde_json::from_value(json!({
+            "type": "function_call_output", "id": "delivery",
+            "name": "send_message_to_thread", "namespace": "codex_app", "output": "Inspect."
+        }))
+        .unwrap(),
+        metadata: Some(CodexHarnessMetadata {
+            sender_user_messages: Some(Box::new(codex_history::SenderUserMessages {
+                receiver_turn_id: turn.sub_id.clone(),
+                receiver_message_id: "delivery".to_owned(),
+                text: "Stop the release.".to_owned(),
+            })),
+            ..Default::default()
+        }),
+    };
+    session
+        .record_prepared_conversation_items(&turn, turn.model_info(), vec![delivery], Vec::new())
+        .await;
+    assert_eq!(
+        writes.wait().await,
+        Err(ReviewPreparationError::HistoryWriteUnconfirmed)
+    );
+}
 
 fn expect_text_output<T>(output: &T) -> String
 where
@@ -616,7 +649,7 @@ async fn guardian_allows_exec_command_additional_permissions_requests_past_polic
             step_context,
             cancellation_token: CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-            call_id: "test-call".to_string(),
+            call_id: "test-call".into(),
             tool_name: codex_tools::ToolName::plain("exec_command"),
             source: crate::tools::context::ToolCallSource::Direct,
             native_call: None,
@@ -742,7 +775,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
             step_context,
             cancellation_token: CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-            call_id: "strict-shell-command-call".to_string(),
+            call_id: "strict-shell-command-call".into(),
             tool_name: codex_tools::ToolName::plain("exec_command"),
             source: ToolCallSource::Direct,
             native_call: None,
@@ -896,7 +929,7 @@ async fn delayed_exec_command_uses_its_captured_authority_after_next_turn_starts
         step_context,
         cancellation_token: CancellationToken::new(),
         tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-        call_id: call_id.to_string(),
+        call_id: call_id.into(),
         tool_name: codex_tools::ToolName::plain("exec_command"),
         source: ToolCallSource::Direct,
         native_call: None,
@@ -1104,7 +1137,7 @@ async fn guardian_allows_unified_exec_additional_permissions_requests_past_polic
             step_context,
             cancellation_token: CancellationToken::new(),
             tracker: Arc::clone(&tracker),
-            call_id: "exec-call".to_string(),
+            call_id: "exec-call".into(),
             tool_name: codex_tools::ToolName::plain("exec_command"),
             source: crate::tools::context::ToolCallSource::Direct,
             native_call: None,
@@ -1230,7 +1263,7 @@ async fn exec_command_allows_sticky_turn_permissions_without_inline_request_perm
             step_context,
             cancellation_token: CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-            call_id: "sticky-turn-grant".to_string(),
+            call_id: "sticky-turn-grant".into(),
             tool_name: codex_tools::ToolName::plain("exec_command"),
             source: crate::tools::context::ToolCallSource::Direct,
             native_call: None,
@@ -1330,6 +1363,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
     let mut thread_extension_init = codex_extension_api::ExtensionDataInit::default();
     thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
     let (session, io) = Session::spawn(SessionSpawnArgs {
+        child_service_tier: None,
         attached_thread: false,
         startup: None,
         config,

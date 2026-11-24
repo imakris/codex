@@ -37,6 +37,23 @@ across account switches. Resume and revert preserve that distinction; forks are 
 Scoped requests skip candidates whose rollout header cannot be read. API-key
 logins see all local history. Direct access by thread ID remains available.
 
+# Streaming thread search (experimental)
+
+`thread/search` continues to return a single paginated response. Clients that initialize
+with `experimentalApi: true` can instead call `thread/search/stream` with the same params
+(a maximum of 65,536 UTF-8 bytes for the trimmed search term).
+It emits best-effort `thread/search/partial` notifications containing the original
+`requestId` and a small subset of verified results. Partials may be dropped, may fall
+outside the final page, and use stored thread metadata; replace them with the final
+response, which is authoritative for results, ordering, and cursors.
+
+Send `thread/search/stream/cancel` with `{requestId}` on the same connection to cancel
+the original streaming request. A client can use a UUID string as the search request ID. The cancel RPC has its own ID and returns `{}`; the
+search completes independently with an error if cancellation wins, or may succeed if
+completion races cancellation. Unknown or finished IDs are no-ops. `thread/search/cancel`
+targets only the existing nonstreaming method. A JavaScript client can connect an
+`AbortSignal` listener to the corresponding cancel RPC.
+
 # Thread list ID filters
 
 `thread/list` accepts `includedThreadIds` to list specific saved threads and
@@ -175,6 +192,15 @@ An unused thread is not guaranteed to survive restart. Omitted or null leaves
 the choice unset. Ephemeral threads cannot save it.
 Use `thread/metadata/update` for later changes. This preference does not select
 `turn/start.cyberAccessProgram` or grant access to an access program.
+
+With `experimentalApi`, a client preparing a thread for later use can pass
+`daybreakProgramPropagationEnrolled: false` to `thread/start` to opt that root
+out of Daybreak propagation. A managed requirement to enable propagation takes
+precedence. Omitted, null, or true uses the configured enrollment rule.
+`thread.daybreakProgramPropagationEnrolled` reports actual enrollment for the
+live thread, including in the start response and `thread/started` notification.
+Stored metadata alone yields null. Reusing the same live session preserves its
+enrollment. Starting a new session from storage yields false.
 
 # Application network policy
 
@@ -391,7 +417,16 @@ enabled = true
 
 Codex reads `[network_proxy]` and its alias `[experimental_network]` as
 `[permissions.network]` within each source before merging managed requirements.
-Across sources, use the same surface (legacy or nested). Use at most one top-level spelling per layer.
+Choose the merge operation with the domain syntax under either table name:
+`allowed_domains` and `denied_domains` each replace the previous list of that kind.
+A host in both surviving lists is denied, including when a keyed grant appears between the lists. Use `[permissions.network.domains]` (or
+the legacy table's `domains` map) for per-host updates. Source priority decides
+a shared selector; unrelated keyed rules survive a nonempty list replacement.
+A surviving `allowed_domains = []` clears lower managed grants. An empty domain
+map contributes no updates. Neither operation changes `managed_allowed_domains_only`.
+When layering mirrored declarations, use the same domain operation in both copies.
+Use the same network table spelling across sources when specifying Unix socket paths.
+Use at most one top-level spelling per layer.
 If a layer also sets `[permissions.network]`, both tables must describe the same policy.
 `configRequirements/read` returns the result in `requirements.network`.
 
@@ -413,9 +448,11 @@ version-gate published policy bundles.
 
 # Amazon Bedrock authentication
 
-If `model_providers.amazon-bedrock.aws.credential_export` is configured, Bedrock setup and
-Bedrock login return an error without changing configuration or saved credentials. Remove the
-exporter configuration before selecting another credential source. `aws.credential_export` and
+Bedrock setup and login accept an optional `providerId`: `amazon-bedrock` (Mantle) or
+`amazon-bedrock-runtime`. Omission or `null` selects Mantle for compatibility. If the selected
+provider has `aws.credential_export` configured, setup and login return an error without changing
+configuration or saved credentials. Remove the exporter configuration before selecting another
+credential source. `aws.credential_export` and
 `aws.profile` cannot be configured together.
 
 Application network restrictions apply to each AWS credential and region HTTP request and to
@@ -511,8 +548,9 @@ Plugin summaries returned by `plugin/list`, `plugin/installed`, `plugin/read`,
 and `plugin/share/list` report effective `enabled` state. When
 `plugins._default.enabled` is configured, an explicit
 `plugins."<plugin-name>@<marketplace-name>".enabled` overrides that default;
-a plugin disabled at its source remains disabled. Omitting the default preserves
-existing source and account enablement. Other plugin settings, including remembered
+a plugin disabled at its source remains disabled. When `_default` is absent,
+an explicit `enabled: false` still disables the plugin without changing its
+installation or account settings. Other plugin settings, including remembered
 tool approvals, inherit the activation default unless `enabled` is explicitly set.
 `plugin/search` retains its discovery behavior: results report `enabled: false`
 while preserving their installation state.
@@ -549,6 +587,14 @@ switching models. Setting `friendly` or `pragmatic` can replace a previous
 `none` setting for that purpose. Changing the setting does not rewrite the
 thread's existing instructions or change explicitly supplied base instructions.
 The old `features.personality` flag is ignored.
+
+# MCP server startup
+
+`mcpServer/startupStatus/updated` reports each server's startup state. On
+`ready` or `failed`, `durationMs` gives the elapsed milliseconds for that
+server's startup attempt, even when notifications arrive together. It is null
+when there is no new measurement, including for reused connections, `starting`
+and `cancelled`. Older servers omit the field.
 
 # MCP server capabilities
 
@@ -612,7 +658,7 @@ PAT sessions continue to return no bearer token from `getAuthStatus`.
 
 The experimental `account/read.workspaceRouting` response field returns the selected ChatGPT workspace's `chatgptAccountId`, resolved HTTPS `backendOrigin`, and backend-provided `accountRoutingOverride`. The routing value is `us`, `us_cr`, or the explicit `NO_CONSTRAINT` value. API-only and signed-out accounts return `null` and do not need `accounts/check`.
 
-App-server discovers routing for saved ChatGPT logins at startup and for new logins or workspace switches. After requirements and routing are ready, it sends the existing `account/updated` notification. Newly initialized connections also receive this notification once saved-workspace routing is ready, including when discovery finished before the connection initialized. Clients then reread `configRequirements/read` and `account/read`. Saved ChatGPT credentials without a selected workspace ID retain their account information and return `workspaceRouting: null`; app-server does not guess a workspace from the backend's default account. Discovery failures for a selected workspace, including missing or null fields from older backends, return an `account/read` error. They never produce a successful unrestricted result. A later read retries failed discovery. Logout clears the cached routing, and results from earlier authentication owners are discarded. Token refreshes for the same known user and workspace invalidate cached routing without cancelling discovery or failing sign-in. Configuration is reloaded after discovery; a changed backend, model provider, or required backend rejects the result so the next read discovers against current configuration. Account notifications recheck the auth owner generation after waiting for outbound queue capacity. Superseded sign-in attempts emit a failed `account/login/completed` event instead of silently dropping completion. Notifications remain snapshots: clients reread current account and requirements state rather than treating a queued notification as authorization.
+App-server discovers routing for saved ChatGPT logins at startup and for new logins or workspace switches. After requirements and routing are ready, it sends the existing `account/updated` notification. Newly initialized connections also receive this notification once saved-workspace routing is ready, including when discovery finished before the connection initialized. This initial notification carries `reason: "workspaceRoutingReady"` when the authenticated owner generation is unchanged. Login, logout, and workspace-switch notifications include `reason: null`. Clients then reread `configRequirements/read` and `account/read`. Saved ChatGPT credentials without a selected workspace ID retain their account information and return `workspaceRouting: null`; app-server does not guess a workspace from the backend's default account. Discovery failures for a selected workspace, including missing or null fields from older backends, return an `account/read` error. They never produce a successful unrestricted result. A later read retries failed discovery. Logout clears the cached routing, and results from earlier authentication owners are discarded. Token refreshes for the same known user and workspace invalidate cached routing without cancelling discovery or failing sign-in. Configuration is reloaded after discovery; a changed backend, model provider, or required backend rejects the result so the next read discovers against current configuration. Account notifications recheck the auth owner generation after waiting for outbound queue capacity. Superseded sign-in attempts emit a failed `account/login/completed` event instead of silently dropping completion. Notifications remain snapshots: clients reread current account and requirements state rather than treating a queued notification as authorization.
 
 Routing compares origins by scheme, host, and effective port, ignoring API paths. A required
 `chatgpt_base_url` must match discovery; if neither provides an origin, `NO_CONSTRAINT` uses the
@@ -761,6 +807,31 @@ HTTP, WebSocket, and code-mode gRPC requests use the shared destination checks.
 User-directed Git, SSH, shell, and other subprocess traffic retain their existing
 execution and sandbox policies.
 
+### Configuration server sign-in during startup
+
+`codex app-server --print-startup-config` reads requirements without starting
+the app server. If a required configuration server uses OAuth and needs a new
+grant, the command exits with an error whose `data` contains
+`"reason": "configServer"` and `"action": "configServerLogin"`.
+
+When the action is `configServerLogin`, start `codex app-server --startup-oauth`.
+This dedicated stdio connection accepts one JSON request per line without an
+initialize handshake. Each reply echoes the string or integer request ID.
+
+1. After the user chooses Sign in, send
+   `{"id":1,"method":"account/gatewayOAuth/login","params":{"target":{"kind":"configServer"}}}`.
+   The helper resolves the target from local managed requirements.
+2. On this pipe, `account/gatewayOAuth/changed` sends the browser handoff with
+   `{"target":{"kind":"configServer"},"status":"started","authUrl":"..."}`.
+   Open that URL on the user's desktop. Rust handles the callback, token exchange,
+   and credential storage.
+3. The original login request stays pending and returns `{"prompt":null}` on
+   success, or an error on failure. To cancel, send
+   `{"id":2,"method":"account/gatewayOAuth/cancel"}`. Closing stdin also ends the
+   pending attempt.
+4. On success, close the pipe and rerun `--print-startup-config`. Continue startup
+   only with the validated requirements.
+
 # Item history anchors
 
 Live notifications and turn history return the same `ThreadItem`. Each item has
@@ -857,8 +928,8 @@ writes still require validation. Lower-precedence definitions can be overridden;
 required definitions are read-only. Both capabilities are false when user
 configuration is ignored. The flag does not establish credential validity or
 whether a setup flow that also selects a default provider will succeed.
-`account/bedrock/setup` targets `amazon-bedrock`; edits to `amazon-bedrock-runtime`
-must use that provider's configuration paths instead.
+`account/bedrock/setup` selects Mantle by default; pass `providerId: "amazon-bedrock-runtime"`
+to select Runtime. Direct edits must use the selected provider's configuration paths.
 
 Use `modelProvider/config/write` with a tagged `settings` patch. To create a
 custom gateway, send `type: "customGateway"`, `name`, and `baseUrl`. Omit

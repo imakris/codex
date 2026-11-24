@@ -37,9 +37,8 @@ Settings:
 -- request 1 (turn) --
 00:message/developer:
     <MODEL_INSTRUCTIONS>
-01:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <COLLABORATION_MODE>
+01:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
 02:message/developer:
     <MULTI_AGENT_ROLE>
 03:message/developer:
@@ -50,15 +49,14 @@ Settings:
 
 ## Window 2 (after request 1)
 Settings: relative to window 1
-  tools (10; hash=9a7d53c1c520c9d2):
+  tools (10; hash=7e8f038920b8f08a):
     - removed function/release
     + function/deployment: Check deployment.; args=[]; hash=2e9a71e9a20e43ad
 -- request 2 (turn) --
 00:message/developer:
     <MODEL_INSTRUCTIONS>
-01:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <COLLABORATION_MODE>
+01:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
 02:message/developer:
     <MULTI_AGENT_ROLE>
 03:message/developer:
@@ -80,14 +78,13 @@ Settings: relative to window 1
 
 ## Window 3 (after request 4)
 Settings: relative to window 2
-  tools (9; hash=0fb40a4e6b518116):
+  tools (9; hash=9b8b6e1eb2dae92e):
     - removed function/deployment
 -- request 5 (turn) --
 00:message/developer:
     <MODEL_INSTRUCTIONS>
-01:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <COLLABORATION_MODE>
+01:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
 02:message/developer:
     <MULTI_AGENT_ROLE>
 03:message/developer:

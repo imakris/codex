@@ -54,6 +54,7 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
+mod app_server_proxy;
 mod config_override_args;
 mod daemon_install;
 mod daemon_telemetry;
@@ -239,10 +240,6 @@ enum Subcommand {
     /// Internal: run the responses API proxy.
     #[clap(hide = true)]
     ResponsesApiProxy(ResponsesApiProxyArgs),
-
-    /// Internal: relay stdio to a Unix domain socket.
-    #[clap(hide = true, name = "stdio-to-uds")]
-    StdioToUds(StdioToUdsCommand),
 
     /// [EXPERIMENTAL] Run the standalone exec-server service.
     ExecServer(ExecServerCommand),
@@ -490,7 +487,7 @@ enum SandboxSubcommand {
 #[cfg(target_os = "macos")]
 type HostSandboxArgs = codex_cli::SeatbeltCommand;
 #[cfg(target_os = "linux")]
-type HostSandboxArgs = codex_cli::LandlockCommand;
+type HostSandboxArgs = codex_cli::LinuxSandboxCommand;
 #[cfg(target_os = "windows")]
 type HostSandboxArgs = codex_cli::WindowsCommand;
 
@@ -761,13 +758,6 @@ struct GenerateInternalJsonSchemaCommand {
     /// Output directory where internal JSON Schema artifacts will be written
     #[arg(short = 'o', long = "out", value_name = "DIR")]
     out_dir: PathBuf,
-}
-
-#[derive(Debug, Parser)]
-struct StdioToUdsCommand {
-    /// Path to the Unix domain socket to connect to.
-    #[arg(value_name = "SOCKET_PATH", value_parser = parse_socket_path)]
-    socket_path: AbsolutePathBuf,
 }
 
 fn parse_socket_path(raw: &str) -> Result<AbsolutePathBuf, String> {
@@ -1057,6 +1047,17 @@ fn main() -> anyhow::Result<()> {
     codex_build_info::initialize!();
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new("--codex-run-as-sandbox-launcher"))
+        {
+            anyhow::ensure!(
+                std::env::args_os().len() == 2,
+                "--codex-run-as-sandbox-launcher does not accept additional arguments"
+            );
+            return codex_cli::shared_sandbox_launcher::run(arg0_paths.codex_linux_sandbox_exe)
+                .await;
+        }
         // Finish polling the large subcommand dispatcher before polling interactive TUI events.
         if let Some(tui) = Box::pin(dispatch_cli(arg0_paths, remote_control_disabled)).await? {
             tui.await?;
@@ -1118,9 +1119,11 @@ async fn dispatch_cli(
         interactive.no_daemon |= options.no_daemon;
     }
     let root_strict_config = interactive.strict_config;
-    interactive
-        .shared
-        .take_auto_review_config_overrides(&mut root_config_overrides);
+    if !matches!(subcommand, Some(Subcommand::Resume(_))) {
+        interactive
+            .shared
+            .take_auto_review_config_overrides(&mut root_config_overrides);
+    }
     reject_root_strict_config_for_subcommand(root_strict_config, &subcommand)?;
     if let Some(subcommand) = subcommand.as_ref() {
         profile_v2_for_subcommand(&interactive, subcommand)?;
@@ -1273,26 +1276,17 @@ async fn dispatch_cli(
             prepend_config_flags(&mut config_overrides, root_config_overrides.clone());
             match subcommand {
                 PluginSubcommand::Add(args) => {
-                    let overrides = config_overrides
-                        .parse_overrides()
-                        .map_err(anyhow::Error::msg)?;
-                    plugin_cmd::run_plugin_add(overrides, args).await?;
+                    plugin_cmd::run_plugin_add(&config_overrides, args).await?;
                 }
                 PluginSubcommand::List(args) => {
-                    let overrides = config_overrides
-                        .parse_overrides()
-                        .map_err(anyhow::Error::msg)?;
-                    plugin_cmd::run_plugin_list(overrides, args).await?;
+                    plugin_cmd::run_plugin_list(&config_overrides, args).await?;
                 }
                 PluginSubcommand::Marketplace(mut marketplace_cli) => {
                     prepend_config_flags(&mut marketplace_cli.config_overrides, config_overrides);
                     marketplace_cli.run().await?;
                 }
                 PluginSubcommand::Remove(args) => {
-                    let overrides = config_overrides
-                        .parse_overrides()
-                        .map_err(anyhow::Error::msg)?;
-                    plugin_cmd::run_plugin_remove(overrides, args).await?;
+                    plugin_cmd::run_plugin_remove(&config_overrides, args).await?;
                 }
             }
         }
@@ -1318,10 +1312,10 @@ async fn dispatch_cli(
                 root_remote_auth_token_env.as_deref(),
                 subcommand.as_ref(),
             )?;
-            if startup_config.print_startup_config {
+            if startup_config.print_startup_config || startup_config.startup_oauth {
                 anyhow::ensure!(
                     subcommand.is_none(),
-                    "--print-startup-config cannot run a subcommand"
+                    "startup configuration modes cannot run a subcommand"
                 );
                 codex_app_server::print_startup_config(
                     arg0_paths,
@@ -1416,7 +1410,9 @@ async fn dispatch_cli(
                                 continue;
                             }
                             let value = if let Some(table) = value.as_table() {
-                                let Some(enabled) = table.get("enabled") else {
+                                let Some(enabled) =
+                                    table.get(codex_features::feature_toggle_field(name))
+                                else {
                                     continue;
                                 };
                                 enabled
@@ -1536,7 +1532,7 @@ async fn dispatch_cli(
                             codex_app_server::app_server_control_socket_path(&codex_home)?
                         }
                     };
-                    codex_stdio_to_uds::run(socket_path.as_path()).await?;
+                    app_server_proxy::run(socket_path.as_path()).await?;
                 }
                 Some(AppServerSubcommand::GenerateTs(gen_cli)) => {
                     let options = codex_app_server_protocol::GenerateTsOptions {
@@ -1861,7 +1857,7 @@ async fn dispatch_cli(
             )
             .await?;
             #[cfg(target_os = "linux")]
-            codex_cli::run_command_under_landlock(
+            codex_cli::run_command_under_linux_sandbox(
                 sandbox_cli,
                 arg0_paths.codex_linux_sandbox_exe.clone(),
                 loader_overrides,
@@ -1958,15 +1954,6 @@ async fn dispatch_cli(
             )?;
             tokio::task::spawn_blocking(move || codex_responses_api_proxy::run_main(args))
                 .await??;
-        }
-        Some(Subcommand::StdioToUds(cmd)) => {
-            reject_remote_mode_for_subcommand(
-                root_remote.as_deref(),
-                root_remote_auth_token_env.as_deref(),
-                "stdio-to-uds",
-            )?;
-            let socket_path = cmd.socket_path;
-            codex_stdio_to_uds::run(socket_path.as_path()).await?;
         }
         Some(Subcommand::ExecServer(mut cmd)) => {
             reject_remote_mode_for_subcommand(
@@ -2465,7 +2452,6 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::Execpolicy(_)) => Some("execpolicy"),
         Some(Subcommand::Apply(_)) => Some("apply"),
         Some(Subcommand::ResponsesApiProxy(_)) => Some("responses-api-proxy"),
-        Some(Subcommand::StdioToUds(_)) => Some("stdio-to-uds"),
         Some(Subcommand::Features(_)) => Some("features"),
         Some(Subcommand::TcpTunnel(_)) => Some("tcp-tunnel"),
     }
@@ -2704,6 +2690,26 @@ fn finalize_resume_interactive(
     interactive.resume_session_id = resume_session_id;
     interactive.resume_show_all = show_all;
     interactive.resume_include_non_interactive = include_non_interactive;
+
+    // Extract the preset before merging launch flags so it cannot erase root permissions
+    // or force an embedded server. Keep its position relative to explicit -c overrides.
+    if interactive.auto_review || resume_cli.auto_review {
+        let overrides_root_permissions = resume_cli.auto_review;
+        let mut config = root_config_overrides.clone();
+        interactive
+            .shared
+            .take_auto_review_config_overrides(&mut config);
+        config
+            .raw_overrides
+            .extend(resume_cli.config_overrides.raw_overrides.iter().cloned());
+        resume_cli
+            .shared
+            .take_auto_review_config_overrides(&mut config);
+        interactive.resume_approval_preset = Some(codex_tui::ResumeApprovalPreset {
+            config,
+            overrides_root_permissions,
+        });
+    }
 
     // Merge resume-scoped flags and overrides with highest precedence.
     merge_interactive_cli_flags(&mut interactive, resume_cli);
@@ -2968,16 +2974,12 @@ enabled = true
     fn finalize_resume_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
-            mut interactive,
-            config_overrides: mut root_overrides,
+            interactive,
+            config_overrides: root_overrides,
             subcommand,
             feature_toggles: _,
             remote: _,
         } = cli;
-        interactive
-            .shared
-            .take_auto_review_config_overrides(&mut root_overrides);
-
         let Subcommand::Resume(ResumeCommand {
             session_id,
             last,
@@ -3386,8 +3388,11 @@ enabled = true
             interactive.approval_policy,
             Some(codex_utils_cli::ApprovalModeCliArg::Never)
         );
+        assert!(interactive.config_overrides.raw_overrides.is_empty());
+        let preset = interactive.resume_approval_preset.unwrap();
+        assert!(!preset.overrides_root_permissions);
         assert_eq!(
-            interactive.config_overrides.raw_overrides,
+            preset.config.raw_overrides,
             vec![
                 r#"approvals_reviewer="auto_review""#.to_string(),
                 r#"approval_policy="on-request""#.to_string(),
@@ -3397,23 +3402,30 @@ enabled = true
     }
 
     #[test]
-    fn later_approve_for_me_overrides_root_tui_approval_policy() {
+    fn resume_preset_preserves_root_permissions_for_later_sessions() {
         let interactive = finalize_resume_from_args(&[
             "codex",
             "--ask-for-approval",
             "never",
+            "--sandbox",
+            "read-only",
             "resume",
             "--approve-for-me",
         ]);
-
-        assert!(interactive.approval_policy.is_none());
-        assert_eq!(
-            interactive.config_overrides.raw_overrides,
-            vec![
-                r#"approvals_reviewer="auto_review""#.to_string(),
-                r#"approval_policy="on-request""#.to_string(),
-                r#"sandbox_mode="workspace-write""#.to_string(),
-            ]
+        assert_matches!(
+            interactive.approval_policy,
+            Some(codex_utils_cli::ApprovalModeCliArg::Never)
+        );
+        assert_matches!(
+            interactive.sandbox_mode,
+            Some(codex_utils_cli::SandboxModeCliArg::ReadOnly)
+        );
+        assert!(interactive.config_overrides.raw_overrides.is_empty());
+        assert!(
+            interactive
+                .resume_approval_preset
+                .unwrap()
+                .overrides_root_permissions
         );
     }
 
@@ -3664,6 +3676,17 @@ enabled = true
             err.to_string(),
             "--force requires a session UUID; names must be confirmed interactively"
         );
+    }
+
+    #[test]
+    fn sandbox_runs_launcher_executable() {
+        let cli = MultitoolCli::try_parse_from(["codex", "sandbox", "launcher", "--help"])
+            .expect("parse sandbox executable");
+        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+            panic!("expected sandbox command");
+        };
+        assert!(command.subcommand.is_none());
+        assert_eq!(command.host.command, vec!["launcher", "--help"]);
     }
 
     #[test]

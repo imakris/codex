@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_code_mode_protocol::CodeModeToolResult;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -90,6 +91,7 @@ pub(crate) struct CreateCellRequest {
     pub(crate) output_truncation: codex_code_mode_protocol::CodeModeOutputTruncation,
     pub(crate) tool_call_id: String,
     pub(crate) enabled_tools: ToolCatalog,
+    pub(crate) tool_preloads: &'static [crate::ToolPreload],
     pub(crate) source: String,
 }
 
@@ -125,7 +127,7 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
         &self,
         invocation: NestedToolCall,
         cancellation_token: CancellationToken,
-    ) -> impl Future<Output = Result<JsonValue, String>> + Send;
+    ) -> impl Future<Output = Result<CodeModeToolResult, String>> + Send;
 
     fn notify(
         &self,

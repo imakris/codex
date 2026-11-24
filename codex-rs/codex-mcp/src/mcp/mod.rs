@@ -32,6 +32,7 @@ use codex_config::types::OAuthCredentialsStoreMode;
 use codex_connectors::ConnectorRuntimeManager;
 use codex_connectors::ConnectorSnapshot;
 use codex_connectors::connector_runtime_context_key;
+use codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_login::CodexAuth;
 use codex_model_provider::CHATGPT_CODEX_BASE_URL;
@@ -203,7 +204,7 @@ pub struct McpConfig {
     pub codex_self_exe: Option<PathBuf>,
     /// Optional path to `codex-linux-sandbox` for sandboxed MCP tool execution.
     pub codex_linux_sandbox_exe: Option<PathBuf>,
-    /// Whether to use legacy Landlock behavior in the MCP sandbox state.
+    /// Whether the MCP sandbox state requests legacy Landlock mode.
     // TODO(anp): Reconcile this runtime-wide copy with TurnEnvironment::sandbox_context
     // for the environment that owns each MCP server.
     pub use_legacy_landlock: bool,
@@ -226,6 +227,8 @@ pub struct McpConfig {
     /// Plugin declarations used to attribute connector tools to plugin display names.
     /// MCP registrations retain their own package attribution in the catalog.
     pub connector_snapshot: ConnectorSnapshot,
+    /// Executor inventory used to project this runtime, retained with its binding.
+    pub executor_discovery_v2: Option<Arc<[ExecutorCapabilityDiscoveryV2Snapshot]>>,
 }
 
 /// Default amount of time a tool catalog capture waits for optional MCP servers.
@@ -468,14 +471,18 @@ pub(crate) fn effective_mcp_server(
         return None;
     }
     let mut server = registration.config().clone();
-    if matches!(server.auth, McpServerAuth::ChatGpt)
+    let request_auth_provider = registration.request_auth_provider();
+    // Preserve the original auth mode so startup can reject conflicts with a request auth provider.
+    if request_auth_provider.is_none()
+        && matches!(server.auth, McpServerAuth::ChatGpt)
         && !is_trusted_chatgpt_mcp_server(&server.transport, &config.client.chatgpt_base_url)
     {
         server.auth = McpServerAuth::OAuth;
     }
     Some(
         EffectiveMcpServer::from_config_with_policy(server, registration.credential_policy())
-            .with_agent_plugin(registration.source().is_agent_plugin()),
+            .with_agent_plugin(registration.source().is_agent_plugin())
+            .with_request_auth_provider(request_auth_provider.cloned()),
     )
 }
 

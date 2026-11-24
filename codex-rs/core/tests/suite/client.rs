@@ -64,7 +64,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
-use codex_protocol_test_support::uuid_v7_item_id_generator_for_test;
+use codex_thread_context_ids_test_support::thread_context_ids;
 use core_test_support::TestCodexResponsesRequestKind;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::load_default_config_for_test;
@@ -1977,7 +1977,7 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
         ),
         AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
-        uuid_v7_item_id_generator_for_test(),
+        thread_context_ids(),
         SessionSource::Exec,
         "test_originator".to_string(),
         config.model_verbosity,
@@ -3027,9 +3027,6 @@ async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()> {
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
             config.model_reasoning_summary = Some(ReasoningSummary::Concise);
-            let _ = config
-                .features
-                .enable(Feature::ConcurrentReasoningSummaries);
         })
         .build(&server)
         .await?;
@@ -3679,7 +3676,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         codex_model_provider::create_model_provider(provider.clone(), /*auth_manager*/ None),
         AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
-        uuid_v7_item_id_generator_for_test(),
+        thread_context_ids(),
         SessionSource::Exec,
         "test_originator".to_string(),
         config.model_verbosity,
@@ -4576,7 +4573,10 @@ async fn env_var_overrides_loaded_auth() {
             "Custom-Header".to_string(),
             "Value".into(),
         )])),
-        env_http_headers: None,
+        env_http_headers: Some(std::collections::HashMap::from([(
+            "X-Codex-Exclude-Stream-Fields".to_string(),
+            EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE.to_string(),
+        )])),
         request_max_retries: None,
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
@@ -4621,6 +4621,10 @@ async fn env_var_overrides_loaded_auth() {
         .find(|request| request.url.path() == "/openai/responses")
         .expect("missing provider request");
     assert_eq!(request.headers.get(X_CODEX_ROUTING_HINT_HEADER), None);
+    assert_eq!(
+        request.headers["x-codex-exclude-stream-fields"],
+        std::env::var(EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE).unwrap()
+    );
 }
 
 fn create_dummy_codex_auth() -> CodexAuth {

@@ -6,7 +6,6 @@
 //! a board after its root has been permanently deleted.
 //! Opening storage adds optional channel metadata without invalidating older readers.
 //! Explicit connections can restrict writes; default handles retain legacy access.
-//! Fixed read views freeze the channel catalog and restrict reads to a captured post sequence.
 //! Posting subscribes and notifies; host appends share persistence without these side effects.
 
 use self::connection::Access;
@@ -24,6 +23,7 @@ use crate::SubscriptionRequest;
 use crate::SubscriptionState;
 use crate::SubscriptionTarget;
 use crate::api::PostBehavior;
+use crate::validate_channel;
 use caseless::default_case_fold_str;
 use chrono::DateTime;
 use chrono::Utc;
@@ -59,33 +59,7 @@ mod subscriptions;
 mod pools_tests;
 
 const MAX_POST_BYTES: usize = 64 * 1024;
-const MAX_CHANNEL_BYTES: usize = 128;
 const MAX_READ_CHARS: usize = 20_000;
-
-/// Capturing a view makes the handle read-only, regardless of its original access.
-#[derive(Clone)]
-enum BoardMode {
-    Live { access: Option<Access> },
-    Fixed { view: Arc<catalog::ReadView> },
-}
-
-impl BoardMode {
-    const FIXED_ACCESS: Access = Access::ReadOnly;
-
-    fn access(&self) -> Option<Access> {
-        match self {
-            Self::Live { access } => *access,
-            Self::Fixed { .. } => Some(Self::FIXED_ACCESS),
-        }
-    }
-
-    fn view(&self) -> Option<&catalog::ReadView> {
-        match self {
-            Self::Live { .. } => None,
-            Self::Fixed { view } => Some(view),
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct LocalAgentMessageBoard {
@@ -93,7 +67,7 @@ pub struct LocalAgentMessageBoard {
     storage_namespace: Arc<str>,
     pool: Arc<SqlitePool>,
     host: Arc<dyn MessageBoardHost>,
-    mode: BoardMode,
+    access: Option<Access>,
     nested_json_pointer: Option<&'static str>,
 }
 
@@ -118,9 +92,42 @@ impl LocalAgentMessageBoard {
             pool: pool::open(sqlite, options).await?,
             storage_namespace: Arc::from(options.storage_namespace.as_str()),
             host,
-            mode: BoardMode::Live { access: None },
+            access: None,
             nested_json_pointer: None,
         })
+    }
+
+    /// Opens a fresh read-write SQLite board with no backing file. Clones share its contents
+    /// until the last handle closes. A later open always creates an independent board.
+    pub async fn open_in_memory(
+        options: &LocalBoardOptions,
+        identity: SessionId,
+        host: Arc<dyn MessageBoardHost>,
+    ) -> Result<Self> {
+        options.validate()?;
+        let pool = SqliteConfig::open_in_memory_pool()
+            .await
+            .map_err(storage_error)?;
+        sqlx::raw_sql(pool::SCHEMA)
+            .execute(&pool)
+            .await
+            .map_err(storage_error)?;
+        Ok(Self {
+            identity,
+            storage_namespace: Arc::from(options.storage_namespace.as_str()),
+            pool: Arc::new(pool),
+            host,
+            access: Some(Access::ReadWrite),
+            nested_json_pointer: None,
+        })
+    }
+
+    /// Reads the same live board and can change only the caller's subscriptions.
+    pub fn read_only_handle(&self) -> Self {
+        Self {
+            access: Some(Access::ReadOnly),
+            ..self.clone()
+        }
     }
 
     pub async fn create_channel(
@@ -128,7 +135,7 @@ impl LocalAgentMessageBoard {
         caller: ThreadId,
         request: CreateChannelRequest,
     ) -> Result<ChannelSummary> {
-        if let Some(access) = self.mode.access() {
+        if let Some(access) = self.access {
             access.require_write(self.identity, "board.create_channel")?;
         }
         validate_channel(&request.channel_name)?;
@@ -188,7 +195,7 @@ impl LocalAgentMessageBoard {
         request: PostRequest,
         behavior: PostBehavior,
     ) -> Result<PostMetadata> {
-        if let Some(access) = self.mode.access() {
+        if let Some(access) = self.access {
             access.require_write(
                 self.identity,
                 match &request.destination {
@@ -235,12 +242,15 @@ impl LocalAgentMessageBoard {
             return Ok(post.metadata);
         }
         drop(conn);
-        let mut recipients = HashSet::new();
-        if let PostBehavior::Discussion = behavior {
+        let notify_recipients = if behavior == PostBehavior::Discussion {
+            let mut recipients = HashSet::new();
             for path in &request.agents_to_notify {
                 recipients.insert(self.host.resolve_agent(path.clone()).await?);
             }
-        }
+            Some(recipients)
+        } else {
+            None
+        };
         let now = self.host.current_time(caller).await?;
         let mut tx = self.begin_write().await?;
         if let Some(post) = self
@@ -308,7 +318,9 @@ impl LocalAgentMessageBoard {
         };
         // Return one JSON array to avoid handing each subscriber row across
         // SQLite's worker thread while the write transaction is held.
-        if let PostBehavior::Discussion = behavior {
+        let subscribers: Vec<ThreadId> = if behavior == PostBehavior::SilentAppend {
+            Vec::new()
+        } else {
             let subscribed = sqlx::query_scalar::<_, String>(
                 "SELECT json_group_array(agent) FROM subscriptions WHERE board=? AND target=?",
             )
@@ -317,13 +329,8 @@ impl LocalAgentMessageBoard {
             .fetch_one(&mut *tx)
             .await
             .map_err(storage_error)?;
-            let subscribed: Vec<String> =
-                serde_json::from_str(&subscribed).map_err(storage_error)?;
-            for recipient in subscribed {
-                recipients.insert(ThreadId::from_string(&recipient).map_err(storage_error)?);
-            }
-        }
-        recipients.remove(&caller);
+            serde_json::from_str(&subscribed).map_err(storage_error)?
+        };
         let post = StoredPost {
             metadata: PostMetadata {
                 message_id: id,
@@ -346,9 +353,11 @@ impl LocalAgentMessageBoard {
         }
         tx.commit().await.map_err(storage_error)?;
 
-        if let PostBehavior::SilentAppend = behavior {
+        let Some(mut recipients) = notify_recipients else {
             return Ok(post.metadata);
-        }
+        };
+        recipients.extend(subscribers);
+        recipients.remove(&caller);
         // A committed post succeeds even if a best-effort notice cannot be delivered.
         let notice = paging::preview(post.clone(), /*max_chars*/ 150);
         futures::stream::iter(recipients)
@@ -373,7 +382,7 @@ impl LocalAgentMessageBoard {
         let target_path = request.target_agent.unwrap_or(caller_path);
         let target_agent = self.host.resolve_agent(target_path.clone()).await?;
         if target_agent != caller
-            && let Some(access) = self.mode.access()
+            && let Some(access) = self.access
         {
             access.require_write(self.identity, "board.manage_subscriptions")?;
         }
@@ -473,19 +482,6 @@ async fn insert_channel(
         .execute(conn).await.map_err(storage_error)?.rows_affected();
     if inserted == 0 {
         return Err(invalid("channel already exists"));
-    }
-    Ok(())
-}
-
-fn validate_channel(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name.len() > MAX_CHANNEL_BYTES
-        || name.trim() != name
-        || name.chars().any(char::is_control)
-    {
-        return Err(invalid(
-            "channel names must contain 1–128 bytes without edge whitespace or control characters",
-        ));
     }
     Ok(())
 }

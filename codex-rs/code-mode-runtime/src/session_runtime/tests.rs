@@ -24,8 +24,8 @@ impl SessionRuntimeDelegate for RecordingDelegate {
         &self,
         _invocation: NestedToolCall,
         _cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String> {
-        Ok(JsonValue::Null)
+    ) -> Result<CodeModeToolResult, String> {
+        Ok(CodeModeToolResult::from(JsonValue::Null))
     }
 
     async fn notify(
@@ -46,8 +46,8 @@ impl SessionRuntimeDelegate for PanickingClosedDelegate {
         &self,
         _invocation: NestedToolCall,
         _cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String> {
-        Ok(JsonValue::Null)
+    ) -> Result<CodeModeToolResult, String> {
+        Ok(CodeModeToolResult::from(JsonValue::Null))
     }
 
     async fn notify(
@@ -146,6 +146,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
                 output_truncation: CodeModeOutputTruncation::Client,
                 tool_call_id: "reader".to_string(),
                 enabled_tools: Default::default(),
+                tool_preloads: &[],
                 source: r#"text(String(load("candidate")));"#.to_string(),
             },
             ObserveMode::YieldAfter(Duration::from_secs(1)),
@@ -171,6 +172,7 @@ fn execute_request(source: &str) -> CreateCellRequest {
         output_truncation: CodeModeOutputTruncation::Client,
         tool_call_id: "call-1".to_string(),
         enabled_tools: Default::default(),
+        tool_preloads: &[],
         source: source.to_string(),
     }
 }

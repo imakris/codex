@@ -14,6 +14,7 @@ use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::CodeModeSessionOptions;
 use codex_code_mode_protocol::CodeModeSessionResultFuture;
 use codex_code_mode_protocol::CodeModeToolKind;
+use codex_code_mode_protocol::CodeModeToolResult;
 use codex_code_mode_protocol::DEFAULT_EXEC_YIELD_TIME_MS;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::ExecuteToPendingOutcome;
@@ -25,7 +26,6 @@ use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::WaitToPendingOutcome;
 use codex_code_mode_protocol::WaitToPendingRequest;
-use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -38,10 +38,24 @@ use crate::session_runtime::SessionRuntime;
 const YIELD_GRACE_PERIOD: Duration = Duration::from_secs(1);
 const MIN_YIELD_TIME_FOR_GRACE: Duration = Duration::from_secs(10);
 
+/// Trusted JavaScript a session installs in cells that expose the named nested tool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolPreload {
+    /// The tool's binding on the Code Mode `tools` object.
+    pub tool: &'static str,
+    /// The exact name dispatched by that binding.
+    pub tool_name: &'static str,
+    /// The exact namespace dispatched by that binding, if any.
+    pub tool_namespace: Option<&'static str>,
+    /// A script evaluated before the cell's module, in the same V8 context.
+    pub source: &'static str,
+}
+
 pub struct InProcessCodeModeSession {
     runtime: SessionRuntime,
     catalog: Mutex<(u64, runtime::ToolCatalog)>,
     options: CodeModeSessionOptions,
+    tool_preloads: &'static [ToolPreload],
 }
 
 impl InProcessCodeModeSession {
@@ -65,9 +79,19 @@ impl InProcessCodeModeSession {
         options: CodeModeSessionOptions,
         task_failure_handler: Option<TaskFailureHandler>,
     ) -> Self {
+        Self::with_options_and_tool_preloads(options, task_failure_handler, &[])
+    }
+
+    /// Creates a session with trusted host helpers selected against each cell's tool catalog.
+    pub fn with_options_and_tool_preloads(
+        options: CodeModeSessionOptions,
+        task_failure_handler: Option<TaskFailureHandler>,
+        tool_preloads: &'static [ToolPreload],
+    ) -> Self {
         Self {
             runtime: SessionRuntime::new_with_task_failure_handler(task_failure_handler),
             catalog: Default::default(),
+            tool_preloads,
             options: CodeModeSessionOptions {
                 cell_execution_limits: CodeModeSessionCellExecutionLimits {
                     max_heap_size_bytes: None,
@@ -119,6 +143,7 @@ impl InProcessCodeModeSession {
             output_truncation: self.options.output_truncation,
             tool_call_id: request.tool_call_id,
             enabled_tools: tools,
+            tool_preloads: self.tool_preloads,
             source: request.source,
         })
     }
@@ -396,7 +421,7 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
         &self,
         invocation: runtime::NestedToolCall,
         cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String> {
+    ) -> Result<CodeModeToolResult, String> {
         self.delegate
             .invoke_tool(
                 CodeModeNestedToolCall {

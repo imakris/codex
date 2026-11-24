@@ -25,6 +25,9 @@ use tokio_util::sync::CancellationToken;
 /// One captured action and its host-enforced constraints. Guardian derives the
 /// contributor input and owns cancellation for the complete review operation.
 pub struct ReviewRequest<'a, H> {
+    /// Issuing action's model and turn, retained across yielded code cells.
+    pub sampling_model: &'a str,
+    pub turn_id: &'a str,
     /// Final serving value retained by the host for this action.
     pub serving_assessment: Option<bool>,
     pub host: H,
@@ -48,6 +51,8 @@ pub struct ReviewRequest<'a, H> {
     pub cancellation: CancellationToken,
     /// Overall review budget; None disables only the review deadline.
     pub timeout: Option<std::time::Duration>,
+    /// Hosted evidence can first be read before synchronous review starts.
+    pub host_deadline: Option<crate::ReviewDeadline>,
     pub model: &'a ModelInfo,
     pub telemetry: &'a SessionTelemetry,
     /// The host verified the assessment opt-in and an explicit OTLP log destination.
@@ -153,6 +158,8 @@ impl<H: ReviewHost> ReviewRequest<'_, H> {
                 }
             }
         };
+        let decision =
+            crate::with_root_evidence_limits(self.host_deadline, &cancellation, decision);
         tokio::pin!(decision);
         let result = if let Some(runtime) = runtime.as_ref() {
             tokio::select! {
@@ -186,6 +193,12 @@ impl<H: ReviewHost> ReviewRequest<'_, H> {
         };
         if self.cancellation.is_cancelled() {
             return ReviewDecision::Abort;
+        }
+        if self
+            .host_deadline
+            .is_some_and(crate::ReviewDeadline::is_elapsed)
+        {
+            return ReviewDecision::TimedOut;
         }
         if self.thread_store.get::<GuardianV2Enabled>().is_some() {
             self.analytics

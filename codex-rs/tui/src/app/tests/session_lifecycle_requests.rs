@@ -50,6 +50,49 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 
 #[tokio::test]
+async fn diff_result_matches_the_server_session_thread_and_cwd() -> Result<()> {
+    use codex_utils_path_uri::LegacyAppPathString;
+    use codex_utils_path_uri::PathUri;
+
+    let mut app = make_test_app().await;
+    let (client, _commands, _events) =
+        codex_app_server_client::CloudClient::channel(/*capacity*/ 1);
+    let mut server = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
+        codex_app_server_client::AppServerClient::Cloud(client),
+        crate::ThreadParamsMode::Cloud,
+    );
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let foreign_cwd = if cfg!(windows) { "/repo" } else { r"D:\repo" };
+    let cwd = PathUri::try_from(LegacyAppPathString::from_string(foreign_cwd))?;
+    let mut session = test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf());
+    session.cwd = cwd.clone();
+    let thread_id = Some(session.thread_id);
+    app.chat_widget.handle_thread_session(session);
+    for (thread_id, cwd) in [
+        (thread_id, app.config.cwd.clone().into()),
+        (Some(ThreadId::new()), cwd.clone()),
+    ] {
+        let stale = AppEvent::DiffResult {
+            thread_id,
+            cwd,
+            text: "old diff".into(),
+        };
+        Box::pin(app.handle_event(&mut tui, &mut server, stale)).await?;
+        assert!(app.overlay.is_none());
+    }
+
+    let current = AppEvent::DiffResult {
+        thread_id,
+        cwd,
+        text: "current diff".into(),
+    };
+    Box::pin(app.handle_event(&mut tui, &mut server, current)).await?;
+    assert!(app.overlay.is_some());
+    Ok(())
+}
+
+#[tokio::test]
 async fn cloud_skips_skills_refresh_and_ignores_stale_local_result() -> Result<()> {
     use futures::FutureExt;
 
@@ -74,7 +117,7 @@ async fn cloud_skips_skills_refresh_and_ignores_stale_local_result() -> Result<(
     for event in [
         AppEvent::CodexOp(refresh),
         AppEvent::SkillsListLoaded {
-            cwd,
+            cwd: app.config.cwd.clone().into(),
             result: Err("stale local skills refresh".into()),
         },
     ] {
@@ -202,6 +245,302 @@ async fn cloud_enter_recovers_drafts_from_server_receipts() -> Result<()> {
         );
     }
     insta::assert_snapshot!("cloud_composer_receipts", rendered_receipts.join("\n\n"));
+    Ok(())
+}
+
+async fn drive_automatic_recovery<F: std::future::Future>(
+    future: F,
+    commands: &mut tokio::sync::mpsc::Receiver<codex_app_server_client::CloudCommand>,
+) -> F::Output {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            value = &mut future => return value,
+            Some(command) = commands.recv() => {
+                let codex_app_server_client::CloudOperation::Request(request) = command.operation else {
+                    panic!("unexpected submission during automatic recovery");
+                };
+                let value = match *request {
+                    ClientRequest::ThreadLoadedList { .. } => serde_json::json!({"data":[],"nextCursor":null}),
+                    ClientRequest::ThreadGoalGet { .. } => serde_json::json!({"goal":null}),
+                    ClientRequest::ThreadUnsubscribe { .. } => serde_json::json!({"status":"unsubscribed"}),
+                    _ => panic!("unexpected request during automatic recovery"),
+                };
+                command.response.send(Ok(Ok(value))).unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn quiet_cloud_recovery_keeps_the_draft() -> Result<()> {
+    use codex_app_server_client::CLOUD_RECOVERY_NETWORK_BLOCKED;
+    use codex_app_server_client::CloudRecoverySignInChanged;
+    #[derive(Clone, Copy, PartialEq)]
+    enum HistoryCase {
+        Unchanged,
+        SwitchThread,
+        Changed,
+        RepeatedCursor,
+        ScanLimit,
+        DelayedHistory,
+        PersistentEmpty,
+        SignInChanged,
+        GenericServer,
+        InvalidRequest,
+        NetworkBlocked,
+    }
+    use HistoryCase::*;
+    for case in [
+        Unchanged,
+        SwitchThread,
+        Changed,
+        RepeatedCursor,
+        ScanLimit,
+        DelayedHistory,
+        PersistentEmpty,
+        SignInChanged,
+        GenericServer,
+        InvalidRequest,
+        NetworkBlocked,
+    ] {
+        let destination = (case == SwitchThread).then(ThreadId::new);
+        let (mut app, mut events, mut ops) = make_test_app_with_channels().await;
+        let id = ThreadId::new();
+        app.app_server_target = AppServerTarget::Cloud;
+        if case == ScanLimit {
+            app.local_settings.transcript_mode = crate::transcript_mode::TranscriptMode::Terminal;
+        }
+        let saved_turns = if matches!(case, PersistentEmpty | ScanLimit) {
+            vec![test_turn("already-seen", TurnStatus::Completed, Vec::new())]
+        } else {
+            Vec::new()
+        };
+        app.enqueue_primary_thread_session(
+            test_thread_session(id, app.config.cwd.to_path_buf()),
+            saved_turns.clone(),
+        )
+        .await?;
+        let (client, mut commands, _events) =
+            codex_app_server_client::CloudClient::channel(/*capacity*/ 1);
+        let mut server = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            codex_app_server_client::AppServerClient::Cloud(client),
+            crate::ThreadParamsMode::Cloud,
+        );
+        app.chat_widget.thread_stream_disconnected = true;
+        app.chat_widget.apply_external_edit("queued prompt".into());
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::Enter));
+        app.chat_widget.apply_external_edit("unsent draft".into());
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        tokio::time::pause();
+        app.start_cloud_resume(&server);
+        // Suspend after losing the connection. Only the recovery task wakes the UI.
+        let stalled = commands.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(/*secs*/ 300)).await;
+        let mut attempt = app.reconnect.cloud_resume.take().unwrap();
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(/*secs*/ 1), &mut attempt.task).await??;
+        assert!(stalled.response.is_closed());
+        app.finish_cloud_resume(&mut tui, &mut server, attempt, outcome)
+            .await?;
+        assert!(app.reconnect.cloud_resume.is_some());
+        assert!(app.chat_widget.thread_stream_disconnected);
+        let command = commands.recv().await.unwrap();
+        let codex_app_server_client::CloudOperation::ResumeDisconnectedThread {
+            release,
+            require_history,
+            ..
+        } = command.operation
+        else {
+            panic!("expected idle attachment")
+        };
+        assert!(!require_history);
+        let mut thread = crate::app::agents_overview::tests::overview_thread(
+            id,
+            /*parent_thread_id*/ None,
+            "Current",
+            ThreadStatus::Idle,
+        );
+        thread.cwd = app.config.cwd.clone().into();
+        thread.history_mode = ThreadHistoryMode::Paginated;
+        let response = serde_json::json!({"thread":thread,"model":"gpt-5.5","modelProvider":thread.model_provider,"cwd":thread.cwd,"approvalPolicy":"never","approvalsReviewer":"user","sandbox":{"type":"readOnly"}});
+        command.response.send(Ok(Ok(response))).unwrap();
+        let mut attempt = app.reconnect.cloud_resume.take().unwrap();
+        let mut reads = Vec::new();
+        let mut scanned = 0;
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut attempt.task => break outcome?,
+                Some(read) = commands.recv() => {
+                    let codex_app_server_client::CloudOperation::Request(request) = read.operation else {
+                        panic!("expected paginated recovery history");
+                    };
+                    let response = match *request {
+                        ClientRequest::ThreadTurnsList { .. } if case == ScanLimit => {
+                            reads.push("turns");
+                            serde_json::json!({"data": saved_turns, "nextCursor": null})
+                        }
+                        ClientRequest::ThreadTurnsList { .. } => {
+                            reads.push("turns");
+                            let turn = test_turn("missed", TurnStatus::Completed, Vec::new());
+                            serde_json::json!({
+                                "data": (case == Changed).then_some(turn).into_iter().collect::<Vec<_>>(),
+                                "nextCursor": (case == DelayedHistory && reads.len() == 1).then_some("projection-not-ready"),
+                            })
+                        }
+                        ClientRequest::ThreadItemsList { params, .. } if case == ScanLimit => {
+                            // Pages of hidden items still count against the scan budget.
+                            reads.push("items");
+                            scanned += params.limit.unwrap() as usize;
+                            serde_json::json!({"data": [], "nextCursor": scanned.to_string()})
+                        }
+                        ClientRequest::ThreadItemsList { .. } => {
+                            reads.push("items");
+                            let answer = ThreadItemPayload::UserMessage {
+                                id: "new-user-message".into(),
+                                client_id: Some("another-client".into()),
+                                content: vec![UserInput::Text { text: "Remote follow-up".into(), text_elements: Vec::new() }],
+                            };
+                            let row = serde_json::json!({"turnId":"missed","item":answer});
+                            serde_json::json!({
+                                "data": (case == Changed).then_some(row).into_iter().collect::<Vec<_>>(),
+                                "nextCursor": (case == RepeatedCursor).then_some("same-page"),
+                            })
+                        }
+                        _ => panic!("expected paginated recovery history"),
+                    };
+                    // Each page arrives promptly, but the full read takes over 15 seconds.
+                    tokio::time::advance(Duration::from_secs(/*secs*/ 10)).await;
+                    let server_error = |code, message| Ok(Err(codex_app_server_protocol::JSONRPCErrorError {
+                        code,
+                        message,
+                        data: None,
+                    }));
+                    let response = match (case, reads.len()) {
+                        (SignInChanged, 1) => Err(std::io::Error::other(CloudRecoverySignInChanged)),
+                        (GenericServer, 1) => server_error(-32000, CloudRecoverySignInChanged.to_string()),
+                        (InvalidRequest, 1) => server_error(-32602, "Recovery history request was rejected".into()),
+                        (NetworkBlocked, 1) => server_error(-32000, CLOUD_RECOVERY_NETWORK_BLOCKED.into()),
+                        _ => Ok(Ok(response)),
+                    };
+                    read.response.send(response).unwrap();
+                }
+            }
+        };
+        match case {
+            ScanLimit => {
+                assert_eq!(scanned, crate::app_server_session::HISTORY_ITEM_SCAN_LIMIT);
+                assert_eq!(reads.iter().filter(|&&read| read == "turns").count(), 1);
+            }
+            RepeatedCursor => assert_eq!(reads, ["turns", "items", "items"].repeat(3)),
+            PersistentEmpty => assert_eq!(reads, ["turns", "items"].repeat(3)),
+            SignInChanged | GenericServer | InvalidRequest | NetworkBlocked => {
+                assert_eq!(reads, ["turns"]);
+            }
+            DelayedHistory => assert_eq!(reads, ["turns", "items", "turns", "items"]),
+            Unchanged | SwitchThread | Changed => assert_eq!(reads, ["turns", "items"]),
+        }
+        assert_eq!(
+            app.chat_widget.queued_user_message_texts(),
+            ["queued prompt"]
+        );
+        assert!(
+            !std::iter::from_fn(|| ops.try_recv().ok()).any(|op| matches!(op, Op::UserTurn { .. }))
+        );
+        // The UI event handler must return even when the worker withholds its final ACK.
+        tokio::time::timeout(
+            Duration::from_secs(/*secs*/ 1),
+            app.finish_cloud_resume(&mut tui, &mut server, attempt, outcome),
+        )
+        .await??;
+        let installed = if let Ok(ack) = release.await {
+            if let Some(side) = destination {
+                let mut session = test_thread_session(side, app.config.cwd.to_path_buf());
+                session.model_provider_id = app.chat_widget.quota_provider_id().to_owned();
+                app.ensure_thread_channel(side)
+                    .store
+                    .lock()
+                    .await
+                    .set_session(session, Vec::new());
+                app.side_threads.insert(side, SideThreadState::new(id));
+                let key = TuiEvent::Key(KeyCode::Backspace.into());
+                boxed_future!(app.handle_tui_event(&mut tui, &mut server, key)).await?;
+                assert_eq!(app.chat_widget.composer_text_with_pending(), "unsent draf");
+                assert_eq!(
+                    app.chat_widget.queued_user_message_texts(),
+                    ["queued prompt"]
+                );
+                let select = app.select_agent_thread(&mut tui, &mut server, side);
+                drive_automatic_recovery(select, &mut commands).await?;
+            }
+            ack.send(Ok(())).unwrap();
+            let mut attempt = app.reconnect.cloud_resume.take().unwrap();
+            let outcome = (&mut attempt.task).await?;
+            drive_automatic_recovery(
+                app.finish_cloud_resume(&mut tui, &mut server, attempt, outcome),
+                &mut commands,
+            )
+            .await?;
+            true
+        } else {
+            false
+        };
+        tokio::time::resume();
+        let must_reopen = !matches!(case, Unchanged | SwitchThread | Changed | DelayedHistory);
+        assert!(app.reconnect.cloud_resume.is_none());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(installed, !must_reopen);
+        assert_eq!(app.chat_widget.thread_stream_disconnected, must_reopen);
+        let app_events: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let dispatched = app_events
+            .iter()
+            .filter(|event| matches!(event, AppEvent::CodexOp(Op::UserTurn { .. })))
+            .count();
+        let submitted = std::iter::from_fn(|| ops.try_recv().ok())
+            .filter(|op| matches!(op, Op::UserTurn { .. }))
+            .count()
+            + dispatched;
+        assert_eq!(
+            submitted,
+            usize::from(!must_reopen && destination.is_none())
+        );
+        if let Some(side) = destination {
+            assert_eq!(app.current_displayed_thread_id(), Some(side));
+            assert_eq!(app.chat_widget.thread_id(), Some(side));
+            continue;
+        }
+        assert_eq!(app.chat_widget.composer_text_with_pending(), "unsent draft");
+        if must_reopen {
+            let rendered = app_events
+                .into_iter()
+                .filter_map(|event| match event {
+                    AppEvent::InsertHistoryCell(cell) => {
+                        Some(lines_to_single_string(&cell.display_lines(/*width*/ 120)))
+                    }
+                    _ => None,
+                })
+                .last()
+                .unwrap();
+            insta::allow_duplicates! {
+                match case {
+                    InvalidRequest => insta::assert_snapshot!(rendered, @"■ Recovery history request was rejected"),
+                    SignInChanged | GenericServer => insta::assert_snapshot!(rendered, @"■ Your cloud sign-in changed or expired. Sign in again to access this conversation."),
+                    NetworkBlocked => insta::assert_snapshot!(rendered, @"■ The current network policy blocks cloud reconnection."),
+                    RepeatedCursor | PersistentEmpty | ScanLimit => insta::assert_snapshot!(rendered, @"■ Cloud conversation history is unavailable. Sending is paused and your draft is saved here."),
+                    Unchanged | SwitchThread | Changed | DelayedHistory => unreachable!(),
+                }
+            }
+        }
+        let store = app.ensure_thread_channel(id).store.lock().await;
+        if case == Changed {
+            assert_eq!(store.turns.len(), 1);
+            assert_eq!(store.turns[0].id, "missed");
+        } else {
+            assert_eq!(store.turns, saved_turns);
+        }
+    }
     Ok(())
 }
 
@@ -391,17 +730,23 @@ async fn cloud_resume_picker_reconciles_admitted_steers() -> Result<()> {
         TurnStatus::InProgress,
         vec![
             commentary.clone(),
+            agent_item("blank-item", "", None),
             agent_item("live-item", "Partial response", None),
+            agent_item("late-directive", "::git-pu", None),
+            agent_item("directive-item", "::git-st", None),
         ],
     );
     ongoing_turn.items[0].completed_at_ms = Some(1);
+    ongoing_turn.items[1].started_at_ms = Some(1);
+    ongoing_turn.items[3].started_at_ms = Some(1);
+    ongoing_turn.items[4].started_at_ms = Some(1);
     let mut original_thread = overview_thread(
         original,
         /*parent_thread_id*/ None,
         "Original",
         ThreadStatus::Idle,
     );
-    original_thread.cwd = app.config.cwd.clone();
+    original_thread.cwd = app.config.cwd.clone().into();
     original_thread.turns = vec![test_turn(
         turn_id,
         TurnStatus::Completed,
@@ -415,7 +760,7 @@ async fn cloud_resume_picker_reconciles_admitted_steers() -> Result<()> {
             active_flags: Vec::new(),
         },
     );
-    other_thread.cwd = app.config.cwd.clone();
+    other_thread.cwd = app.config.cwd.clone().into();
     other_thread.turns = vec![ongoing_turn];
 
     let (client, mut commands, _server_events) =
@@ -570,6 +915,14 @@ async fn cloud_resume_picker_reconciles_admitted_steers() -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let rendered_transcript = |app: &App| {
+        app.transcript_cells
+            .iter()
+            .flat_map(|cell| cell.display_lines(/*width*/ 80))
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let mut tui = crate::tui::test_support::make_test_tui()?;
     while events.try_recv().is_ok() {}
     for thread_id in [other, original] {
@@ -592,8 +945,68 @@ async fn cloud_resume_picker_reconciles_admitted_steers() -> Result<()> {
             • Commentary response
             • Partial response
             ");
+            assert!(rendered_transcript(&app).contains("::git-st"));
+            assert_eq!(app.chat_widget.last_agent_markdown_text(), Some("::git-st"));
+            let directive = agent_item("directive-item", r#"::git-stage{cwd="/repo"}"#, None);
+            for notification in [
+                agent_message_delta_notification(other, ongoing, "directive-item", "age"),
+                completed(other, ongoing, directive.clone()),
+            ] {
+                app.enqueue_thread_notification(other, notification).await?;
+                let event = app.active_thread_rx_mut().unwrap().recv().await.unwrap();
+                app.handle_thread_event_now(event);
+            }
+            drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
+            assert!(!rendered_transcript(&app).contains("::git-st"));
+            assert!(app.transcript_cells.iter().all(|cell| {
+                !cell
+                    .copy_source()
+                    .is_some_and(|source| source.contains("::git-st"))
+            }));
+            assert_eq!(app.chat_widget.last_agent_markdown_text(), Some("::git-pu"));
+            let mut view = crate::transcript_view::TranscriptView::default();
+            let area = ratatui::layout::Rect::new(0, 0, 80, 20);
+            view.render(
+                area,
+                &mut ratatui::buffer::Buffer::empty(area),
+                &app.transcript_cells,
+            );
+            assert!(view.begin_copy_mode(&app.transcript_cells, /*guard*/ None));
+            let selection = view.selected_text(&app.transcript_cells).unwrap();
+            let mut copied = String::new();
+            view.copy_selected_text_with(
+                &app.transcript_cells,
+                &selection,
+                /*clear_selection*/ false,
+                |text, _| {
+                    copied = text.to_owned();
+                    Ok(crate::clipboard_copy::CopyStatus::Confirmed)
+                },
+            )
+            .unwrap();
+            assert_eq!(copied, "::git-pu");
             for notification in [
                 agent_message_delta_notification(other, ongoing, "live-item", "Live response "),
+                agent_message_delta_notification(other, ongoing, "late-directive", "sh"),
+                completed(
+                    other,
+                    ongoing,
+                    agent_item(
+                        "late-directive",
+                        r#"::git-push{cwd="/repo" branch="feat"}"#,
+                        None,
+                    ),
+                ),
+            ] {
+                app.enqueue_thread_notification(other, notification).await?;
+                let event = app.active_thread_rx_mut().unwrap().recv().await.unwrap();
+                app.handle_thread_event_now(event);
+            }
+            drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
+            let intermediate = rendered_transcript(&app);
+            assert!(intermediate.contains("Live response"));
+            assert!(!intermediate.contains("::git-pu"));
+            for notification in [
                 agent_message_delta_notification(
                     other,
                     ongoing,
@@ -602,18 +1015,61 @@ async fn cloud_resume_picker_reconciles_admitted_steers() -> Result<()> {
                 ),
                 completed(other, ongoing, commentary.clone()),
                 agent_message_delta_notification(other, ongoing, "live-item", "continues"),
+                completed(
+                    other,
+                    ongoing,
+                    agent_item("live-item", "Canonical final response", None),
+                ),
+                completed(
+                    other,
+                    ongoing,
+                    agent_item("live-item", "Canonical final response", None),
+                ),
+                completed(other, ongoing, directive),
+                agent_message_delta_notification(other, ongoing, "blank-item", "Earlier "),
+                completed(
+                    other,
+                    ongoing,
+                    agent_item("blank-item", "Earlier final response", None),
+                ),
                 turn_completed_notification(other, ongoing, TurnStatus::Completed),
             ] {
                 app.enqueue_thread_notification(other, notification).await?;
-                let event = app.active_thread_rx.as_mut().unwrap().recv().await.unwrap();
+                let event = app.active_thread_rx_mut().unwrap().recv().await.unwrap();
                 app.handle_thread_event_now(event);
             }
             drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
-            insta::assert_snapshot!(rendered_responses(&app), @"
+            let live_responses = rendered_responses(&app);
+            let live_transcript = rendered_transcript(&app);
+            assert!(!live_transcript.contains("::git-st"));
+            assert!(!live_transcript.contains("::git-pu"));
+            assert_eq!(
+                app.chat_widget.last_agent_markdown_text(),
+                Some("Canonical final response")
+            );
+            insta::assert_snapshot!(&live_responses, @"
             • Commentary response
-            • Partial response
-            • Live response continues
+            • Earlier final response
+            • Canonical final response
             ");
+            let channel = app.ensure_thread_channel(other);
+            let snapshot = channel.store.lock().await.snapshot();
+            app.render_thread_snapshot(
+                &mut tui,
+                &mut server,
+                other,
+                snapshot,
+                /*resume_restored_queue*/ false,
+            )
+            .await?;
+            drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
+            assert_eq!(rendered_responses(&app), live_responses);
+            assert!(!rendered_transcript(&app).contains("::git-st"));
+            assert!(!rendered_transcript(&app).contains("::git-pu"));
+            assert_eq!(
+                app.chat_widget.last_agent_markdown_text(),
+                Some("Canonical final response")
+            );
         }
     }
 
@@ -679,7 +1135,7 @@ async fn cloud_resume_picker_reconciles_admitted_steers() -> Result<()> {
     ] {
         app.enqueue_thread_notification(original, notification)
             .await?;
-        let event = app.active_thread_rx.as_mut().unwrap().recv().await.unwrap();
+        let event = app.active_thread_rx_mut().unwrap().recv().await.unwrap();
         app.handle_thread_event_now(event);
     }
     drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
@@ -996,6 +1452,7 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
     let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
     model.model = app.chat_widget.current_model().to_string();
     model.available_access_programs = Some(ModelAccessPrograms {
+        daybreak_availability: Default::default(),
         cyber: vec![
             CyberAccessProgram::Standard,
             CyberAccessProgram::DaybreakBlue,
@@ -1004,6 +1461,7 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
     let mut unsupported_model = model.clone();
     unsupported_model.model = "standard-only".into();
     unsupported_model.available_access_programs = Some(ModelAccessPrograms {
+        daybreak_availability: Default::default(),
         cyber: vec![CyberAccessProgram::Standard],
     });
     app.chat_widget
@@ -1092,14 +1550,17 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
     app.chat_widget.set_daybreak_enabled(/*enabled*/ true);
     app.chat_widget
         .set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ false);
-    let mut models = app.chat_widget.model_catalog().models.clone();
+    let mut models = app.chat_widget.model_catalog().models().to_vec();
     for (name, cyber) in [
         ("red", vec![CyberAccessProgram::DaybreakRed]),
         ("empty", vec![]),
     ] {
         models.push(ModelPreset {
             model: name.into(),
-            available_access_programs: Some(ModelAccessPrograms { cyber }),
+            available_access_programs: Some(ModelAccessPrograms {
+                cyber,
+                daybreak_availability: Default::default(),
+            }),
             ..models[0].clone()
         });
     }
@@ -1962,6 +2423,141 @@ async fn make_history_test_app() -> Result<(Box<App>, tempfile::TempDir)> {
 }
 
 #[tokio::test]
+async fn approve_for_me_updates_only_the_initially_resumed_thread() -> Result<()> {
+    use crate::resume_permissions::ResumePermissions;
+
+    let (mut app, _home) = make_history_test_app().await?;
+    let home = app.config.codex_home.clone();
+    let cwd = app.config.cwd.clone();
+    let requirements = home.join("requirements.toml");
+    let loader = LoaderOverrides {
+        system_requirements_path: Some(requirements.to_path_buf()),
+        ..LoaderOverrides::without_managed_config_for_tests()
+    };
+    let extra = home.join("extra");
+    std::fs::create_dir_all(extra.join(".git"))?;
+    app_test_support::MockResponsesConfig::new("http://127.0.0.1:9")
+        .with_root_config("project_doc_max_bytes = 0")
+        .with_extra_config(&format!(
+            "[windows]\nsandbox = 'elevated'\n[sandbox_workspace_write]\nwritable_roots = ['{}']",
+            extra.display()
+        ))
+        .write(&home)?;
+    app.config = app.rebuild_config_for_cwd(cwd.to_path_buf()).await?;
+    let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let first = create_history_rollout(&app.config, ThreadHistoryMode::Legacy, "first")?;
+    let local = app.local_settings.clone();
+    let model = app.resume_model_settings();
+    let loaded = server
+        .resume_thread(&local, app.config.clone(), first, model)
+        .await?;
+    let permissions = |s: &ThreadSessionState| {
+        (
+            s.approval_policy,
+            s.approvals_reviewer,
+            s.permission_profile
+                .legacy_sandbox_policy_label(cwd.as_path()),
+        )
+    };
+    let defaults = permissions(&loaded.session);
+
+    let mut preset = codex_utils_cli::CliConfigOverrides::default();
+    codex_utils_cli::SharedCliOptions {
+        auto_review: true,
+        ..Default::default()
+    }
+    .take_auto_review_config_overrides(&mut preset);
+    let builder = crate::legacy_core::config::ConfigBuilder::default()
+        .codex_home(home.to_path_buf())
+        .fallback_cwd(Some(cwd.to_path_buf()))
+        .loader_overrides(loader.clone())
+        .cli_overrides(preset.parse_overrides().unwrap());
+    let overrides = ResumePermissions::PRESET;
+    let resume = async |server: &mut AppServerSession, config| {
+        server
+            .resume_thread_with_permission_overrides(&local, config, first, model, overrides)
+            .await
+    };
+
+    // Loaded threads need a settings update, not just resume overrides.
+    let scoped = builder.clone().build().await?;
+    let other_workspace = builder
+        .clone()
+        .harness_overrides(crate::legacy_core::config::ConfigOverrides {
+            default_permissions: Some(":workspace".into()),
+            additional_writable_roots: vec![extra.to_path_buf(), home.to_path_buf()],
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    assert!(resume(&mut server, other_workspace).await.is_err());
+    server.thread_settings_update_supported = false;
+    assert!(resume(&mut server, scoped.clone()).await.is_err());
+    server.thread_settings_update_supported = true;
+    let resumed = resume(&mut server, scoped).await?;
+    assert_eq!(
+        permissions(&resumed.session),
+        (
+            AskForApproval::OnRequest,
+            ApprovalsReviewer::AutoReview,
+            "workspace-write"
+        )
+    );
+    app.enqueue_primary_thread_session(resumed.session, resumed.turns)
+        .await?;
+
+    // Neither restriction is visible in the loaded thread's sandbox summary.
+    for rule in [
+        "[permissions.network]\ndenied_domains = ['blocked.test']",
+        "[permissions.filesystem]\ndeny_read = ['private']",
+    ] {
+        std::fs::write(&requirements, rule)?;
+        let restricted = builder.clone().build().await?;
+        assert!(resume(&mut server, restricted).await.is_err(), "{rule}");
+    }
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.start_fresh_session(
+        &mut tui,
+        &mut server,
+        FreshSessionStart::PreserveCurrentView(None),
+        /*initial_user_message*/ None,
+        /*new_thread_name*/ None,
+    )
+    .await;
+    let fresh = app.primary_session_configured.as_ref().unwrap();
+    assert_eq!(permissions(fresh), defaults);
+    let other = create_history_rollout(&app.config, ThreadHistoryMode::Legacy, "other")?;
+    let other = server
+        .resume_thread(&local, app.config.clone(), other, model)
+        .await?;
+    assert_eq!(permissions(&other.session), defaults);
+    server.shutdown().await?;
+
+    // A cold load applies the read denial. Inspect the live policy, not the wire summary.
+    #[cfg(unix)]
+    {
+        let mut server = Box::pin(crate::start_app_server_for_picker(
+            crate::backend_id::BackendId::new(),
+            &app.config,
+            &crate::AppServerTarget::Embedded,
+            Vec::new(),
+            loader,
+            /*state_db*/ None,
+            Arc::new(EnvironmentManager::default_for_tests()),
+        ))
+        .await?;
+        resume(&mut server, builder.build().await?).await?;
+        let live = server.model_preview_permissions(first).await?.unwrap();
+        let policy = live.profile.file_system_sandbox_policy();
+        assert!(!policy.can_read_local_path_with_cwd(&home.join("private"), cwd.as_path()));
+        assert!(policy.can_read_local_path_with_cwd(&home.join("public"), cwd.as_path()));
+        server.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn first_prompt_counts_once_before_and_after_resume() -> Result<()> {
     use crate::app::session_lifecycle::ThreadAttachPresentation::Fresh;
     use crate::app::session_lifecycle::ThreadAttachPresentation::SessionLineage;
@@ -2001,8 +2597,7 @@ async fn first_prompt_counts_once_before_and_after_resume() -> Result<()> {
         )
         .await?;
         drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
-        app.chat_widget
-            .set_feature_enabled(Feature::TuiExtensionsStatusLine, mode == "builtin");
+        app.chat_widget.statusline_feature_enabled = mode == "builtin";
         for text in ["first prompt", "follow-up"] {
             let sent = responses::mount_sse_once(&model, responses::sse_completed("ok")).await;
             app.chat_widget.apply_external_edit(text.into());
@@ -2210,7 +2805,7 @@ async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
             app.chat_widget.composer_text_with_pending(),
             "Retained on failure"
         );
-        assert!(!app.chat_widget.has_active_view());
+        assert!(!app.agents_overview_has_focus());
 
         let resumed = server
             .resume_thread(
@@ -2230,6 +2825,7 @@ async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
             .fork_side_thread(
                 &app.local_settings,
                 side_config.clone(),
+                /*workspace_roots*/ None,
                 thread_id,
                 /*selected_profile*/ None,
                 crate::app_server_session::SideChatStorage::Temporary,
@@ -2248,6 +2844,7 @@ async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
                 .fork_side_thread(
                     &app.local_settings,
                     side_config,
+                    /*workspace_roots*/ None,
                     thread_id,
                     /*selected_profile*/ None,
                     crate::app_server_session::SideChatStorage::Temporary,
@@ -2261,7 +2858,7 @@ async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
         );
         assert_eq!(app.active_thread_id, Some(thread_id));
         assert!(app.side_threads.contains_key(&side_id));
-        assert!(!app.chat_widget.has_active_view());
+        assert!(!app.agents_overview_has_focus());
         assert_eq!(recorded_params(&requests, "thread/delete").len(), 1);
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
         app.app_event_tx = AppEventSender::new(tx);
@@ -2302,7 +2899,7 @@ async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
             (None, None, None)
         );
         assert!(app.chat_widget.composer_is_empty());
-        assert!(app.chat_widget.has_active_view());
+        assert!(app.agents_overview_has_focus());
         assert_eq!(
             recorded_params(&requests, "thread/delete"),
             vec![
@@ -2438,12 +3035,12 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
         .await?;
     let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
 
-    crate::task_mentions::spawn_search(
-        restarted_app_server.request_handle(),
+    let handle = restarted_app_server.request_handle();
+    restarted_app_server.task_search.spawn(
+        handle,
         "bbd".to_string(),
         startup.session.thread_id,
         app.config.cwd.to_path_buf(),
-        restarted_app_server.task_search_generation(),
         crate::app_event_sender::AppEventSender::new(sender),
     );
 
@@ -2474,7 +3071,7 @@ async fn embedded_archive_completes_after_opening_command_center() -> Result<()>
     let (_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     app.active_thread_id = Some(thread_id);
     Box::pin(app.archive_current_thread(&mut tui, &mut server)).await?;
-    assert!(app.chat_widget.active_view_is(AGENTS_OVERVIEW_VIEW_ID));
+    assert!(app.agents_overview_has_focus());
     assert_matches!(
         app.saved_openings.next_event(&mut events).await,
         Some(AppEvent::ArchiveFinished { thread_id: id, result: Ok(()), .. }) if id == thread_id
@@ -2542,7 +3139,7 @@ async fn archive_opens_command_center_before_the_server_replies() -> Result<()> 
                 .expect("the confirmation must not wait for the archive RPC")?,
             AppRunControl::Continue
         );
-        assert!(app.chat_widget.active_view_is(AGENTS_OVERVIEW_VIEW_ID));
+        assert!(app.agents_overview_has_focus());
         assert_eq!(app.current_displayed_thread_id(), None);
         assert_eq!(app.agents_overview.visible_thread_ids, [other_id]);
         assert_eq!(
@@ -2617,6 +3214,15 @@ async fn archive_opens_command_center_before_the_server_replies() -> Result<()> 
 
 #[tokio::test]
 async fn archive_shows_progress_and_keeps_the_session_when_side_chat_cleanup_fails() -> Result<()> {
+    archive_progress_scenario(/*owned_screen*/ false).await
+}
+
+#[tokio::test]
+async fn fullscreen_archive_progress_handles_terminal_shrink() -> Result<()> {
+    archive_progress_scenario(/*owned_screen*/ true).await
+}
+
+async fn archive_progress_scenario(owned_screen: bool) -> Result<()> {
     use codex_app_server_client::AppServerClient;
     use codex_app_server_client::CloudClient;
     use codex_app_server_client::CloudOperation;
@@ -2641,6 +3247,11 @@ async fn archive_shows_progress_and_keeps_the_session_when_side_chat_cleanup_fai
     app.side_threads
         .insert(side_id, SideThreadState::new(thread_id));
     let mut tui = crate::tui::test_support::make_test_tui()?;
+    if owned_screen {
+        tui.set_owned_screen(/*owned*/ true)?;
+        tui.terminal
+            .resize(Size::new(/*width*/ 80, /*height*/ 37))?;
+    }
 
     let mut archive =
         Box::pin(app.handle_event(&mut tui, &mut server, AppEvent::ArchiveCurrentThread));
@@ -2692,6 +3303,9 @@ async fn archive_shows_progress_and_keeps_the_session_when_side_chat_cleanup_fai
         "Unsent draft"
     );
     assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("Archiving"));
+    if owned_screen {
+        tui.set_owned_screen(/*owned*/ false)?;
+    }
     Ok(())
 }
 
@@ -2742,6 +3356,7 @@ async fn archive_current_thread_returns_to_agents() -> Result<()> {
                 .fork_side_thread(
                     &app.local_settings,
                     side_config,
+                    /*workspace_roots*/ None,
                     thread_id,
                     /*selected_profile*/ None,
                     crate::app_server_session::SideChatStorage::Temporary,
@@ -2820,13 +3435,7 @@ async fn archive_current_thread_returns_to_agents() -> Result<()> {
             recorded_params(&requests, "thread/archive"),
             vec![serde_json::json!({"threadId": thread_id.to_string()})]
         );
-        assert!(
-            app.chat_widget
-                .selected_index_for_present_view(
-                    crate::app::agents_overview::AGENTS_OVERVIEW_VIEW_ID
-                )
-                .is_some()
-        );
+        assert!(app.agents_overview_has_focus());
         server.shutdown().await?;
         proxy.await??;
     }
@@ -2859,6 +3468,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
     .await?;
     Box::pin(app_server.start_dynamic_tool_mcp(
         app.config.clone(),
+        /*workspace_enabled*/ false,
         app.app_event_tx.clone(),
         app.dynamic_tool_status_updates.clone(),
     ))
@@ -3180,6 +3790,7 @@ async fn local_mcp_respects_configured_servers_and_managed_requirements() -> Res
         let result = app_server
             .start_dynamic_tool_mcp(
                 app.config.clone(),
+                /*workspace_enabled*/ false,
                 app.app_event_tx.clone(),
                 app.dynamic_tool_status_updates.clone(),
             )
@@ -3357,6 +3968,7 @@ async fn check_dynamic_tool_requests(
     for model in &mut catalog.models {
         model.available_access_programs =
             Some(codex_protocol::openai_models::ModelAccessPrograms {
+                daybreak_availability: Default::default(),
                 cyber: vec![codex_protocol::turn_input::CyberAccessProgram::DaybreakBlue],
             });
     }
@@ -4692,6 +5304,7 @@ async fn paginated_workflows_never_request_full_thread_history() -> Result<()> {
     Box::pin(app_server.fork_side_thread(
         &crate::local_settings::LocalSettings::from(&side_config),
         side_config,
+        /*workspace_roots*/ None,
         paginated_thread_id,
         /*selected_profile*/ None,
         crate::app_server_session::SideChatStorage::Temporary,
@@ -5677,19 +6290,26 @@ terminal_visualization_instructions = true
 
 #[test]
 fn changing_directory_preserves_project_trust_permissions_history_and_hooks() -> Result<()> {
+    run_embedded_tui_scenario("tui-change-directory", change_directory_scenario)
+}
+
+fn run_embedded_tui_scenario(
+    name: &str,
+    scenario: impl AsyncFnOnce() -> Result<()> + Send + 'static,
+) -> Result<()> {
     // The TUI and embedded app-server load full configurations on the same test thread.
     const TEST_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
     std::thread::Builder::new()
-        .name("tui-change-directory".into())
+        .name(name.to_owned())
         .stack_size(TEST_STACK_SIZE_BYTES)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(boxed_future!(change_directory_scenario()))
+                .block_on(boxed_future!(scenario()))
         })?
         .join()
-        .expect("directory change test thread panicked")
+        .expect("embedded TUI test thread panicked")
 }
 
 async fn change_directory_scenario() -> Result<()> {
@@ -5982,18 +6602,22 @@ async fn change_directory_scenario() -> Result<()> {
     let earlier_skills_requests = recorded_params(&requests, "skills/list");
     app.submit_active_thread_op(
         &mut server,
-        AppCommand::list_skills(vec![current.clone()], /*force_reload*/ true),
+        AppCommand::list_skills(current.clone().abs().into(), /*force_reload*/ true),
     )
     .await?;
     assert_eq!(
         recorded_params(&requests, "skills/list"),
         earlier_skills_requests
     );
-    let (cwd, result) = (current.clone(), Err("stale skills".into()));
+    let (cwd, result) = (current.clone().abs().into(), Err("stale skills".into()));
     let skills = AppEvent::SkillsListLoaded { cwd, result };
     let (cwd, plugins) = (current.clone(), Some(vec![]));
     let plugins = AppEvent::PluginMentionsLoaded { cwd, plugins };
-    let diff = AppEvent::DiffResult(current.clone(), "stale diff".to_string());
+    let diff = AppEvent::DiffResult {
+        thread_id: Some(original),
+        cwd: current.clone().abs().into(),
+        text: "stale diff".to_string(),
+    };
     let branch = AppEvent::SyncThreadGitBranch {
         thread_id: original,
         branch: "stale".to_string(),
@@ -6034,7 +6658,7 @@ async fn change_directory_scenario() -> Result<()> {
     let found = |id: ThreadId| removed.iter().any(|p| p["threadId"] == id.to_string());
     assert!([original, child].into_iter().all(found));
     let retained = server.thread_read(original, /*include_turns*/ false);
-    assert_eq!(retained.await?.cwd, current.abs().canonicalize()?);
+    assert_eq!(retained.await?.cwd, current.abs().canonicalize()?.into());
     assert_eq!(app.chat_widget.config_ref().cwd, trusted.clone().abs());
     assert!(render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("SessionStart"));
     app.chat_widget
@@ -6665,6 +7289,7 @@ async fn external_writer_escape_preserves_snapshot_and_explicit_quits() -> Resul
         AppServerTarget::Remote { endpoint },
     ] {
         let (mut app, _codex_home) = make_history_test_app().await?;
+        crate::app::test_support::use_modal_agents_overview(&mut app);
         let thread_id =
             create_history_rollout(&app.config, ThreadHistoryMode::Legacy, "owned elsewhere")?;
         let (mut server, requests, proxy) = start_recording_app_server(

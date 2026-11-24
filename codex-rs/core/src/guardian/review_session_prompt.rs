@@ -49,7 +49,7 @@ pub(super) async fn build_guardian_prompt_items(
             .executed_tool_calls
             .exec_output_matches(output, selected_tool_names)
     };
-    let collected = collect_guardian_prompt_items_with_parent_turn(
+    let mut collected = collect_guardian_prompt_items_with_parent_turn(
         params.parent_session.as_ref(),
         history,
         Some(&params.parent_context),
@@ -59,6 +59,7 @@ pub(super) async fn build_guardian_prompt_items(
         reviewed_node_repl_evidence_sequence,
     )
     .await?;
+    collected.profile.transcript_format = params.spawn_config.guardian_transcript_mode;
     let context_window = model_info.resolved_context_window().map(|supported| {
         params
             .spawn_config
@@ -92,7 +93,7 @@ pub(super) async fn build_guardian_prompt_items(
         &collected.session_id,
         collected.node_repl_evidence_sequence,
         codex_guardian_context::SyncPreparation {
-            budgeting: params.spawn_config.guardian_context_budgeting(),
+            elastic: params.spawn_config.guardian_sync_elastic_budget.as_ref(),
             reviewer_history: reviewer_history.annotated_items(),
             context_window,
             history_tokens,

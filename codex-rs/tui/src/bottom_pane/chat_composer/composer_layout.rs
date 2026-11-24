@@ -327,7 +327,7 @@ impl ChatComposer {
         let find_active = options
             .footer
             .is_some_and(|footer| footer.cursor_column.is_some());
-        let footer = FooterLayout::new(
+        let mut footer = FooterLayout::new(
             workspace_height,
             self.footer_hint_height(footer_width, options),
             /*priority_hint_rows*/ if find_active { 2 } else { 1 },
@@ -338,7 +338,7 @@ impl ChatComposer {
                 .footer_image_rows
                 .is_none_or(|(top, bottom)| y < top || y >= bottom)
         });
-        let status_width = if footer.wanted_hints == 0
+        let mut status_width = if footer.wanted_hints == 0
             && options.full_width_footer
             && status_row_is_clear
             && self.status_surface_height(footer.status_bounds(full_width, available), options) == 1
@@ -347,7 +347,7 @@ impl ChatComposer {
         } else {
             width
         };
-        let wanted_status =
+        let mut wanted_status =
             self.status_surface_height(footer.status_bounds(status_width, available), options);
         let basic = (footer.reserved_hints + wanted_status.min(1)).min(2);
         let above_input = above_input.min(available.saturating_sub(basic));
@@ -359,6 +359,39 @@ impl ChatComposer {
             available -= thumbnails;
         } else {
             thumbnails = 0;
+        }
+        let hints_before_reserve = footer.wanted_hints;
+        if self.footer.status_line_enabled
+            && footer.wanted_hints == 0
+            && wanted_status > 0
+            && wanted_status < footer.cap.min(available)
+            && self.attachments.is_empty()
+            && !options.is_dialog_backdrop
+            && self.passive_hints(options).is_some()
+        {
+            footer.wanted_hints = 1;
+        }
+        // The reserved hint row becomes the final row, so a full-width status line above it
+        // would meet the image unless a screen-bottom image ends elsewhere.
+        let status_stays_clear = options.footer_image_rows.is_some_and(|(top, bottom)| {
+            bottom_y.is_none_or(|bottom_y| {
+                let y = bottom_y.saturating_sub(2);
+                y < top || y >= bottom
+            })
+        });
+        if footer.wanted_hints != hints_before_reserve
+            && status_width != width
+            && !status_stays_clear
+        {
+            let protected_status =
+                self.status_surface_height(footer.status_bounds(width, available), options);
+            if protected_status < footer.cap.min(available) {
+                status_width = width;
+                wanted_status = protected_status;
+            } else {
+                // Without room for both, keep the single full-width row on the clear final row.
+                footer.wanted_hints = hints_before_reserve;
+            }
         }
         ComposerRows {
             input: input_height,

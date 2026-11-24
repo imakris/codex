@@ -6,6 +6,7 @@ use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use codex_code_mode_protocol::CodeModeOutputTruncation;
+use codex_code_mode_protocol::CodeModeToolResult;
 use codex_code_mode_protocol::host::BOUNDED_OUTPUT_MAX_IMAGE_BYTES;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
@@ -33,7 +34,7 @@ impl CellHost for TestHost {
         &self,
         _invocation: CellToolCall,
         _cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String> {
+    ) -> Result<CodeModeToolResult, String> {
         Err("unexpected tool call".to_string())
     }
 
@@ -67,7 +68,7 @@ impl CellHost for RecordingHost {
         &self,
         _invocation: CellToolCall,
         _cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String> {
+    ) -> Result<CodeModeToolResult, String> {
         Err("unexpected tool call".to_string())
     }
 
@@ -135,6 +136,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
         CellRequest {
             tool_call_id: "call-1".to_string(),
             enabled_tools: Default::default(),
+            tool_preloads: &[],
             source: "await new Promise(() => {});".to_string(),
             output_truncation: CodeModeOutputTruncation::Client,
         },

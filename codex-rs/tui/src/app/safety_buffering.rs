@@ -92,7 +92,7 @@ impl App {
             && !self.side_threads.contains_key(&thread_id);
         let eligible_account = self.chat_widget.daybreak_account_eligible();
         if let Err(message) = crate::daybreak::program_for_turn(
-            &self.chat_widget.model_catalog().models,
+            self.chat_widget.model_catalog().models(),
             &model,
             eligible_account,
             daybreak_enabled,
@@ -202,6 +202,7 @@ impl App {
             .fork_thread_at(
                 &self.local_settings,
                 retry_config,
+                Some(self.chat_widget.session_workspace_roots()),
                 thread_id,
                 /*last_turn_id*/ None,
                 /*before_turn_id*/ Some(turn_id),

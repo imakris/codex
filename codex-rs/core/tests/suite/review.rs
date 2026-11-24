@@ -631,9 +631,9 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
             enabled: false,
             use_history_notes_extension: false,
             reminder_threshold_tokens: 6_144,
-            reminder_message_template: "Reminder: {n_remaining} tokens remain.".to_string(),
-            guidance_message: guidance_message.to_string(),
-            auto_compact_fallback_prompt: "Preserve the important context.".to_string(),
+            reminder_message_template: "Reminder: {n_remaining} tokens remain.".into(),
+            guidance_message: guidance_message.into(),
+            auto_compact_fallback_prompt: "Preserve the important context.".into(),
             auto_compact_fallback_buffer_tokens: 16_384,
         }
     }
@@ -834,18 +834,9 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
         review_context.approvals_reviewer,
         Some(ApprovalsReviewer::User)
     );
-    // The review delegate still starts in its own default mode, not the parent's Plan mode.
-    assert_eq!(
-        review_context.collaboration_mode,
-        Some(CollaborationMode {
-            mode: ModeKind::Default,
-            settings: Settings {
-                model: "gpt-5.4".to_string(),
-                reasoning_effort: Some(ReasoningEffort::Medium),
-                developer_instructions: None,
-            },
-        })
-    );
+    assert_eq!(review_context.collaboration_mode, None);
+    assert_eq!(review_context.model, "gpt-5.4");
+    assert_eq!(review_context.effort, Some(ReasoningEffort::Medium));
 
     let _codex_home_guard = codex_home;
     server.verify().await;

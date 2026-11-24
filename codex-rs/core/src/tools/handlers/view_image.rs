@@ -1,3 +1,4 @@
+use codex_code_mode::CodeModeToolResult;
 use codex_exec_server::GetMetadataOptions;
 use codex_exec_server::ReadFileOptions;
 use codex_protocol::items::ImageViewItem;
@@ -212,7 +213,7 @@ impl ViewImageHandler {
         }
 
         let item = TurnItem::ImageView(ImageViewItem {
-            id: call_id,
+            id: call_id.into(),
             path: path_uri,
         });
         session.emit_turn_item_started(turn.as_ref(), &item).await;
@@ -273,15 +274,16 @@ impl ToolOutput for ViewImageOutput {
         }
     }
 
-    fn code_mode_result(&self, _payload: &ToolPayload) -> serde_json::Value {
-        if self.unified_image_budget {
+    fn code_mode_result(&self, _payload: &ToolPayload) -> CodeModeToolResult {
+        let value = if self.unified_image_budget {
             serde_json::json!({ "image_url": self.image_url })
         } else {
             serde_json::json!({
                 "image_url": self.image_url,
                 "detail": self.image_detail
             })
-        }
+        };
+        CodeModeToolResult::from(value)
     }
 }
 
@@ -365,9 +367,11 @@ mod tests {
             unified_image_budget: false,
         };
 
-        let result = output.code_mode_result(&ToolPayload::Function {
-            arguments: "{}".to_string(),
-        });
+        let result = output
+            .code_mode_result(&ToolPayload::Function {
+                arguments: "{}".to_string(),
+            })
+            .into_json();
 
         assert_eq!(
             result,
@@ -413,7 +417,7 @@ mod tests {
                 turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-                call_id: "call-view-image".to_string(),
+                call_id: "call-view-image".into(),
                 tool_name: codex_tools::ToolName::plain("view_image"),
                 source: ToolCallSource::Direct,
                 native_call: None,
@@ -445,7 +449,7 @@ mod tests {
                 turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-                call_id: "call-view-image".to_string(),
+                call_id: "call-view-image".into(),
                 tool_name: codex_tools::ToolName::plain("view_image"),
                 source: ToolCallSource::Direct,
                 native_call: None,
@@ -490,7 +494,7 @@ mod tests {
                 turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-                call_id: "call-view-image".to_string(),
+                call_id: "call-view-image".into(),
                 tool_name: codex_tools::ToolName::plain("view_image"),
                 source: ToolCallSource::Direct,
                 native_call: None,
@@ -530,7 +534,7 @@ mod tests {
                 turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-                call_id: "call-view-image".to_string(),
+                call_id: "call-view-image".into(),
                 tool_name: codex_tools::ToolName::plain("view_image"),
                 source: ToolCallSource::CodeMode {
                     cell_id: "cell-1".to_string(),

@@ -50,9 +50,10 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_thread_store::PersistContext;
 
-use crate::context_manager::is_user_turn_boundary;
+use crate::context_manager::is_instruction_turn_boundary;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::mcp::RequestId as ProtocolRequestId;
+use codex_protocol::protocol::AgentStatus;
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
 use serde_json::Value;
@@ -271,11 +272,55 @@ pub async fn reload_user_config(sess: &Arc<Session>) {
 }
 
 pub async fn compact(sess: &Arc<Session>, sub_id: String) {
+    let local_reset = sess.enabled(Feature::TokenBudget);
+    // Reject invalid settings before interrupting. Ordinary turn construction
+    // validates again after teardown, when a Guardian refresh may have landed.
+    let admission = if local_reset {
+        Ok(())
+    } else {
+        let state = sess.state.lock().await;
+        let configuration = &state.session_configuration;
+        configuration.validate(&configuration.environments)
+    };
+    if let Err(error) = admission {
+        let message = format!("Cannot start /compact. {error}");
+        // Keep the active turn's status and order the notice with turn registration.
+        let active = sess.active_turn.lock().await;
+        let status = sess.agent_status.borrow();
+        let turn_in_progress = active
+            .as_ref()
+            .is_some_and(|turn| turn.task.is_some() || matches!(*status, AgentStatus::Running));
+        let msg = if turn_in_progress {
+            EventMsg::Warning(WarningEvent { message })
+        } else {
+            drop(status);
+            sess.agent_status
+                .send_replace(AgentStatus::Errored(message.clone()));
+            EventMsg::Error(ErrorEvent {
+                misalignment: None,
+                message,
+                codex_error_info: Some(CodexErrorInfo::BadRequest),
+            })
+        };
+        if let Err(error) = sess.tx_event.try_send(Event { id: sub_id, msg }) {
+            debug!(%error, "dropping compaction rejection because the event channel is closed");
+        }
+        return;
+    }
     // Stop the old turn before the compact task picks up the next turn's environments.
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
-    let turn_context = sess
-        .new_turn_with_default_settings(sub_id, Default::default())
-        .await;
+    let turn_context = if local_reset {
+        sess.new_turn_with_default_settings(sub_id, Default::default())
+            .await
+    } else {
+        let Ok((turn_context, _)) = sess
+            .new_turn_with_sub_id(sub_id, Default::default(), Default::default())
+            .await
+        else {
+            return;
+        };
+        turn_context
+    };
 
     sess.spawn_task(turn_context, Vec::new(), CompactTask).await;
 }
@@ -307,7 +352,6 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
                 misalignment: None,
                 message: err.to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
-                rejected_audio_file_ids: Vec::new(),
             }),
         };
         sess.send_event_raw(event).await;
@@ -330,8 +374,13 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
     if let Some(startup_prewarm) = startup_prewarm {
         startup_prewarm.abort().await;
     }
-    let _ = sess.conversation.shutdown().await;
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    let (conversation_shutdown, ()) = tokio::join!(
+        sess.conversation.shutdown(),
+        sess.abort_all_tasks(TurnAbortReason::Interrupted),
+    );
+    if let Err(err) = conversation_shutdown {
+        warn!("failed to shut down realtime conversation: {err}");
+    }
     if let Some(reporting) = &sess.outcome_reporting {
         reporting.handoffs.wait().await;
     }
@@ -432,8 +481,9 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
     let turn_count = history
-        .raw_items()
-        .filter(|item| is_user_turn_boundary(item))
+        .annotated_items()
+        .iter()
+        .filter(|item| is_instruction_turn_boundary(item))
         .count();
     sess.services.session_telemetry.counter(
         "codex.conversation.turn.count",
@@ -461,7 +511,6 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
                 misalignment: None,
                 message: "Failed to shutdown thread persistence".to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
-                rejected_audio_file_ids: Vec::new(),
             }),
         };
         sess.send_event_raw(event).await;
@@ -511,7 +560,6 @@ pub async fn review(
                     misalignment: None,
                     message: err.to_string(),
                     codex_error_info: Some(CodexErrorInfo::Other),
-                    rejected_audio_file_ids: Vec::new(),
                 }),
             };
             sess.send_event(&turn_context, event.msg).await;
@@ -526,6 +574,7 @@ pub(super) async fn submission_loop(
 ) {
     // Session shutdown and tree shutdown both use the existing teardown handler.
     let mut shutdown_received = false;
+    let mut admission_updates = sess.services.extensions.turn_start_admission_updates();
     let mut catalog_updates = sess.services.models_manager.model_catalog_updates();
     if let Some(updates) = &mut catalog_updates {
         // A resumed chat must also consume a catalog fetched before it was opened.
@@ -581,6 +630,25 @@ pub(super) async fn submission_loop(
                 Ok(sub) => *sub,
                 Err(_) => break,
             },
+            _ = sess.input_queue.pending_work_wake.notified() => {
+                sess.maybe_start_turn_for_pending_work().await;
+                continue;
+            }
+            update = async {
+                match &mut admission_updates {
+                    Some(updates) => updates.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if update.is_err() {
+                    admission_updates = None;
+                } else {
+                    // Recheck the normal gate: another pause or shutdown may have
+                    // begun since this notification, and mail must remain queued.
+                    sess.maybe_start_turn_for_pending_work().await;
+                }
+                continue;
+            }
             update = async {
                 match &mut mailbox {
                     Some(updates) => updates.changed().await.map(|()| *updates.borrow_and_update()),
@@ -657,7 +725,6 @@ pub(super) async fn submission_loop(
                                 misalignment: None,
                                 message: err.to_string(),
                                 codex_error_info: Some(CodexErrorInfo::Other),
-                                rejected_audio_file_ids: Vec::new(),
                             }),
                         })
                         .await;
@@ -687,17 +754,16 @@ pub(super) async fn submission_loop(
                     let _ = reply.send(result);
                     false
                 }
+                Op::RealtimeConversationEnd { realtime_session_id, reply } => {
+                    crate::realtime_conversation::handle_end(&sess, sub.id, &realtime_session_id, reply).await;
+                    false
+                }
                 Op::RealtimeConversationDetach {
                     realtime_session_id,
                     reply,
                 } => {
-                    crate::realtime_conversation::handle_detach(
-                        &sess,
-                        Some(&realtime_session_id),
-                        &sub.id,
-                    )
-                    .await;
-                    let _ = reply.send(Ok(()));
+                    crate::realtime_conversation::handle_detach(&sess, &realtime_session_id, reply)
+                        .await;
                     false
                 }
                 Op::RealtimeConversationAudio(params) => {
@@ -799,7 +865,6 @@ pub(super) async fn submission_loop(
                                         misalignment: None,
                                         message,
                                         codex_error_info: Some(CodexErrorInfo::BadRequest),
-                                        rejected_audio_file_ids: Vec::new(),
                                     }),
                                 })
                                 .await;

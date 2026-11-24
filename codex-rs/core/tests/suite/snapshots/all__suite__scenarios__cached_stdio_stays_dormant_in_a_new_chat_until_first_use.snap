@@ -13,6 +13,7 @@ Settings:
   reasoning: {"summary":"auto"}
   store: false
   stream: true
+  stream_options: {"reasoning_summary_delivery":"sequential_cutoff"}
   tool_choice: "auto"
   tools (11; hash=067d271a36f2eb01):
     - function/exec_command: Runs a command in a PTY, returning output or a session ID for ongoing interaction.; args=[cmd, justification, login, max_output_tokens, prefix_rule, sandbox_permissions, shell, tty, workdir, yield_time_ms]; hash=24f4b6739dd5d940
@@ -53,7 +54,7 @@ Settings:
 
 ## Window 2 (after request 3)
 Settings: relative to window 1
-  tools (11; hash=82d35d01519a030e):
+  tools (11; hash=b70335ec6452062c):
     ~ namespace/mcp__cached_rmcp: Use the tools from live-helper.; hash=36249b57679444b8
       - function/echo
 -- request 4 (request) --

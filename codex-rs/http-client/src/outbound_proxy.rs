@@ -262,11 +262,6 @@ impl HttpClientFactory {
         self
     }
 
-    /// Returns whether ChatGPT cookie-store clients have additional configured cookies.
-    pub fn has_chatgpt_cookies(&self) -> bool {
-        self.chatgpt_cookie_store.is_some()
-    }
-
     pub(crate) fn chatgpt_cookie_store(&self) -> Option<Arc<ChatGptCookieStore>> {
         self.chatgpt_cookie_store.clone()
     }
@@ -646,8 +641,11 @@ fn cache_system_proxy_decision(request_url: &str, decision: SystemProxyDecision)
 ///
 /// This is public only so tests in HTTP-client consumers can exercise system-proxy routing
 /// deterministically on every supported platform.
-pub fn cache_system_proxy_route_for_test(request_url: &str, proxy_url: String) {
-    cache_system_proxy_decision(request_url, SystemProxyDecision::Proxy { url: proxy_url });
+pub fn cache_system_proxy_route_for_test(request_url: &str, proxy_url: impl Into<Option<String>>) {
+    let decision = proxy_url.into().map_or(SystemProxyDecision::Direct, |url| {
+        SystemProxyDecision::Proxy { url }
+    });
+    cache_system_proxy_decision(request_url, decision);
 }
 
 fn insert_system_proxy_cache_entry(

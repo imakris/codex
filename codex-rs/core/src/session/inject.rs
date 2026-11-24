@@ -1,14 +1,57 @@
+//! Records client injections and preserves their existing active-turn delivery.
+
+use super::RealtimeRecord;
 use super::TurnInput as PendingTurnInput;
 use super::session::Session;
 use super::turn_context::TurnContext;
 use codex_features::Feature;
 use codex_history::ResponseItemEnvelope;
+use codex_protocol::AgentPath;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::MultiAgentVersion;
+use codex_thread_store::PersistContext;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+/// Native queue-only delivery accepts only ordinary plaintext agent messages.
+pub(crate) fn plaintext_agent_messages<'a>(
+    items: impl IntoIterator<Item = &'a ResponseItem>,
+) -> Option<Vec<InterAgentCommunication>> {
+    items
+        .into_iter()
+        .map(|item| {
+            let ResponseItem::AgentMessage {
+                id,
+                author,
+                recipient,
+                content,
+                internal_chat_message_metadata_passthrough,
+            } = item
+            else {
+                return None;
+            };
+            let [AgentMessageInputContent::InputText { text }] = content.as_slice() else {
+                return None;
+            };
+            Some(InterAgentCommunication {
+                id: id.clone(),
+                author: AgentPath::try_from(author.as_str()).ok()?,
+                recipient: AgentPath::try_from(recipient.as_str()).ok()?,
+                other_recipients: Vec::new(),
+                content: text.clone(),
+                encrypted_content: None,
+                internal_chat_message_metadata_passthrough:
+                    internal_chat_message_metadata_passthrough.clone(),
+                trigger_turn: false,
+            })
+        })
+        .collect()
+}
 
 /// Uploaded files need the admission checks on typed turn input before entering history.
 pub(crate) fn validate_injected_response_item(item: &ResponseItem) -> CodexResult<()> {
@@ -21,11 +64,40 @@ pub(crate) fn validate_injected_response_item(item: &ResponseItem) -> CodexResul
 }
 
 impl Session {
+    /// Seal idle input before exposing its wake to the ordinary mailbox scheduler.
+    pub(crate) async fn checkpoint_client_injection(
+        self: &Arc<Self>,
+        recorded_mail: Option<u64>,
+    ) -> std::io::Result<()> {
+        self.try_ensure_rollout_materialized(PersistContext::ThreadPreparation)
+            .await?;
+        if let Some(recorded_through) = recorded_mail.filter(|sequence| *sequence > 0)
+            && self.multi_agent_version() == Some(MultiAgentVersion::V2)
+            && !self.get_config().await.multi_agent_v2.disable_native_tools
+        {
+            {
+                let mut state = self.state.lock().await;
+                if state
+                    .session_configuration
+                    .session_source
+                    .is_non_root_agent()
+                {
+                    return Ok(());
+                }
+                state.pending_recorded_mail_sequence =
+                    state.pending_recorded_mail_sequence.max(recorded_through);
+            }
+            self.maybe_start_turn_for_pending_work().await;
+        }
+        Ok(())
+    }
+
     /// History injection can precede the first turn. Capture full initial context
     /// only when the thread has no reference context, including after compaction.
     pub(crate) async fn history_injection_context(
         self: &Arc<Self>,
     ) -> CodexResult<Arc<TurnContext>> {
+        self.conversation.check_history_recovery()?;
         if self.reference_context_item().await.is_some() {
             let turn = self.new_inject_items_context().await;
             // Compaction can clear the baseline while we build this context.
@@ -39,8 +111,7 @@ impl Session {
             let step = self
                 .capture_step_context(Arc::clone(&turn), &CancellationToken::new())
                 .await?;
-            self.record_context_updates_and_set_reference_context_item(step.as_ref())
-                .await?;
+            self.try_publish_initial_context(step.as_ref()).await?;
         }
         Ok(turn)
     }
@@ -118,6 +189,7 @@ impl Session {
     }
 
     /// Applies client developer-message retention before queueing or recording items.
+    /// Returns the recorded history sequence, or zero for input queued into an active turn.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
@@ -126,7 +198,7 @@ impl Session {
         &self,
         items: Vec<impl Into<ResponseItemEnvelope>>,
         turn_context: &TurnContext,
-    ) {
+    ) -> u64 {
         let items = items
             .into_iter()
             .map(Into::into)
@@ -143,7 +215,7 @@ impl Session {
                         .collect(),
                 )
                 .await;
-            return;
+            return 0;
         }
         let finishing = active.as_ref().and_then(|turn| turn.finishing.clone());
         drop(active);
@@ -151,7 +223,7 @@ impl Session {
             finishing.cancelled().await;
         }
         self.record_annotated_conversation_items(turn_context, turn_context.model_info(), items)
-            .await;
+            .await
     }
 
     pub(crate) fn annotate_client_response_item(
@@ -181,7 +253,7 @@ impl Session {
         turn_context: &TurnContext,
         model_info: &ModelInfo,
         items: Vec<ResponseItemEnvelope>,
-    ) {
+    ) -> u64 {
         let (annotated_items, image_preparations) = self
             .prepare_conversation_items_for_history(turn_context, model_info, items)
             .await;
@@ -191,7 +263,28 @@ impl Session {
             annotated_items,
             image_preparations,
         )
-        .await;
+        .await
+    }
+
+    pub(crate) async fn record_realtime_session_chunk(
+        &self,
+        turn: &TurnContext,
+        item: ResponseItemEnvelope,
+    ) -> std::io::Result<()> {
+        self.try_ensure_rollout_materialized(PersistContext::Standard)
+            .await?;
+        let (items, images) = self
+            .prepare_conversation_items_for_history(turn, turn.model_info(), vec![item])
+            .await;
+        self.record_prepared_items(
+            turn,
+            turn.model_info(),
+            items,
+            images,
+            Some(RealtimeRecord::Chunk),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Injects items into active work, or records them without starting a turn.

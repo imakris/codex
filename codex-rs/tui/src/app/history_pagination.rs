@@ -94,7 +94,8 @@ impl App {
                 store
                     .session
                     .as_ref()
-                    .map_or_else(|| self.config.cwd.clone(), |session| session.cwd.clone()),
+                    .map(|session| session.cwd.to_path_buf())
+                    .unwrap_or_else(|| self.config.cwd.to_path_buf()),
                 store.turns.clone(),
             )
         };
@@ -127,7 +128,7 @@ impl App {
                 pane.cells.as_slice()
             });
         let split_insertion = split_image_insertion(existing, split_turn);
-        let (cells, split_images) = self.project_older_history_cells(
+        let (mut cells, split_images) = self.project_older_history_cells(
             items,
             &turns,
             &hidden_item_ids,
@@ -136,6 +137,11 @@ impl App {
             visibility,
             split_insertion.is_some(),
         );
+        for cell in &mut cells {
+            if let Some(cell) = Arc::get_mut(cell) {
+                self.prepare_collab_history(app_server, cell);
+            }
+        }
         if let Some(pane) = self.side_companions.get_mut(&thread_id).filter(|_| parked) {
             let images = split_insertion.and_then(|index| {
                 if split_images.is_empty() {
@@ -203,7 +209,7 @@ impl App {
         turns: &[Turn],
         hidden_item_ids: &HashSet<(&str, &str)>,
         thread_id: ThreadId,
-        cwd: &AbsolutePathBuf,
+        cwd: &std::path::Path,
         visibility: RawReasoningVisibility,
     ) {
         if hidden_item_ids.is_empty() {
@@ -289,25 +295,71 @@ impl App {
         turns: &[Turn],
         hidden_item_ids: &HashSet<(&str, &str)>,
         thread_id: ThreadId,
-        cwd: &AbsolutePathBuf,
+        cwd: &std::path::Path,
         visibility: RawReasoningVisibility,
         relocate_split_images: bool,
     ) -> (TranscriptCells, TranscriptCells) {
+        let cloud = matches!(self.app_server_target, AppServerTarget::Cloud)
+            && self.chat_widget.thread_id() == Some(thread_id);
+        let mut unfinished = HashSet::new();
+        if cloud {
+            for (turn_id, item) in items.iter().rev().filter(|(turn, item)| {
+                matches!(item, ThreadItemPayload::AgentMessage { .. })
+                    && !hidden_item_ids.contains(&(turn.as_str(), item.id()))
+            }) {
+                if let Some(turn) = turns.iter().find(|turn| turn.id == *turn_id)
+                    && let Some(entry) = turn.items.iter().find(|entry| entry.id() == item.id())
+                    && let Some(key) =
+                        self.chat_widget
+                            .remember_older_cloud_reply(turn_id, entry, &turn.status)
+                {
+                    unfinished.insert(key);
+                }
+            }
+        }
         let mut cells = Vec::new();
         let mut split_images = Vec::new();
+        let project = |items: &[(String, ThreadItemPayload)]| {
+            thread_items_to_transcript_cells(
+                Some(thread_id),
+                cwd,
+                items.iter().map(|(_, item)| item.clone()),
+                visibility,
+                Some(&self.config),
+            )
+        };
         for (range, turn_end) in completion::group_turn_items(&items, turns) {
             let start = cells.len();
             // Internal prompts stay invisible, but still separate adjacent tool groups.
             for visible in items[range]
                 .split(|(turn_id, item)| hidden_item_ids.contains(&(turn_id.as_str(), item.id())))
             {
-                cells.extend(thread_items_to_transcript_cells(
-                    Some(thread_id),
-                    cwd,
-                    visible.iter().map(|(_, item)| item.clone()),
-                    visibility,
-                    Some(&self.config),
-                ));
+                for chunk in visible.split_inclusive(|(turn, item)| {
+                    unfinished.contains(&(turn.clone(), item.id().to_owned()))
+                }) {
+                    let anchor = chunk.last().and_then(|(turn, item)| {
+                        let key = (turn.clone(), item.id().to_owned());
+                        unfinished.get(&key).cloned()
+                    });
+                    let split = chunk.len() - usize::from(anchor.is_some());
+                    cells.extend(project(&chunk[..split]));
+                    if let Some(key) = anchor {
+                        let mut cell =
+                            project(&chunk[split..])
+                                .into_iter()
+                                .next()
+                                .unwrap_or_else(|| {
+                                    Arc::new(history_cell::PendingAgentMessageCell(key.clone()))
+                                });
+                        if let Some(markdown) = Arc::get_mut(&mut cell).and_then(|cell| {
+                            cell.as_any_mut()
+                                .downcast_mut::<history_cell::AgentMarkdownCell>()
+                        }) {
+                            markdown.interrupted_item = Some(key);
+                        }
+                        cells.push(cell);
+                    }
+                }
             }
             let Some(turn) = turn_end else {
                 if relocate_split_images {

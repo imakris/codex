@@ -1917,7 +1917,7 @@ async fn unattributed_network_request_uses_active_turn_environment_fallback(
                     })
                     .await?;
                 if history.items.iter().any(|item| {
-                    matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(event)) if event.error.is_some())
+                    matches!(item, RolloutItem::EventMsg { event: EventMsg::TurnComplete(event), .. } if event.error.is_some())
                 }) {
                     return Ok::<(), anyhow::Error>(());
                 }
@@ -3350,10 +3350,8 @@ pub(super) fn guardian_parent_catalog() -> ModelsResponse {
                     .as_mut()
                     .expect("model messages")
                     .auto_review = Some(AutoReviewMessages {
-                    policy: Some("captured policy".to_string()),
-                    policy_template: Some(
-                        "captured template: {{ tenant_policy_config }}".to_string(),
-                    ),
+                    policy: Some("captured policy".into()),
+                    policy_template: Some("captured template: {{ tenant_policy_config }}".into()),
                     node_repl_policy: None,
                     rejection_instructions: None,
                     timeout_instructions: None,

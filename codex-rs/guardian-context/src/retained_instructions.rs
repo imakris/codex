@@ -231,8 +231,7 @@ impl ComposedContext {
                 .filter(|section| section.id == "retained_user_instructions")
                 .cloned()
                 .collect(),
-            truncations: Vec::new(),
-            enclosing_call: None,
+            ..Default::default()
         }
     }
 
@@ -346,7 +345,6 @@ impl ComposedContext {
             let SectionDelivery::UserContent(items) = &mut section.delivery else {
                 continue;
             };
-            // At most sixteen retained originals are checked; no history-sized index is needed.
             items.retain(|item| {
                 let keep = item.source.as_ref().is_none_or(|source| {
                     !delivered_sources.clone().any(|delivered| {

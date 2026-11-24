@@ -33,8 +33,12 @@ use codex_plugin::PluginCapabilitySummary;
 use codex_plugin::PluginId;
 use codex_plugin::app_connector_ids_from_declarations;
 use codex_plugin::prompt_safe_plugin_description;
+use codex_plugin_archive_verification::ArchiveVerificationFailure;
+use codex_plugin_archive_verification::RemotePluginArchiveDownload;
+use codex_plugin_archive_verification::SigningKeyCache;
 use codex_runtime_agent_instance::RuntimeAuthSlot;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use futures::future::BoxFuture;
 use http::HeaderMap;
 use http::Method;
 use http::StatusCode;
@@ -117,7 +121,6 @@ const REMOTE_INSTALLED_PLUGINS_FETCH_TIMEOUT: Duration = Duration::from_secs(60)
 // Allow 20,000 installed plugins without unbounded cursor history.
 const MAX_REMOTE_INSTALLED_PLUGIN_PAGES: usize = 100;
 const RECOMMENDED_PLUGINS_TIMEOUT: Duration = Duration::from_secs(5);
-const TOOLING_STATE_TIMEOUT: Duration = Duration::from_millis(250);
 const REMOTE_PLUGIN_LIST_PAGE_LIMIT: u32 = 200;
 const MAX_RECOMMENDED_PLUGINS: usize = 50;
 const MAX_RECOMMENDED_PLUGIN_NAME_LEN: usize = 64;
@@ -158,6 +161,7 @@ pub struct RemotePluginServiceConfig {
     pub(crate) product_sku: String,
     pub(crate) http_clients: Arc<dyn HttpClientSelector>,
     pub(crate) runtime_auth: Option<(RuntimeAuthSlot, RuntimeAuthMode)>,
+    pub(crate) signing_key_cache: Arc<SigningKeyCache>,
 }
 
 impl RemotePluginServiceConfig {
@@ -187,6 +191,7 @@ impl RemotePluginServiceConfig {
             product_sku: product_sku.unwrap_or_else(|| CODEX_PRODUCT_SKU.to_string()),
             http_clients,
             runtime_auth: None,
+            signing_key_cache: Arc::default(),
         }
     }
 
@@ -226,19 +231,25 @@ impl RemotePluginServiceConfig {
         config
     }
 
+    pub(crate) async fn authenticated_request(
+        &self,
+        method: Method,
+        url: &str,
+        auth: &CodexAuth,
+    ) -> Result<RequestBuilder, codex_api::AuthError> {
+        let (request, headers) = self
+            .prepare_authenticated_request(method, url, auth)
+            .await?;
+        Ok(request.headers(headers))
+    }
+
     // Keep runtime registration out of callers' async stack frames.
-    pub(crate) fn authenticated_request<'a>(
+    fn prepare_authenticated_request<'a>(
         &'a self,
         method: Method,
         url: &'a str,
         auth: &'a CodexAuth,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<RequestBuilder, codex_api::AuthError>>
-                + Send
-                + 'a,
-        >,
-    > {
+    ) -> BoxFuture<'a, Result<(RequestBuilder, HeaderMap), codex_api::AuthError>> {
         Box::pin(async move {
             if self.runtime_auth.is_some() {
                 codex_model_provider::validate_runtime_destination(Some(&self.chatgpt_base_url))
@@ -280,7 +291,7 @@ impl RemotePluginServiceConfig {
                 None => self.http_clients.request(method, url),
             };
             let headers = resolved.auth.apply_auth_headers(HeaderMap::new()).await?;
-            Ok(request.headers(default_headers()).headers(headers))
+            Ok((request.headers(default_headers()), headers))
         })
     }
 
@@ -428,7 +439,7 @@ pub struct RemotePluginDetail {
     pub share_url: Option<String>,
     pub description: Option<String>,
     pub release_version: Option<String>,
-    pub bundle_download_url: Option<String>,
+    pub archive_download: RemotePluginArchiveDownload,
     pub app_manifest: Option<JsonValue>,
     pub skills: Vec<RemotePluginSkill>,
     pub onboarding_skill_name: Option<String>,
@@ -491,10 +502,13 @@ pub struct RecommendedPlugin {
     pub display_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum RecommendedPluginsMode {
+    #[default]
     Legacy,
-    Endpoint { plugins: Vec<RecommendedPlugin> },
+    Endpoint {
+        plugins: Vec<RecommendedPlugin>,
+    },
 }
 
 pub fn is_valid_remote_plugin_id(plugin_id: &str) -> bool {
@@ -755,8 +769,8 @@ struct RemotePluginReleaseResponse {
     version: Option<String>,
     display_name: String,
     description: String,
-    #[serde(default)]
-    bundle_download_url: Option<String>,
+    #[serde(flatten)]
+    archive_download: RemotePluginArchiveDownload,
     #[serde(default)]
     app_ids: Vec<String>,
     #[serde(default)]
@@ -903,11 +917,6 @@ struct RemotePluginInstalledItem {
 struct RemotePluginListResponse {
     plugins: Vec<RemotePluginDirectoryItem>,
     pagination: RemotePluginPagination,
-}
-
-#[derive(Deserialize)]
-struct PluginToolingStateResponse {
-    tooling_changed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1160,28 +1169,11 @@ pub fn invalidate_cached_remote_plugin_catalog_scopes(
     }
 }
 
-#[instrument(level = "trace", skip_all)]
-pub(crate) async fn fetch_tooling_changed_at(
-    config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
-) -> Result<Option<String>, RemotePluginCatalogError> {
-    let auth = ensure_chatgpt_auth(auth)?;
-    let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/ps/plugins/tooling-state/turtle");
-    let poll = async {
-        let request = authenticated_request(config, Method::GET, &url, auth).await?;
-        let response: PluginToolingStateResponse = send_and_decode(request, &url).await?;
-        Ok(response.tooling_changed_at)
-    };
-    tokio::time::timeout(TOOLING_STATE_TIMEOUT, poll)
-        .await
-        .unwrap_or_else(|_| {
-            tracing::debug!("timed out reading recommendation tooling state");
-            Ok(None)
-        })
-}
-
-#[instrument(level = "trace", skip_all)]
+#[instrument(
+    name = "plugins.recommendations.fetch_catalog",
+    level = "info",
+    skip_all
+)]
 pub async fn fetch_recommended_plugins(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
@@ -1652,7 +1644,7 @@ async fn build_remote_plugin_detail(
         share_url: plugin.share_url,
         description: non_empty_string(Some(&plugin.release.description)),
         release_version: plugin.release.version,
-        bundle_download_url: plugin.release.bundle_download_url,
+        archive_download: plugin.release.archive_download,
         app_manifest: plugin.release.app_manifest,
         skills,
         onboarding_skill_name: plugin.release.onboarding_skill_name,
@@ -2505,13 +2497,36 @@ async fn authenticated_request(
     url: &str,
     auth: &CodexAuth,
 ) -> Result<RequestBuilder, RemotePluginCatalogError> {
-    Ok(config
+    let request = config
         .authenticated_request(method, url, auth)
         .await
         .map_err(std::io::Error::other)
-        .map_err(RemotePluginCatalogError::AuthToken)?
+        .map_err(RemotePluginCatalogError::AuthToken)?;
+    Ok(with_catalog_request_options(config, request))
+}
+
+/// Pair the selected transport with the exact credentials used to scope the signing-key cache.
+pub(crate) async fn prepare_signing_key_request(
+    config: &RemotePluginServiceConfig,
+    url: String,
+    auth: Option<&CodexAuth>,
+) -> Result<(RequestBuilder, HeaderMap), ArchiveVerificationFailure> {
+    let auth = ensure_chatgpt_auth(auth)
+        .map_err(|_| ArchiveVerificationFailure::AuthenticationRequired)?;
+    let (request, headers) = config
+        .prepare_authenticated_request(Method::GET, &url, auth)
+        .await
+        .map_err(|_| ArchiveVerificationFailure::AuthenticationRequired)?;
+    Ok((with_catalog_request_options(config, request), headers))
+}
+
+fn with_catalog_request_options(
+    config: &RemotePluginServiceConfig,
+    request: RequestBuilder,
+) -> RequestBuilder {
+    request
         .timeout(REMOTE_PLUGIN_CATALOG_TIMEOUT)
-        .header(OAI_PRODUCT_SKU_HEADER, &config.product_sku))
+        .header(OAI_PRODUCT_SKU_HEADER, &config.product_sku)
 }
 
 async fn send_and_decode<T: for<'de> Deserialize<'de>>(

@@ -102,7 +102,17 @@ pub(crate) async fn run_codex_thread_interactive(
     };
     let mut thread_extension_init = codex_extension_api::ExtensionDataInit::default();
     thread_extension_init.insert(isolation);
+    if config.guardian_model_provider.is_some()
+        && Arc::ptr_eq(&auth_manager, &parent_session.services.auth_manager)
+        && let Some(context) = parent_session
+            .services
+            .thread_extension_data
+            .get::<crate::guardian::GuardianInferenceContext>()
+    {
+        thread_extension_init.insert((*context).clone());
+    }
     let spawn_result = Session::spawn(SessionSpawnArgs {
+        child_service_tier: None,
         attached_thread: false,
         startup: Some(Arc::clone(&startup)),
         config,

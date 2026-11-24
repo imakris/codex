@@ -70,6 +70,18 @@ const fn default_enabled() -> bool {
     true
 }
 
+/// Resolved per-thread settings for the standalone image generation tool.
+pub struct ImageGenerationSettings {
+    pub provider: codex_model_provider_info::ModelProviderInfo,
+    pub http_client_factory: codex_http_client::HttpClientFactory,
+    pub gif_enabled: bool,
+    pub deferred: bool,
+}
+
+impl ImageGenerationSettings {
+    pub const NAMESPACE: &str = "image_gen";
+}
+
 /// Last selected grouping in Agent Command Center.
 #[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -499,6 +511,10 @@ pub struct AppToolConfig {
     /// Approval mode for this tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<AppToolApproval>,
+
+    /// Reviewer for this tool's approval prompts, overriding link-level and app-level settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
 }
 
 /// Tool settings for a single app.
@@ -508,6 +524,15 @@ pub struct AppToolsConfig {
     /// Per-tool overrides keyed by tool name (for example `repos/list`).
     #[serde(default, flatten)]
     pub tools: HashMap<String, AppToolConfig>,
+}
+
+impl AppToolsConfig {
+    /// Match a tool by its raw name first and use its title as a fallback.
+    pub fn for_tool(&self, name: &str, title: Option<&str>) -> Option<&AppToolConfig> {
+        self.tools
+            .get(name)
+            .or_else(|| title.and_then(|title| self.tools.get(title)))
+    }
 }
 
 /// Approval settings for a connected account within an app.
@@ -1167,16 +1192,13 @@ pub struct PluginsConfigToml {
 
 impl PluginsConfigToml {
     /// Whether configuration permits a source-enabled plugin to remain active.
-    /// Without `_default`, preserve legacy source and account enablement.
-    /// Otherwise, an explicit enablement setting overrides the configured default.
+    /// Only plugins without an explicit `enabled` setting inherit `_default`.
     pub fn allows_plugin(&self, plugin_id: &str) -> bool {
-        let Some(default) = &self.default else {
-            return true;
-        };
         self.plugins
             .get(plugin_id)
             .and_then(|plugin| plugin.enabled)
-            .unwrap_or(default.enabled)
+            .or(self.default.as_ref().map(|default| default.enabled))
+            .unwrap_or(true)
     }
 }
 

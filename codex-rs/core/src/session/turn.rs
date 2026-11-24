@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -43,7 +44,11 @@ use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_response_stream_error;
 use crate::responses_retry::is_terminal_sampling_outcome;
+use crate::rollout_budget::ResponseWork;
+use crate::rollout_budget::TurnWork;
+use crate::session::InputQueueEntry;
 use crate::session::PreviousTurnSettings;
+use crate::session::SubmittedAdditionalContext;
 use crate::session::TurnInput;
 use crate::session::daemon_recovery::RecordedTurnInput;
 use crate::session::sampling_interrupt::SamplingInterrupt;
@@ -92,7 +97,6 @@ use codex_history::ResponseItemEnvelope;
 use codex_hooks::SamplingKind;
 use codex_login::CodexAuth;
 use codex_model_provider::RemoteCompactionSupport;
-use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
@@ -171,7 +175,14 @@ async fn preserve_initial_input_during<T>(
     input: &mut Vec<TurnInput>,
     prepare: impl Future<Output = T>,
 ) -> CodexResult<T> {
-    if input.is_empty() || sess.host_roster_reader(turn_context).is_none() {
+    // A context-only submission still needs Some([]) so suspension records its context.
+    if sess.host_roster_reader(turn_context).is_none()
+        || (input.is_empty()
+            && turn_context
+                .extension_data
+                .get::<SubmittedAdditionalContext>()
+                .is_none())
+    {
         return Ok(prepare.await);
     }
 
@@ -224,11 +235,12 @@ pub(crate) async fn run_turn(
     if !model_info.input_modalities.contains(&InputModality::Audio)
         && input.iter().any(turn_input_has_uploaded_audio_file)
     {
-        let result = run_hooks_and_record_inputs(
+        let result = run_hooks_and_record_input_entries(
             &sess,
             &turn_context,
             &model_info,
-            &input,
+            Some(&input),
+            /*pending_input*/ &[],
             PersistContext::TurnStart,
         )
         .await;
@@ -271,11 +283,12 @@ pub(crate) async fn run_turn(
         .await?
     {
         // Compaction runs before the new input is recorded, so preserve it on every failure.
-        let _ = run_hooks_and_record_inputs(
+        let _ = run_hooks_and_record_input_entries(
             &sess,
             &turn_context,
             &turn_context.capture_current_model_info(),
-            &input,
+            Some(&input),
+            /*pending_input*/ &[],
             PersistContext::Standard,
         )
         .await;
@@ -320,11 +333,12 @@ pub(crate) async fn run_turn(
         {
             Ok(requirements) => requirements,
             Err(err) => {
-                let _ = run_hooks_and_record_inputs(
+                let _ = run_hooks_and_record_input_entries(
                     &sess,
                     &turn_context,
                     &turn_context.capture_current_model_info(),
-                    &input,
+                    Some(&input),
+                    /*pending_input*/ &[],
                     PersistContext::Standard,
                 )
                 .await;
@@ -348,11 +362,12 @@ pub(crate) async fn run_turn(
     {
         Ok(step_context) => step_context,
         Err(err) if crate::tasks::ends_turn_as_interrupted(&err) => {
-            let _ = run_hooks_and_record_inputs(
+            let _ = run_hooks_and_record_input_entries(
                 &sess,
                 &turn_context,
                 &turn_context.capture_current_model_info(),
-                &input,
+                Some(&input),
+                /*pending_input*/ &[],
                 PersistContext::Standard,
             )
             .await;
@@ -360,53 +375,19 @@ pub(crate) async fn run_turn(
         }
         Err(err) => return Err(err),
     };
-    // Record initial context while preparing diff display roots.
-    let (record_context, display_roots) = tokio::join!(
-        preserve_initial_input_during(
-            &sess,
-            &turn_context,
-            &mut input,
-            sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
-        ),
-        async {
-            // Guardian must not wait for remote Git discovery just to display diff paths.
-            if crate::guardian::is_basic_session_source(&turn_context.session_source)
-                || first_step_context
-                    .turn
-                    .config
-                    .features
-                    .enabled(Feature::CwdRelativeTurnDiffs)
-            {
-                first_step_context
-                    .environments
-                    .turn_environments()
-                    .map(|environment| {
-                        (
-                            environment.selection().environment_id,
-                            environment.cwd().clone(),
-                        )
-                    })
-                    .collect()
-            } else {
-                turn_diff_display_roots(first_step_context.as_ref()).await
-            }
-        },
-    );
-    let mut world_state = record_context??;
-
-    let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
+    let mut world_state = preserve_initial_input_during(
         &sess,
-        first_step_context.as_ref(),
-        &user_input,
-        &mentioned_plugins,
-        &cancellation_token,
+        &turn_context,
+        &mut input,
+        sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
     )
-    .await
-    else {
-        return Ok(None);
-    };
+    .await??;
 
-    if run_pending_session_start_hooks(&sess, &turn_context).await {
+    if run_pending_session_start_hooks(&sess, &turn_context, &cancellation_token).await {
+        // A queued steer can reuse this turn context after the initial input is discarded.
+        turn_context
+            .extension_data
+            .remove::<SubmittedAdditionalContext>();
         return Ok(None);
     }
     if crate::guardian::is_basic_session_source(&turn_context.session_source)
@@ -452,11 +433,12 @@ pub(crate) async fn run_turn(
         .await?;
     }
     let mut can_drain_pending_input = input.is_empty();
-    if run_hooks_and_record_inputs(
+    if run_hooks_and_record_input_entries(
         &sess,
         &turn_context,
         &first_step_context.settings.model_info,
-        &input,
+        Some(&input),
+        /*pending_input*/ &[],
         PersistContext::TurnStart,
     )
     .await?
@@ -474,6 +456,24 @@ pub(crate) async fn run_turn(
     {
         turn_context.session_telemetry.user_prompt(&user_input);
     }
+
+    // Neither extension setup nor diff path discovery should delay recording accepted input.
+    let (extensions, display_roots) = tokio::join!(
+        build_skills_and_plugins(
+            &sess,
+            first_step_context.as_ref(),
+            &user_input,
+            &mentioned_plugins,
+            &cancellation_token,
+        ),
+        cancellation_token
+            .run_until_cancelled(turn_diff_display_roots(first_step_context.as_ref())),
+    );
+    let (Some((injection_items, explicitly_enabled_connectors)), Some(display_roots)) =
+        (extensions, display_roots)
+    else {
+        return Ok(None);
+    };
 
     // Only speculate after hooks accept the turn, using its finalized tools and permissions.
     {
@@ -522,6 +522,13 @@ pub(crate) async fn run_turn(
     track_turn_resolved_config_analytics(&sess, &first_step_context, &input).await;
 
     let mut last_agent_message: Option<String> = None;
+    let mut work = TurnWork::new(
+        &sess.services.budget_policy,
+        sess.thread_id(),
+        &turn_context.sub_id,
+        &turn_context.session_source,
+    );
+    let mut completion_hooks = TurnCompletionHooks::default();
     let mut stop_hook_active = false;
     // A steer can reopen sampling within the same turn. Keep its aggregate until the turn ends.
     let turn_diff_tracker = turn_context
@@ -559,10 +566,11 @@ pub(crate) async fn run_turn(
             Vec::new()
         };
 
-        if run_hooks_and_record_inputs(
+        if run_hooks_and_record_input_entries(
             &sess,
             &turn_context,
             &turn_context.capture_current_model_info(),
+            /*initial_input*/ None,
             &pending_input,
             PersistContext::SteeredUserInput,
         )
@@ -594,7 +602,8 @@ pub(crate) async fn run_turn(
                 .await?
             }
             Some(_) | None => {
-                let pending_user_input = input_for_extensions(&pending_input);
+                let pending_user_input =
+                    input_for_extensions(pending_input.iter().map(|entry| &entry.input));
                 if allow_plugin_mentions {
                     required_plugins.extend(crate::plugins::collect_explicit_plugin_ids(
                         &pending_user_input,
@@ -665,12 +674,13 @@ pub(crate) async fn run_turn(
         .await;
         let sampling_request_result =
             sampling_request_result.and_then(|(output, notifications)| {
-                sess.check_rollout_budget()?;
-                Ok((output, notifications))
+                let has_final_answer =
+                    !output.mailbox_preempted && output.last_agent_message.final_answer.is_some();
+                let next = work.accept_response(has_final_answer)?;
+                Ok((output, notifications, next))
             });
         match sampling_request_result {
-            Ok(result) => {
-                let (sampling_request_output, notify_messages) = result;
+            Ok((sampling_request_output, notify_messages, next)) => {
                 guardian_budget_compacted = false;
 
                 let SamplingRequestResult {
@@ -682,13 +692,13 @@ pub(crate) async fn run_turn(
                     final_answer,
                     trailing_commentary,
                 } = sampling_request_last_agent_message;
-                let sampling_request_last_agent_message = trailing_commentary.or(final_answer);
-                let hooks = TurnCompletionHooks {
+                let sampling_request_last_agent_message =
+                    work.assistant_message(final_answer, trailing_commentary);
+                completion_hooks = TurnCompletionHooks {
                     last_assistant_message: sampling_request_last_agent_message,
                     notify_messages: Some(notify_messages),
                     stop_ran: false,
                 };
-                let mut completion_hooks = hooks;
                 if model_needs_follow_up {
                     sess.input_queue
                         .accept_mailbox_delivery_for_current_turn(
@@ -700,6 +710,14 @@ pub(crate) async fn run_turn(
                 can_drain_pending_input = true;
                 // Process async hooks only after sampling and its tools have finished.
                 drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ false).await;
+                if next.should_retry(model_needs_follow_up) {
+                    continue;
+                }
+                if next.is_finished() {
+                    return completion_hooks
+                        .finish(&sess, &step_context, stop_hook_active, work.take_answer())
+                        .await;
+                }
                 let (has_pending_input, token_status) = async {
                     // Tool output can add audio without a queued user input. Resolve its
                     // duration before checking the continuation's compaction threshold.
@@ -800,7 +818,13 @@ pub(crate) async fn run_turn(
                     .await;
                     match compacted {
                         Ok(true) => {
-                            if run_pending_session_start_hooks(&sess, &turn_context).await {
+                            if run_pending_session_start_hooks(
+                                &sess,
+                                &turn_context,
+                                &cancellation_token,
+                            )
+                            .await
+                            {
                                 return Ok(None);
                             }
                             // After interrupted sampling, drain pending input even if compaction
@@ -835,6 +859,15 @@ pub(crate) async fn run_turn(
                     let stop_outcome = completion_hooks
                         .run_stop(&sess, &step_context, stop_hook_active)
                         .await;
+                    let after_stop = work.after_stop_hook()?;
+                    if after_stop.is_finished() {
+                        return completion_hooks
+                            .finish(&sess, &step_context, stop_hook_active, work.take_answer())
+                            .await;
+                    }
+                    if after_stop.should_return(&stop_outcome) {
+                        return Ok(work.take_answer());
+                    }
                     if matches!(
                         turn_context.session_source,
                         SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
@@ -846,10 +879,9 @@ pub(crate) async fn run_turn(
                         ));
                     }
                     if stop_outcome.should_block {
-                        if let Some(hook_prompt_message) = build_hook_prompt_message(
-                            &stop_outcome.continuation_fragments,
-                            &sess.item_id_generator,
-                        ) {
+                        if let Some(hook_prompt_message) =
+                            build_hook_prompt_message(&stop_outcome.continuation_fragments)
+                        {
                             sess.record_response_item_and_emit_turn_item(
                                 &turn_context,
                                 &step_context.settings.model_info,
@@ -919,7 +951,7 @@ pub(crate) async fn run_turn(
                                 return Err(err);
                             }
                             let error = err.to_codex_protocol_error();
-                            if matches!(error, CodexErrorInfo::UsageLimitExceeded) {
+                            if error.is_usage_limit() {
                                 // Preserve the completed answer while stopping automatic work.
                                 sess.emit_turn_error_lifecycle(
                                     turn_context.as_ref(),
@@ -930,6 +962,9 @@ pub(crate) async fn run_turn(
                             }
                             warn!(error = %err, "Post-turn compaction failed; preserving the completed turn");
                         }
+                    }
+                    if work.should_finish_after_compaction()? {
+                        return Ok(work.take_answer());
                     }
                     break;
                 }
@@ -988,12 +1023,22 @@ pub(crate) async fn run_turn(
                     message: "Invalid image in your last message. Please remove it and try again."
                         .to_string(),
                     codex_error_info: Some(error),
-                    rejected_audio_file_ids: Vec::new(),
                 });
                 sess.send_event(&turn_context, event).await;
                 break;
             }
             Err(e) => {
+                let e = match work.on_error(e)? {
+                    ControlFlow::Break(next) => {
+                        if next.is_finished() {
+                            return completion_hooks
+                                .finish(&sess, &step_context, stop_hook_active, work.take_answer())
+                                .await;
+                        }
+                        continue;
+                    }
+                    ControlFlow::Continue(e) => e,
+                };
                 info!("Turn error: {e:#}");
                 if matches!(
                     e.details(),
@@ -1006,16 +1051,11 @@ pub(crate) async fn run_turn(
                     .await;
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
                 let mut error_event = e.to_error_event(/*message_prefix*/ None);
-                if let Some(rejected) = turn_context
-                    .extension_data
-                    .remove::<rejected_audio::RejectedAudioFileIds>()
-                {
-                    error_event
-                        .rejected_audio_file_ids
-                        .extend(Arc::unwrap_or_clone(rejected).0);
-                }
                 if matches!(e.details(), CodexErrorDetails::InvalidAudioInput { .. })
-                    || !error_event.rejected_audio_file_ids.is_empty()
+                    || turn_context
+                        .extension_data
+                        .get::<rejected_audio::RejectedAudioFileIds>()
+                        .is_some()
                 {
                     error_event.message.push_str(
                         " Please remove or replace the affected audio attachment and try again.",
@@ -1069,10 +1109,45 @@ impl TurnCompletionHooks {
         };
         run_legacy_after_agent_hook(sess, turn, messages, self.last_assistant_message.clone()).await
     }
+    async fn finish(
+        mut self,
+        sess: &Arc<Session>,
+        step_context: &Arc<StepContext>,
+        stop_hook_active: bool,
+        answer: Option<String>,
+    ) -> CodexResult<Option<String>> {
+        if !self.stop_ran {
+            self.run_stop(sess, step_context, stop_hook_active).await;
+        }
+        if self.run_after_agent(sess, &step_context.turn).await {
+            return Ok(None);
+        }
+        Ok(answer)
+    }
 }
 
 #[instrument(level = "trace", skip_all)]
 async fn turn_diff_display_roots(step_context: &StepContext) -> Vec<(String, PathUri)> {
+    // Guardian must not wait for remote Git discovery just to display diff paths.
+    if crate::guardian::is_basic_session_source(&step_context.turn.session_source)
+        || step_context
+            .turn
+            .config
+            .features
+            .enabled(Feature::CwdRelativeTurnDiffs)
+    {
+        return step_context
+            .environments
+            .turn_environments()
+            .map(|environment| {
+                (
+                    environment.selection().environment_id,
+                    environment.cwd().clone(),
+                )
+            })
+            .collect();
+    }
+
     let mut display_roots = Vec::new();
     for turn_environment in step_context.environments.turn_environments() {
         let cwd = turn_environment.cwd();
@@ -1094,26 +1169,53 @@ async fn turn_diff_display_roots(step_context: &StepContext) -> Vec<(String, Pat
     display_roots
 }
 
-#[instrument(level = "trace", skip_all)]
-pub(crate) async fn run_hooks_and_record_inputs(
+#[instrument(name = "run_hooks_and_record_inputs", level = "trace", skip_all)]
+pub(crate) async fn run_hooks_and_record_input_entries(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     model_info: &ModelInfo,
-    input: &[TurnInput],
+    initial_input: Option<&[TurnInput]>,
+    pending_input: &[InputQueueEntry],
     persist_context: PersistContext,
 ) -> CodexResult<bool> {
+    // A started turn owns one initial submission; consume its context exactly once.
+    let initial_context = turn_context
+        .extension_data
+        .remove::<SubmittedAdditionalContext>();
+    // An empty original submission can deliver context by itself; missing input
+    // means its original submission is no longer available for delivery.
+    if matches!(initial_input, Some([]))
+        && let Some(context) = initial_context.as_deref()
+        && can_record_input(sess)
+    {
+        record_delivered_additional_context(sess, turn_context, model_info, context).await;
+    }
+    let initial_input = initial_input.unwrap_or_default();
     let mut blocked_input = false;
     let mut accepted_user_input = false;
-    for input_item in recordable_inputs(sess, model_info, input) {
-        let input_item = input_item?;
+    let mut input_error = None;
+    for input_item in recordable_inputs(
+        sess,
+        model_info,
+        initial_input,
+        pending_input,
+        initial_context.as_deref(),
+    ) {
+        let (input_item, additional_context) = input_item?;
         let hook_outcome = inspect_pending_input(sess, turn_context, &input_item).await;
+        let realtime_handoff_id = match input_item.as_ref() {
+            TurnInput::UserInput { metadata, .. } => metadata.realtime_handoff_id,
+            _ => None,
+        };
         if hook_outcome.should_stop {
+            if let Some(id) = realtime_handoff_id {
+                sess.reject_realtime_handoff(id).await;
+            }
             blocked_input = true;
             record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
         } else {
-            if matches!(input_item.as_ref(), TurnInput::UserInput { content, .. } if !content.is_empty())
-            {
-                accepted_user_input = true;
+            if let Some(context) = additional_context {
+                record_delivered_additional_context(sess, turn_context, model_info, context).await;
             }
             // Tool outputs retain their durability barrier, including in mixed input batches.
             let input_persist_context = if persist_context == PersistContext::SteeredUserInput
@@ -1123,7 +1225,8 @@ pub(crate) async fn run_hooks_and_record_inputs(
             } else {
                 persist_context
             };
-            record_pending_input(
+            let is_user_input = matches!(input_item.as_ref(), TurnInput::UserInput { content, .. } if !content.is_empty());
+            if let Err(error) = record_pending_input(
                 sess,
                 turn_context,
                 model_info,
@@ -1131,39 +1234,81 @@ pub(crate) async fn run_hooks_and_record_inputs(
                 hook_outcome.additional_contexts,
                 input_persist_context,
             )
-            .await;
+            .await
+            {
+                // The batch has left the queue. Persist its unrelated siblings before failing.
+                input_error.get_or_insert(error);
+            } else if is_user_input {
+                accepted_user_input = true;
+            }
         }
     }
     // The batch has left the input queue. Persist every accepted item before the
     // optional lookup can suspend this task long enough for an interrupt to abort it.
-    if !input.is_empty() {
+    if !initial_input.is_empty() || !pending_input.is_empty() {
         super::file_audio::resolve_pending(sess).await;
+    }
+    if let Some(error) = input_error {
+        sess.conversation.stop_for_history_recovery().await;
+        return Err(CodexErr::Io(error));
     }
     Ok(blocked_input && !accepted_user_input)
 }
 
-/// Yields usable input in order, then reports unsupported audio after valid siblings can be recorded.
+pub(crate) async fn record_delivered_additional_context(
+    sess: &Session,
+    turn_context: &TurnContext,
+    model_info: &ModelInfo,
+    context: &SubmittedAdditionalContext,
+) {
+    let items = merge_submitted_context(sess, turn_context, context).await;
+    if !items.is_empty() {
+        sess.record_annotated_conversation_items(turn_context, model_info, items)
+            .await;
+    }
+}
+
+pub(crate) async fn merge_submitted_context(
+    sess: &Session,
+    turn_context: &TurnContext,
+    context: &SubmittedAdditionalContext,
+) -> Vec<ResponseItemEnvelope> {
+    let items = sess.state.lock().await.additional_context.merge(
+        context.0.clone(),
+        sess.additional_context_format(),
+        &turn_context.session_telemetry,
+        &sess.context_ids,
+    );
+    items
+        .into_iter()
+        .map(|item| sess.annotate_client_response_item(item))
+        .collect()
+}
+
+/// Yields usable input with its context in order, then reports unsupported audio after valid siblings can be recorded.
 pub(crate) fn recordable_inputs<'a>(
     sess: &Session,
     model_info: &ModelInfo,
-    input: &'a [TurnInput],
-) -> impl Iterator<Item = CodexResult<Cow<'a, TurnInput>>> {
-    let rejected_audio = !model_info.input_modalities.contains(&InputModality::Audio)
-        && input.iter().any(turn_input_has_uploaded_audio_file);
-    // Only finalized evidence may enter reusable Guardian history.
-    let items: &[TurnInput] = if sess
-        .services
-        .thread_extension_data
-        .get::<crate::guardian::PendingReviewContext>()
-        .is_some()
-    {
-        &[]
-    } else {
-        input
-    };
-    items
+    initial_input: &'a [TurnInput],
+    pending_input: &'a [InputQueueEntry],
+    initial_context: Option<&'a SubmittedAdditionalContext>,
+) -> impl Iterator<Item = CodexResult<(Cow<'a, TurnInput>, Option<&'a SubmittedAdditionalContext>)>>
+{
+    let input = initial_input
         .iter()
-        .filter_map(move |item| {
+        .enumerate()
+        .map(move |(index, item)| (item, initial_context.filter(|_| index == 0)))
+        .chain(pending_input.iter().map(InputQueueEntry::input_and_context));
+    let rejected_audio = !model_info.input_modalities.contains(&InputModality::Audio)
+        && input
+            .clone()
+            .any(|(item, _)| turn_input_has_uploaded_audio_file(item));
+    let can_record = can_record_input(sess);
+    input
+        .filter_map(move |(item, context)| {
+            if !can_record {
+                return None;
+            }
             let mut item = Cow::Borrowed(item);
             if rejected_audio
                 && turn_input_has_uploaded_audio_file(&item)
@@ -1174,9 +1319,17 @@ pub(crate) fn recordable_inputs<'a>(
                     return None;
                 }
             }
-            Some(Ok(item))
+            Some(Ok((item, context)))
         })
         .chain(rejected_audio.then(|| Err(unsupported_uploaded_audio_error())))
+}
+
+fn can_record_input(sess: &Session) -> bool {
+    // Only finalized evidence may enter reusable Guardian history.
+    sess.services
+        .thread_extension_data
+        .get::<crate::guardian::PendingReviewContext>()
+        .is_none()
 }
 
 fn turn_input_has_uploaded_audio_file(input: &TurnInput) -> bool {
@@ -1190,9 +1343,9 @@ fn unsupported_uploaded_audio_error() -> CodexErr {
 }
 
 /// Extensions and telemetry consume the protocol view, including the original mention and path labels.
-fn input_for_extensions(input: &[TurnInput]) -> Vec<UserInput> {
+fn input_for_extensions<'a>(input: impl IntoIterator<Item = &'a TurnInput>) -> Vec<UserInput> {
     input
-        .iter()
+        .into_iter()
         .filter_map(|item| match item {
             TurnInput::UserInput { content, .. } => Some(content.as_slice()),
             TurnInput::ResponseItem(_)
@@ -1494,7 +1647,7 @@ async fn build_extension_turn_input_items(
     let input = TurnInputContext {
         step_store: &step_context.extension_data,
         turn_id: turn_context.sub_id.to_string(),
-        user_input: user_input.to_vec(),
+        user_input,
         environments,
     };
     let extension_metrics =
@@ -2032,11 +2185,6 @@ async fn run_sampling_request(
         if first_attempt && turn_context.config.notify.is_some() {
             notify_messages = legacy_notify_input_messages(&prompt.input);
         }
-        let _native_search = crate::model_search::SearchOwner::reserve_server_fallback(
-            &step_context.extension_data,
-            &sess.services.thread_extension_data,
-            &mut prompt.tools,
-        );
         let (submitted_audio, pending_audio) = {
             let model = &step_context.settings.model_info.slug;
             let provider = &turn_context.config.model_provider_id;
@@ -2156,7 +2304,7 @@ pub(super) enum PreparedToolRecommendations {
 }
 
 impl PreparedToolRecommendations {
-    #[instrument(level = "trace", skip_all)]
+    #[instrument(name = "plugins.recommendations.load", level = "info", skip_all)]
     pub(super) async fn load(sess: &Session, turn_context: &TurnContext) -> Self {
         let auth = sess.services.auth_manager.auth().await;
         let endpoint_candidates = sess
@@ -2283,6 +2431,30 @@ struct SamplingRequestResult {
     /// Queued mail interrupted sampling and must be drained before the next request.
     mailbox_preempted: bool,
     last_agent_message: AssistantMessages,
+}
+
+/// The client carries IDs from added to done, so deferred items only need to suppress deltas.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Keep the single streaming item inline"
+)]
+enum ActiveItem {
+    Streaming(TurnItem),
+    Deferred,
+}
+
+fn streaming_item_for_delta<'a>(
+    active: Option<&'a ActiveItem>,
+    event: &str,
+) -> Option<&'a TurnItem> {
+    match active {
+        Some(ActiveItem::Streaming(item)) => Some(item),
+        Some(ActiveItem::Deferred) => None,
+        None => {
+            error_or_panic(format!("{event} without active item"));
+            None
+        }
+    }
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -3004,24 +3176,14 @@ async fn try_run_sampling_request(
     let mut pending_assessment: Option<codex_api::GuardianAssessment> = None;
     let mut response_completed = false;
     let mut includes_reasoning = step_context.settings.model_info.use_responses_lite;
-    // Catalog policies can enable adaptive review independently of the legacy scorer flag.
-    // Capture evidence whenever Guardian is available; the reviewer resolves the policy.
-    let assessment_authorization = if turn_context
-        .config
-        .features
-        .enabled(Feature::GuardianApproval)
-    {
-        Some(crate::guardian::ScoreAuthorization::for_session(&sess, &Default::default()).await)
-    } else {
-        None
-    };
-    let mut resampling = crate::guardian::ResponseResampling::new(&sess);
+    let accept_actor_assessments = turn_context.config.guardian_model_provider.is_none();
     let prompt = Arc::new(prompt);
+    let mut resampling = crate::guardian::ResponseResampling::new(&sess, &prompt);
     let interrupt_at_boundary = SamplingInterrupt::enabled(&turn_context);
-    let mut stream_request = async |prompt: &Arc<Prompt>| {
+    let mut stream_request = async |prompt: Arc<Prompt>| {
         let send = client_session
             .open_model_response(
-                prompt,
+                &prompt,
                 &step_context.settings.model_info,
                 &step_context.session_telemetry,
                 SamplingOptions {
@@ -3049,7 +3211,7 @@ async fn try_run_sampling_request(
             )
             .await
     };
-    let mut stream = match stream_request(&prompt)
+    let mut stream = match stream_request(prompt)
         .or_cancel(&cancellation_token)
         .await?
     {
@@ -3074,9 +3236,10 @@ async fn try_run_sampling_request(
         == codex_config::config_toml::ResponseProcessMode::Streaming;
     let mut wait_for_bill_only = false;
     let mut in_flight = FuturesOrdered::new();
+    let mut response_work = ResponseWork::default();
     let mut needs_follow_up = false;
     let mut last_agent_message = AssistantMessages::default();
-    let mut active_item: Option<TurnItem> = None;
+    let mut active_item = None;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
         Box<dyn ToolArgumentDiffConsumer>,
@@ -3100,7 +3263,6 @@ async fn try_run_sampling_request(
         plan_mode.then(|| PlanModeStreamState::new(unfinished_plan_id.clone()));
     let defer_streamed_turn_items_for_contributors =
         !sess.services.extensions.turn_item_contributors().is_empty();
-    let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
     // Sending the request starts the first item, even before the first stream event arrives.
     let mut between_items = false;
@@ -3111,9 +3273,16 @@ async fn try_run_sampling_request(
             if resampling.update_usage_boundary {
                 sess.state.lock().await.history.reset_last_usage_boundary();
             }
+            // A completed final retained during the drain can defer queue-only mail.
+            // Recheck that boundary instead of reopening it solely because we interrupted.
+            let mailbox_preempted = *draining_for_mailbox
+                && sess
+                    .input_queue
+                    .should_preempt_sampling_for_mail(&sess.active_turn, &turn_context.sub_id)
+                    .await;
             break Ok(SamplingRequestResult {
-                needs_follow_up,
-                mailbox_preempted: *draining_for_mailbox,
+                needs_follow_up: needs_follow_up || mailbox_preempted,
+                mailbox_preempted,
                 last_agent_message,
             });
         }
@@ -3245,6 +3414,7 @@ async fn try_run_sampling_request(
         match event {
             ResponseEvent::Created { response_id } => {
                 answer_moderation = None;
+                pending_assessment = None;
                 response_id_for_assessment.clone_from(&response_id);
                 if let Some(response_id) = response_id {
                     turn_context
@@ -3258,26 +3428,14 @@ async fn try_run_sampling_request(
                         .insert(codex_api::ResponseId(response_id));
                 }
             }
-            ResponseEvent::OutputItemDone(mut item) => {
+            ResponseEvent::OutputItemDone(item) => {
                 between_items = true;
                 // Serving emits one final value immediately before this item's completion.
                 // After this handoff, the invocation/cell owns it independently of the stream.
-                let assessment = pending_assessment
+                let guardian_probe = pending_assessment
                     .take()
                     .filter(|value| item.id().is_some_and(|id| id.as_str() == value.item_id))
-                    .zip(assessment_authorization.as_ref())
-                    .map(|(value, authorization)| {
-                        Arc::new(crate::guardian::ServingAssessment {
-                            requires_review: value.requires_review,
-                            authorization: authorization.clone(),
-                        })
-                    });
-                if item.id().is_none_or(|id| id.is_empty())
-                    && let Some(active_item) = &active_item
-                {
-                    item.set_id(Some(ResponseItemId::from_server(active_item.id())));
-                }
-                sess.assign_missing_response_item_id(&mut item);
+                    .map(|value| value.requires_review);
                 sess.reserve_assistant_message_order(&turn_context, &item)
                     .await;
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
@@ -3301,13 +3459,10 @@ async fn try_run_sampling_request(
                 {
                     sess.send_event(&turn_context, event).await;
                 }
-                let previously_active_item = active_item.take();
-                let previously_streamed_item = if active_item_is_streaming_to_client {
-                    previously_active_item
-                } else {
-                    None
+                let previously_streamed_item = match active_item.take() {
+                    Some(ActiveItem::Streaming(item)) => Some(item),
+                    Some(ActiveItem::Deferred) | None => None,
                 };
-                active_item_is_streaming_to_client = false;
                 if let Some(previous) = previously_streamed_item.as_ref()
                     && matches!(previous, TurnItem::AgentMessage(_))
                 {
@@ -3338,8 +3493,11 @@ async fn try_run_sampling_request(
                 }
 
                 let mut tool_runtime = tool_runtime.clone();
-                if assessment.is_some() {
-                    Arc::make_mut(&mut tool_runtime.step_context).serving_assessment = assessment;
+                if guardian_probe.is_some() {
+                    let tool_step = Arc::make_mut(&mut tool_runtime.step_context);
+                    // Probe results are observations; async Guardian remains authoritative.
+                    tool_step.serving_assessment = None;
+                    tool_step.guardian_probe = guardian_probe;
                 }
                 let mut ctx = HandleOutputCtx {
                     sess: sess.clone(),
@@ -3438,13 +3596,11 @@ async fn try_run_sampling_request(
                     }
                     // Keep the response ID and terminal decision. Later tools receive a denial.
                     *draining_for_mailbox = true;
-                    needs_follow_up = true;
                     continue;
                 }
             }
-            ResponseEvent::OutputItemAdded(mut item) => {
+            ResponseEvent::OutputItemAdded(item) => {
                 between_items = false;
-                sess.assign_missing_response_item_id(&mut item);
                 sess.reserve_assistant_message_order(&turn_context, &item)
                     .await;
                 if !*draining_for_mailbox
@@ -3462,7 +3618,13 @@ async fn try_run_sampling_request(
                 } else if matches!(&item, ResponseItem::FunctionCall { .. }) {
                     active_tool_argument_diff_consumer = None;
                 }
-                if let Some(turn_item) = handle_non_tool_response_item(
+                // A drain may discard the partial item, and contributors may rewrite it.
+                // Wait for OutputItemDone before parsing or exposing it in either case.
+                if *draining_for_mailbox || defer_streamed_turn_items_for_contributors {
+                    active_item = Some(ActiveItem::Deferred);
+                    continue;
+                }
+                if let Some(mut turn_item) = handle_non_tool_response_item(
                     sess.as_ref(),
                     TurnItemContributorPolicy::Skip,
                     &item,
@@ -3470,15 +3632,9 @@ async fn try_run_sampling_request(
                 )
                 .await
                 {
-                    let mut turn_item = turn_item;
-                    // An interrupted response may discard its partial item. Only expose
-                    // items received during this drain once OutputItemDone confirms them.
-                    let stream_item_to_client =
-                        !*draining_for_mailbox && !defer_streamed_turn_items_for_contributors;
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                     let mut seeded_item_id: Option<String> = None;
-                    if stream_item_to_client
-                        && matches!(turn_item, TurnItem::AgentMessage(_))
+                    if matches!(turn_item, TurnItem::AgentMessage(_))
                         && let Some(raw_text) = raw_assistant_output_text_from_item(&item)
                     {
                         let item_id = turn_item.id();
@@ -3497,34 +3653,31 @@ async fn try_run_sampling_request(
                         seeded_parsed = plan_mode.then_some(seeded);
                         seeded_item_id = Some(item_id);
                     }
-                    if stream_item_to_client {
-                        if let Some(state) = plan_mode_state.as_mut()
-                            && matches!(turn_item, TurnItem::AgentMessage(_))
-                        {
-                            let item_id = turn_item.id();
-                            state
-                                .pending_agent_message_items
-                                .insert(item_id, turn_item.clone());
-                        } else {
-                            sess.emit_turn_item_started(&turn_context, &turn_item).await;
-                        }
-                        if let (Some(state), Some(item_id), Some(parsed)) = (
-                            plan_mode_state.as_mut(),
-                            seeded_item_id.as_deref(),
-                            seeded_parsed,
-                        ) {
-                            emit_streamed_assistant_text_delta(
-                                &sess,
-                                &turn_context,
-                                Some(state),
-                                item_id,
-                                parsed,
-                            )
-                            .await;
-                        }
+                    if let Some(state) = plan_mode_state.as_mut()
+                        && matches!(turn_item, TurnItem::AgentMessage(_))
+                    {
+                        let item_id = turn_item.id();
+                        state
+                            .pending_agent_message_items
+                            .insert(item_id, turn_item.clone());
+                    } else {
+                        sess.emit_turn_item_started(&turn_context, &turn_item).await;
                     }
-                    active_item = Some(turn_item);
-                    active_item_is_streaming_to_client = stream_item_to_client;
+                    if let (Some(state), Some(item_id), Some(parsed)) = (
+                        plan_mode_state.as_mut(),
+                        seeded_item_id.as_deref(),
+                        seeded_parsed,
+                    ) {
+                        emit_streamed_assistant_text_delta(
+                            &sess,
+                            &turn_context,
+                            Some(state),
+                            item_id,
+                            parsed,
+                        )
+                        .await;
+                    }
+                    active_item = Some(ActiveItem::Streaming(turn_item));
                 }
             }
             ResponseEvent::ServerModel(server_model) => {
@@ -3558,7 +3711,10 @@ async fn try_run_sampling_request(
                     .await;
             }
             ResponseEvent::GuardianAssessment(assessment) => {
-                if response_id_for_assessment.as_deref() == Some(assessment.response_id.as_str()) {
+                if accept_actor_assessments
+                    && response_id_for_assessment.as_deref()
+                        == Some(assessment.response_id.as_str())
+                {
                     pending_assessment = Some(assessment);
                 }
             }
@@ -3595,9 +3751,10 @@ async fn try_run_sampling_request(
                 response_id,
                 token_usage,
                 usage_metadata,
-                reasoning_removals: _,
+                reasoning_removals,
                 end_turn,
             } => {
+                let retry_prompt = resampling.finish_response(end_turn, token_usage.is_some());
                 if let Some(accepted) = pending_audio.take() {
                     sess.record_retained_context(
                         codex_history::RetainedContextEvent::AcceptedFileAudio {
@@ -3606,6 +3763,8 @@ async fn try_run_sampling_request(
                     )
                     .await;
                 }
+                sess.state.lock().await.last_sampling_cot_removed =
+                    reasoning_removals.as_ref().map(|counts| !counts.is_empty());
                 response_completed = true;
                 sess.services
                     .analytics_events_client
@@ -3631,6 +3790,8 @@ async fn try_run_sampling_request(
                     usage_metadata.as_ref(),
                 )
                 .await;
+                let mut hook_output = hook_output;
+                response_work.accept_charge(&mut hook_output);
                 let budget_result = sess
                     .record_token_usage_info(
                         &turn_context,
@@ -3639,7 +3800,7 @@ async fn try_run_sampling_request(
                             provider: token_usage,
                             charge: hook_output,
                         },
-                        if resampling.retry_pending {
+                        if retry_prompt.is_some() {
                             super::TokenUsageContext::SpendingOnly
                         } else {
                             super::TokenUsageContext::Sampling {
@@ -3660,17 +3821,15 @@ async fn try_run_sampling_request(
                         last_agent_message,
                     });
                 }
-                if resampling.retry_pending {
+                if let Some(prompt) = retry_prompt {
                     response_completed = false;
                     response_id_for_assessment = None;
                     pending_assessment = None;
                     includes_reasoning = step_context.settings.model_info.use_responses_lite;
-                    stream = match resampling
-                        .retry(stream_request(&prompt), &cancellation_token)
-                        .await
-                    {
-                        Ok(stream) => stream,
-                        Err(error) => break Err(error),
+                    stream = match stream_request(prompt).or_cancel(&cancellation_token).await {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(error)) => break Err(error),
+                        Err(error) => break Err(error.into()),
                     };
                     continue;
                 }
@@ -3681,10 +3840,9 @@ async fn try_run_sampling_request(
             ResponseEvent::OutputTextDelta(delta) => {
                 // In review child threads, suppress assistant text deltas; the
                 // UI will show a selection popup from the final ReviewOutput.
-                if let Some(active) = active_item.as_ref() {
-                    if !active_item_is_streaming_to_client {
-                        continue;
-                    }
+                if let Some(active) =
+                    streaming_item_for_delta(active_item.as_ref(), "OutputTextDelta")
+                {
                     let item_id = active.id();
                     if matches!(active, TurnItem::AgentMessage(_)) {
                         let parsed = assistant_message_stream_parsers.parse_delta(&item_id, &delta);
@@ -3706,8 +3864,6 @@ async fn try_run_sampling_request(
                         sess.send_event(&turn_context, EventMsg::AgentMessageContentDelta(event))
                             .await;
                     }
-                } else {
-                    error_or_panic("OutputTextDelta without active item".to_string());
                 }
             }
             ResponseEvent::ToolCallInputDelta {
@@ -3735,10 +3891,9 @@ async fn try_run_sampling_request(
                 if uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
-                if let Some(active) = active_item.as_ref() {
-                    if !active_item_is_streaming_to_client {
-                        continue;
-                    }
+                if let Some(active) =
+                    streaming_item_for_delta(active_item.as_ref(), "ReasoningSummaryDelta")
+                {
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.thread_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
@@ -3748,26 +3903,21 @@ async fn try_run_sampling_request(
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
                         .await;
-                } else {
-                    error_or_panic("ReasoningSummaryDelta without active item".to_string());
                 }
             }
             ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
                 if uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
-                if let Some(active) = active_item.as_ref() {
-                    if !active_item_is_streaming_to_client {
-                        continue;
-                    }
+                if let Some(active) =
+                    streaming_item_for_delta(active_item.as_ref(), "ReasoningSummaryPartAdded")
+                {
                     let event =
                         EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                             item_id: active.id(),
                             summary_index,
                         });
                     sess.send_event(&turn_context, event).await;
-                } else {
-                    error_or_panic("ReasoningSummaryPartAdded without active item".to_string());
                 }
             }
             ResponseEvent::ReasoningSummaryDone {
@@ -3778,10 +3928,10 @@ async fn try_run_sampling_request(
                 if !uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
-                let Some(active) = active_item.as_ref() else {
+                let Some(ActiveItem::Streaming(active)) = &active_item else {
                     continue;
                 };
-                if !active_item_is_streaming_to_client || active.id() != item_id {
+                if active.id() != item_id {
                     continue;
                 }
                 if summary_index > 0 {
@@ -3808,10 +3958,9 @@ async fn try_run_sampling_request(
                 delta,
                 content_index,
             } => {
-                if let Some(active) = active_item.as_ref() {
-                    if !active_item_is_streaming_to_client {
-                        continue;
-                    }
+                if let Some(active) =
+                    streaming_item_for_delta(active_item.as_ref(), "ReasoningRawContentDelta")
+                {
                     let event = ReasoningRawContentDeltaEvent {
                         thread_id: sess.thread_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
@@ -3821,8 +3970,6 @@ async fn try_run_sampling_request(
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningRawContentDelta(event))
                         .await;
-                } else {
-                    error_or_panic("ReasoningRawContentDelta without active item".to_string());
                 }
             }
         }
@@ -3876,6 +4023,7 @@ async fn try_run_sampling_request(
         return Err(CodexErr::TurnAborted);
     }
 
+    response_work.finish(&sess.services.budget_policy)?;
     outcome
 }
 

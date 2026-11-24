@@ -35,8 +35,6 @@ use crate::bottom_pane::LocalImageAttachment;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::UserMessage;
 use crate::chatwidget::mention_bindings_from_user_inputs;
-#[cfg(test)]
-use crate::history_cell::AgentMessageCell;
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
 use crate::history_cell::sanitize_user_text;
@@ -62,6 +60,8 @@ pub(crate) const SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE: &str =
 /// Aggregates all backtrack-related state used by the App.
 #[derive(Default)]
 pub(crate) struct BacktrackState {
+    /// Hold terminal input between confirming a prompt edit and dispatching its revert.
+    pub(crate) revert_queued: bool,
     /// True when Esc has primed backtrack mode in the main view.
     pub(crate) primed: bool,
     /// Session id of the base thread whose transcript is being inspected.
@@ -171,6 +171,7 @@ impl App {
         else {
             return;
         };
+        self.backtrack.revert_queued = true;
         self.app_event_tx
             .send(AppEvent::RevertSessionForPromptEdit {
                 thread_id: selection.thread_id,
@@ -454,9 +455,14 @@ impl App {
                 let _ = tui.set_mouse_capture(tui::MouseCapture::Inherit);
             }
             let completed_copy = result?;
-            let close_overlay = t.is_done();
+            let thread_link = t.pending_thread_link.take();
+            let close_overlay = t.is_done() || thread_link.is_some();
             let select_mode_closed = was_select_mode && (!t.is_select_mode() || close_overlay);
             let pending_follow_id = t.pending_follow_id();
+            if let Some(thread_id) = thread_link {
+                self.app_event_tx
+                    .send(AppEvent::OpenThreadLink { thread_id });
+            }
             if !close_overlay
                 && active_key.is_some_and(|key| key.animation_tick.is_some())
                 && t.is_scrolled_to_bottom()
@@ -747,34 +753,6 @@ fn user_positions_iter(
         .filter_map(|(idx, cell)| {
             let user = cell.as_any().downcast_ref::<UserHistoryCell>()?;
             user.has_visible_content().then_some(idx)
-        })
-}
-
-#[cfg(test)]
-fn agent_group_count(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> usize {
-    agent_group_positions_iter(cells).count()
-}
-
-#[cfg(test)]
-fn agent_group_positions_iter(
-    cells: &[Arc<dyn crate::history_cell::HistoryCell>],
-) -> impl Iterator<Item = usize> + '_ {
-    let session_start_type = TypeId::of::<SessionInfoCell>();
-    let type_of = |cell: &Arc<dyn crate::history_cell::HistoryCell>| cell.as_any().type_id();
-
-    let start = cells
-        .iter()
-        .rposition(|cell| type_of(cell) == session_start_type)
-        .map_or(0, |idx| idx + 1);
-
-    cells
-        .iter()
-        .enumerate()
-        .skip(start)
-        .filter_map(move |(idx, cell)| {
-            let is_agent = cell.as_any().downcast_ref::<AgentMessageCell>().is_some();
-            let is_copy_source_group = is_agent && !cell.is_stream_continuation();
-            is_copy_source_group.then_some(idx)
         })
 }
 
@@ -1186,26 +1164,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn agent_group_count_ignores_context_compacted_marker() {
-        let cells: Vec<Arc<dyn HistoryCell>> = vec![
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("first")],
-                /*is_first_line*/ true,
-            )) as Arc<dyn HistoryCell>,
-            Arc::new(crate::history_cell::new_info_event(
-                "Context compacted".to_string(),
-                /*hint*/ None,
-            )) as Arc<dyn HistoryCell>,
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("second")],
-                /*is_first_line*/ true,
-            )) as Arc<dyn HistoryCell>,
-        ];
-
-        assert_eq!(agent_group_count(&cells), 2);
     }
 
     #[test]

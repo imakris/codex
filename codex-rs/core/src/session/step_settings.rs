@@ -11,6 +11,7 @@ use codex_otel::SessionTelemetry;
 use codex_protocol::RequestCountry;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -18,6 +19,8 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::CatalogModel;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::SpawnServiceTierOverride;
+use codex_protocol::protocol::TurnContextItem;
 use std::sync::Arc;
 
 /// Model and execution settings selected for an individual model step within
@@ -31,6 +34,8 @@ pub(crate) struct StepSettings {
     pub(crate) reasoning_summary: Option<ReasoningSummary>,
     /// Normalized requested tier; resolution filters it against the pinned model.
     pub(crate) service_tier: Option<String>,
+    /// Present when this child owns its tier. Descendants inherit the saved preference.
+    pub(crate) spawn_service_tier_override: Option<SpawnServiceTierOverride>,
     pub(crate) personality: Option<Personality>,
     pub(crate) approval_policy: Constrained<AskForApproval>,
     pub(crate) approvals_reviewer: ApprovalsReviewer,
@@ -56,6 +61,10 @@ pub(crate) struct ResolvedStepSettings {
 }
 
 impl ResolvedStepSettings {
+    pub(crate) fn spawn_service_tier_override(&self) -> Option<&SpawnServiceTierOverride> {
+        self.selected.spawn_service_tier_override.as_ref()
+    }
+
     pub(crate) fn request_country(&self) -> &RequestCountry {
         &self.selected.request_country
     }
@@ -92,6 +101,15 @@ impl ResolvedStepSettings {
         self.reasoning_effort()
             .or(self.model_info.default_reasoning_level.as_ref())
             .cloned()
+    }
+
+    pub(super) fn active_collaboration_mode(
+        &self,
+        previous: Option<&TurnContextItem>,
+    ) -> Option<ModeKind> {
+        let mode = self.selected.collaboration_mode.mode;
+        (mode == ModeKind::Plan || previous.is_some_and(|item| item.collaboration_mode.is_some()))
+            .then_some(mode)
     }
 
     pub(crate) fn effective_collaboration_mode(&self) -> CollaborationMode {

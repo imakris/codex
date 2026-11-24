@@ -3,9 +3,11 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
+use crate::tools::executed_tool_calls::PendingResultBody;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::output::CapturedStream;
 use crate::unified_exec::resolve_max_tokens;
+use codex_code_mode::CodeModeToolResult;
 use codex_extension_api::ToolCallOutcome;
 use codex_protocol::ResponseItemId;
 use codex_protocol::mcp::CallToolResult;
@@ -14,7 +16,9 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::ToolResultMetadata;
 use codex_protocol::models::function_call_output_content_items_to_text;
+use codex_tool_call_id::ToolCallId;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
 use codex_utils_audio::estimate_tool_audio_tokens;
@@ -116,7 +120,7 @@ pub struct ToolInvocation {
     pub(crate) step_context: Arc<StepContext>,
     pub cancellation_token: CancellationToken,
     pub tracker: SharedTurnDiffTracker,
-    pub call_id: String,
+    pub call_id: ToolCallId,
     pub tool_name: ToolName,
     pub source: ToolCallSource,
     pub payload: ToolPayload,
@@ -155,7 +159,7 @@ impl ToolInvocation {
             .find_map(|item| match item {
                 ResponseItem::FunctionCall { id, call_id, .. }
                 | ResponseItem::CustomToolCall { id, call_id, .. }
-                    if call_id == &self.call_id =>
+                    if call_id == self.call_id.as_str() =>
                 {
                     id.clone()
                 }
@@ -174,6 +178,7 @@ pub struct McpToolOutput {
     pub tool_input: JsonValue,
     // Keep the original metadata for hooks; this flag only controls analytics capture.
     pub(crate) result_metadata_capture_allowed: bool,
+    pub(crate) result_capture: Option<Arc<PendingResultBody>>,
     pub wall_time: Duration,
     pub original_image_detail_supported: bool,
     pub truncation_policy: TruncationPolicy,
@@ -211,15 +216,25 @@ impl ToolOutput for McpToolOutput {
         }
     }
 
-    fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
+    fn code_mode_result(&self, payload: &ToolPayload) -> CodeModeToolResult {
         self.result.code_mode_result(payload)
     }
 
-    fn tool_result_metadata(&self) -> Option<&JsonValue> {
+    fn tool_result_metadata(&self) -> ToolResultMetadata {
         if !self.result_metadata_capture_allowed {
-            return None;
+            return ToolResultMetadata::default();
         }
-        self.result.meta.as_ref()
+        let result_id = self
+            .result_capture
+            .as_ref()
+            .filter(|_| self.result.success())
+            .and_then(|capture| capture.accept());
+        self.result
+            .meta
+            .as_ref()
+            .map(ToolResultMetadata::new)
+            .unwrap_or_default()
+            .with_result_id(result_id)
     }
 
     fn post_tool_use_input(&self, _payload: &ToolPayload) -> Option<JsonValue> {
@@ -388,8 +403,8 @@ impl ToolOutput for ApplyPatchToolOutput {
         Some(JsonValue::String(self.text.clone()))
     }
 
-    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        JsonValue::Object(serde_json::Map::new())
+    fn code_mode_result(&self, _payload: &ToolPayload) -> CodeModeToolResult {
+        CodeModeToolResult::from(JsonValue::Object(serde_json::Map::new()))
     }
 }
 
@@ -500,7 +515,7 @@ impl ToolOutput for ExecCommandToolOutput {
         ))
     }
 
-    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
+    fn code_mode_result(&self, _payload: &ToolPayload) -> CodeModeToolResult {
         #[derive(Serialize)]
         struct UnifiedExecCodeModeResult {
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -527,9 +542,10 @@ impl ToolOutput for ExecCommandToolOutput {
             },
         };
 
-        serde_json::to_value(result).unwrap_or_else(|err| {
+        let value = serde_json::to_value(result).unwrap_or_else(|err| {
             JsonValue::String(format!("failed to serialize exec result: {err}"))
-        })
+        });
+        CodeModeToolResult::from(value)
     }
 }
 

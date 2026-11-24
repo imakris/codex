@@ -11,6 +11,7 @@ mod composer_gap;
 mod copy_mode;
 mod disclosure;
 mod document;
+pub(crate) use document::DocumentPosition;
 mod follow_control;
 mod footer;
 mod input;
@@ -94,6 +95,7 @@ struct VisibleRow {
 /// Shared scrolling and interaction state for compact and detailed transcript presentations.
 pub(crate) struct TranscriptView {
     pub(crate) image_protocol: Option<crate::pets::ImageProtocol>,
+    pub(crate) agent_links: Option<crate::backend_id::BackendId>,
     pub(crate) document_links: bool,
     pub(crate) mouse_scroll_speed: f64,
     pending_mouse_scroll: f64,
@@ -117,6 +119,7 @@ pub(crate) struct TranscriptView {
     visible: Vec<VisibleRow>,
     selection: Option<Selection>,
     select_mode: Option<SelectMode>,
+    select_reveal_pending: bool,
     copy_mode: Option<copy_mode::CopyMode>,
     held_reading: Option<ViewSnapshot>,
     search: Search,
@@ -137,6 +140,7 @@ impl Default for TranscriptView {
     fn default() -> Self {
         Self {
             image_protocol: None,
+            agent_links: None,
             document_links: false,
             mouse_scroll_speed: 1.0,
             pending_mouse_scroll: 0.0,
@@ -160,6 +164,7 @@ impl Default for TranscriptView {
             visible: Vec::new(),
             selection: None,
             select_mode: None,
+            select_reveal_pending: false,
             copy_mode: None,
             held_reading: None,
             search: Search::default(),
@@ -179,6 +184,17 @@ impl Default for TranscriptView {
 }
 
 impl TranscriptView {
+    pub(crate) fn can_scroll_without_refresh(
+        &self,
+        cells: &[Arc<dyn HistoryCell>],
+        live_key: Option<ActiveCellTranscriptKey>,
+    ) -> bool {
+        !self.area.is_empty()
+            && !self.cache.has_mutable_source()
+            && self.last_tail == cells.last().map(EntryKey::cell)
+            && self.live_key.map(|(_, key)| key) == live_key
+    }
+
     /// Rows left after the last render, including all startup notices and live entries.
     /// Callers can paint temporary UI here without changing selection or saved history.
     pub(crate) fn remaining_area(&self) -> Rect {
@@ -198,6 +214,8 @@ impl TranscriptView {
     }
 
     fn paint_rows(&mut self, area: Rect, buf: &mut Buffer, cells: &[Arc<dyn HistoryCell>]) {
+        let previous_viewport_height =
+            self.area.height + u16::from(self.prompt_header_target.is_some());
         self.composer_tip = None;
         self.prompt_header_target = None;
         self.cache.begin_frame();
@@ -209,6 +227,10 @@ impl TranscriptView {
         Clear.render(area, buf);
         let previous_height = self.area.height;
         let resized = self.area.width != area.width || self.area.bottom() != area.bottom();
+        let select_width_changed = self
+            .visible
+            .first()
+            .is_some_and(|row| row.layout.width != area.width);
         self.prepare_width(area.width);
         self.area = area;
         self.normalize_selection(cells);
@@ -219,6 +241,15 @@ impl TranscriptView {
         if area.is_empty() {
             self.tail_visible = false;
             return;
+        }
+        let select_reveal_pending = std::mem::take(&mut self.select_reveal_pending);
+        if (resized
+            || select_width_changed
+            || previous_viewport_height != area.height
+            || select_reveal_pending)
+            && self.is_select_mode()
+        {
+            self.reveal_select_cursor(cells);
         }
         if let Some(key) = self.disclosure.anchor_control.take()
             && let Position::Reading(mut anchor) = self.position
@@ -314,6 +345,9 @@ impl TranscriptView {
             };
             let row_area = Rect::new(area.x, y, area.width, /*height*/ 1);
             layout.render(row_area, buf, row);
+            if self.agent_links.is_some() {
+                layout.underline_agent_links(row_area, buf, row);
+            }
             self.render_disclosure(&activity_ids, &layout, row, row_area, buf);
             if self.highlight == Some(index) && self.selection.is_none() && !self.search.is_active()
             {
@@ -519,7 +553,13 @@ impl TranscriptView {
                 })
             });
         }
+        let position = self.position;
         self.render(area, buffer, cells);
+        if self.is_select_mode() && self.position != position {
+            self.position = position;
+            // Reveal again if this pane becomes active without another resize.
+            self.select_reveal_pending = true;
+        }
         self.unseen_activity = unseen_activity;
     }
 
@@ -688,8 +728,7 @@ impl TranscriptView {
         }
         // Anchor visible content, not a hidden header that stays ahead of every older page.
         let index = self.next_nonempty(cells, index).unwrap_or(index);
-        let bottom = self.bottom_start(cells);
-        if rows > 0 && (index, row) >= bottom {
+        if rows > 0 && (index, row) >= self.bottom_start(cells) {
             if self.selection.is_none() && !self.search.is_active() {
                 self.jump_to_latest();
             } else {

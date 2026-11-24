@@ -500,6 +500,7 @@ impl ExternalAgentSessionImporter {
             multi_agent_version: Some(MultiAgentVersion::V1),
             history_mode: ThreadHistoryMode::Legacy,
             history_base: None,
+            inherited_history_visibility: Default::default(),
             subagent_history_start_ordinal: None,
             initial_window_id: codex_protocol::ContextWindowId::new_uuid_v7(),
             metadata: ThreadPersistenceMetadata {
@@ -512,8 +513,14 @@ impl ExternalAgentSessionImporter {
         let (created_at, updated_at) = rollout_items
             .iter()
             .filter_map(|item| match item {
-                RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => event.started_at,
-                RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => event.completed_at,
+                RolloutItem::EventMsg {
+                    event: EventMsg::TurnStarted(event),
+                    ..
+                } => event.started_at,
+                RolloutItem::EventMsg {
+                    event: EventMsg::TurnComplete(event),
+                    ..
+                } => event.completed_at,
                 _ => None,
             })
             .fold(None, |chronology: Option<(i64, i64)>, timestamp| {

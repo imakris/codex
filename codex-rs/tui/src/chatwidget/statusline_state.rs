@@ -274,7 +274,7 @@ impl ChatWidget {
         };
         let model = StatuslineStateModel {
             access_program: crate::daybreak::program_for_turn(
-                &self.model_catalog.models,
+                self.model_catalog.models(),
                 selected_model,
                 self.daybreak_account_eligible(),
                 self.daybreak_enabled && !self.side_conversation_active(),
@@ -333,7 +333,7 @@ impl ChatWidget {
                 usage: self.into(),
                 workspace: StatuslineStateWorkspace {
                     cwd: codex_utils_path_uri::LegacyAppPathString::from_path(
-                        self.status_line_workspace_cwd(),
+                        &self.status_line_workspace_cwd(),
                     ),
                 },
                 approval,

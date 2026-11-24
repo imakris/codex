@@ -29,6 +29,9 @@ impl AsyncQuestions {
 
     pub(super) fn select_option(&mut self, index: usize) {
         self.text_selection.borrow_mut().clear();
+        if self.selected_option_index() != Some(index) {
+            self.option_viewport.get_mut().selected = None;
+        }
         self.save_current_draft();
         self.state.pending[self.state.current_idx]
             .options_state
@@ -88,33 +91,14 @@ impl AsyncQuestions {
         &self,
         area: Rect,
         buf: &mut ratatui::buffer::Buffer,
-        rows: &[GenericDisplayRow],
+        lines: &[Vec<HyperlinkLine>],
     ) {
         use ratatui::text::Line;
         use ratatui::widgets::Widget;
 
         let input = self.other_input_area(area);
         let named_area = Rect::new(area.x, area.y, area.width, input.y.saturating_sub(area.y));
-        let rows = &rows[..rows.len() - 1];
-        let mut state = ScrollState::default();
-        while state.scroll_top + 1 < rows.len()
-            && measure_rows_height(rows, &state, rows.len(), named_area.width) > named_area.height
-        {
-            state.scroll_top += 1;
-        }
-        if measure_rows_height(rows, &state, rows.len(), named_area.width) <= named_area.height {
-            self.visible_options
-                .set((state.scroll_top, rows.len() - state.scroll_top));
-        }
-        crate::bottom_pane::request_user_input::render::render_rows_bottom_aligned(
-            named_area,
-            buf,
-            rows,
-            &state,
-            rows.len(),
-            "",
-        );
-        self.record_option_rows(named_area, state.scroll_top, rows.len());
+        self.render_scrollable_options(named_area, buf, lines);
         let margin = Rect::new(
             area.x,
             input.y,
@@ -209,6 +193,9 @@ impl BottomPaneView for AsyncQuestions {
             }
             return;
         }
+        if self.page_content(key) {
+            return;
+        }
         if self.has_options() {
             // Default j/k start Other; explicit printable list remaps keep their meaning.
             let printable = matches!(key.code, KeyCode::Char(_))
@@ -221,7 +208,7 @@ impl BottomPaneView for AsyncQuestions {
                 && (!self.focus_is_notes() || matches!(key.code, KeyCode::Up | KeyCode::Down))
             {
                 let count = self.options_len();
-                let visible = self.visible_options.get().1.max(1);
+                let visible = self.option_viewport.borrow().visible.len().max(1);
                 let mut state = self.state.pending[self.state.current_idx].options_state;
                 match self.keymap.list.action_for(key) {
                     Some(ListAction::MoveUp) => state.move_up_wrap(count),

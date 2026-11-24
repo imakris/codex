@@ -196,14 +196,14 @@ fn exec_server_env_for_request(
 ) {
     if let Some(exec_server_env_config) = &request.exec_server_env_config {
         let mut env =
-            env_overlay_for_exec_server(&request.env, &exec_server_env_config.local_policy_env);
+            env_overlay_for_exec_server(request.env(), &exec_server_env_config.local_policy_env);
         if request.exec_server_shell_snapshot.is_some()
             && !exec_server_env_config.policy.r#set.contains_key("PATH")
         {
             env.remove("PATH");
         }
         if request.exec_server_managed_network.is_some() {
-            for (key, value) in &request.env {
+            for (key, value) in request.env() {
                 if is_managed_proxy_env_var(key, value) {
                     env.insert(key.clone(), value.clone());
                 }
@@ -211,7 +211,7 @@ fn exec_server_env_for_request(
         }
         (Some(exec_server_env_config.policy.clone()), env)
     } else {
-        (None, request.env.clone())
+        (None, request.env().clone())
     }
 }
 
@@ -236,14 +236,14 @@ fn exec_server_params_for_request(
             thread_id: Some(ctx.session.thread_id()),
             tool_call_id: Some(ctx.call_id.clone()),
         }),
-        argv: request.command.clone(),
-        cwd: request.cwd.clone(),
+        argv: request.argv().to_vec(),
+        cwd: request.cwd().clone(),
         env_policy,
         shell_snapshot: request.exec_server_shell_snapshot.clone(),
         env,
         tty,
         pipe_stdin: false,
-        arg0: request.arg0.clone(),
+        arg0: request.arg0().clone(),
         sandbox,
         enforce_managed_network: request.exec_server_enforce_managed_network,
         managed_network: request.exec_server_managed_network.clone(),
@@ -265,7 +265,6 @@ struct PreparedProcessHandles {
     process: Arc<UnifiedExecProcess>,
     output: OutputHandles,
     pause_state: Option<watch::Receiver<bool>>,
-    session: Option<Arc<crate::session::session::Session>>,
     network_approval: Option<DeferredNetworkApproval>,
     call_id: String,
     hook_command: String,
@@ -304,39 +303,20 @@ impl Drop for InitialExecCommandGuard {
     }
 }
 
-async fn unregister_network_approval_for_entry(entry: &ProcessEntry) {
-    if let Some(network_approval) = entry.network_approval.as_ref()
-        && let Some(session) = entry.session.upgrade()
-    {
-        session
-            .services
-            .network_approval
-            .unregister_call(network_approval.registration_id())
-            .await;
+fn unregister_network_approval_for_entry(entry: &ProcessEntry) {
+    if let Some(network_approval) = entry.network_approval.as_ref() {
+        let _ = network_approval.finish();
     }
 }
 
 async fn finish_network_approval_after_process_exit_for_entry(
     entry: &ProcessEntry,
 ) -> Result<(), String> {
-    let session = entry.session.upgrade();
-    finish_deferred_network_approval_after_process_exit_for_session(
-        session.as_ref(),
-        entry.network_approval.clone(),
-    )
-    .await
+    finish_deferred_network_approval_after_process_exit(entry.network_approval.clone()).await
 }
 
-async fn finish_deferred_network_approval_for_session(
-    session: Option<&Arc<crate::session::session::Session>>,
-    deferred: Option<DeferredNetworkApproval>,
-) -> Result<(), String> {
-    let Some(session) = session else {
-        return Ok(());
-    };
-    finish_deferred_network_approval(session.as_ref(), deferred)
-        .await
-        .map_err(network_approval_error_message)
+fn finish_network_approval(deferred: Option<DeferredNetworkApproval>) -> Result<(), String> {
+    finish_deferred_network_approval(deferred).map_err(network_approval_error_message)
 }
 
 fn network_approval_error_message(err: ToolError) -> String {
@@ -346,14 +326,8 @@ fn network_approval_error_message(err: ToolError) -> String {
     }
 }
 
-async fn network_denial_message_for_session(
-    session: Option<&Arc<crate::session::session::Session>>,
-    deferred: Option<DeferredNetworkApproval>,
-) -> String {
-    let Some(session) = session else {
-        return NETWORK_ACCESS_DENIED_MESSAGE.to_string();
-    };
-    match finish_deferred_network_approval(session.as_ref(), deferred).await {
+fn network_denial_message(deferred: Option<DeferredNetworkApproval>) -> String {
+    match finish_deferred_network_approval(deferred) {
         Ok(()) => NETWORK_ACCESS_DENIED_MESSAGE.to_string(),
         Err(err) => network_approval_error_message(err),
     }
@@ -368,8 +342,7 @@ async fn wait_for_late_network_denial(network_cancelled: &CancellationToken) -> 
     .is_ok()
 }
 
-async fn finish_deferred_network_approval_after_process_exit_for_session(
-    session: Option<&Arc<crate::session::session::Session>>,
+async fn finish_deferred_network_approval_after_process_exit(
     deferred: Option<DeferredNetworkApproval>,
 ) -> Result<(), String> {
     if let Some(approval) = &deferred {
@@ -381,7 +354,7 @@ async fn finish_deferred_network_approval_after_process_exit_for_session(
             _ = wait_for_late_network_denial(&network_cancelled) => {}
         }
     }
-    finish_deferred_network_approval_for_session(session, deferred).await
+    finish_network_approval(deferred)
 }
 
 fn fail_process_with_message(process: &UnifiedExecProcess, message: String) -> UnifiedExecError {
@@ -430,16 +403,20 @@ async fn emit_failed_initial_exec_end_if_unstored(
 }
 
 fn terminate_process_on_network_denial(
-    process: Arc<UnifiedExecProcess>,
-    session: std::sync::Weak<crate::session::session::Session>,
+    process: &Arc<UnifiedExecProcess>,
     deferred: DeferredNetworkApproval,
 ) -> tokio::task::JoinHandle<()> {
     let network_cancelled = deferred.cancellation_token();
     let process_exited = process.cancellation_token();
+    // Startup and the terminal registry own the process; observing it must not keep it alive.
+    let process = Arc::downgrade(process);
     tokio::spawn(async move {
         let denied = tokio::select! {
             _ = network_cancelled.cancelled() => true,
             _ = process_exited.cancelled() => {
+                if process.upgrade().is_none() {
+                    return;
+                }
                 // A yielded process stays registered until its next poll.
                 wait_for_late_network_denial(&network_cancelled).await
             }
@@ -447,9 +424,10 @@ fn terminate_process_on_network_denial(
         if !denied {
             return;
         }
-        let session = session.upgrade();
-        let message = network_denial_message_for_session(session.as_ref(), Some(deferred)).await;
-        process.fail_and_terminate(message);
+        let message = network_denial_message(Some(deferred));
+        if let Some(process) = process.upgrade() {
+            process.fail_and_terminate(message);
+        }
     })
 }
 
@@ -504,7 +482,7 @@ impl UnifiedExecProcessManager {
             store.remove(process_id)
         };
         if let Some(entry) = removed {
-            unregister_network_approval_for_entry(&entry).await;
+            unregister_network_approval_for_entry(&entry);
         }
     }
 
@@ -566,13 +544,9 @@ impl UnifiedExecProcessManager {
         if let Some(completion) = completion.as_ref() {
             let _ = completion.process.set(Arc::clone(&process));
         }
-        let network_denial_monitor = deferred_network_approval.as_ref().map(|deferred| {
-            terminate_process_on_network_denial(
-                Arc::clone(&process),
-                Arc::downgrade(&context.session),
-                deferred.clone(),
-            )
-        });
+        let network_denial_monitor = deferred_network_approval
+            .as_ref()
+            .map(|deferred| terminate_process_on_network_denial(&process, deferred.clone()));
 
         let output_buffer = Arc::clone(&process.output_handles().output_buffer);
         let model_context = context.step_context.model_context();
@@ -620,10 +594,7 @@ impl UnifiedExecProcessManager {
         // Persist live sessions and remote output that remains pollable after an early exit.
         let process_stored = (!process.has_exited() && process.exit_code().is_none())
             || (process.output_handles().drain_policy == OutputDrainPolicy::WaitForOutputClosure
-                && !process
-                    .output_handles()
-                    .output_closed
-                    .load(Ordering::Acquire));
+                && !process.output_handles().output_closed.is_cancelled());
         let mut initial_exec_command_guard = InitialExecCommandGuard {
             active: None,
             metrics_sidecar,
@@ -693,11 +664,7 @@ impl UnifiedExecProcessManager {
             .as_ref()
             .is_some_and(DeferredNetworkApproval::is_cancelled)
         {
-            let message = network_denial_message_for_session(
-                Some(&context.session),
-                deferred_network_approval.take(),
-            )
-            .await;
+            let message = network_denial_message(deferred_network_approval.take());
             emit_failed_initial_exec_end_if_unstored(
                 process_stored,
                 process.sandbox_type(),
@@ -715,11 +682,7 @@ impl UnifiedExecProcessManager {
             return Err(fail_process_with_message(process.as_ref(), message));
         }
         if let Some(message) = process.failure_message() {
-            let finish_result = finish_deferred_network_approval_for_session(
-                Some(&context.session),
-                deferred_network_approval.take(),
-            )
-            .await;
+            let finish_result = finish_network_approval(deferred_network_approval.take());
             emit_failed_initial_exec_end_if_unstored(
                 process_stored,
                 process.sandbox_type(),
@@ -757,12 +720,10 @@ impl UnifiedExecProcessManager {
                 } => (Some(process_id), exit_code),
                 ProcessStatus::Exited { exit_code, entry } => {
                     entry.process.cancellation_token().cancel();
-                    if let Err(message) =
-                        finish_deferred_network_approval_after_process_exit_for_session(
-                            Some(&context.session),
-                            deferred_network_approval.take(),
-                        )
-                        .await
+                    if let Err(message) = finish_deferred_network_approval_after_process_exit(
+                        deferred_network_approval.take(),
+                    )
+                    .await
                     {
                         return Err(fail_process_with_message(entry.process.as_ref(), message));
                     }
@@ -802,8 +763,7 @@ impl UnifiedExecProcessManager {
         } else {
             // Short-lived command: emit the completed command item immediately
             // using the same helper as the background watcher.
-            let finish_result = finish_deferred_network_approval_after_process_exit_for_session(
-                Some(&context.session),
+            let finish_result = finish_deferred_network_approval_after_process_exit(
                 deferred_network_approval.take(),
             )
             .await;
@@ -1000,7 +960,6 @@ impl UnifiedExecProcessManager {
             process,
             output,
             pause_state,
-            session,
             network_approval,
             call_id,
             hook_command,
@@ -1076,18 +1035,12 @@ impl UnifiedExecProcessManager {
             .as_ref()
             .is_some_and(DeferredNetworkApproval::is_cancelled)
         {
-            let message =
-                network_denial_message_for_session(session.as_ref(), network_approval.clone())
-                    .await;
+            let message = network_denial_message(network_approval.clone());
             self.release_process(process_id, Some(locked_process)).await;
             return Err(fail_process_with_message(process.as_ref(), message));
         }
         if let Some(message) = process.failure_message() {
-            let finish_result = finish_deferred_network_approval_for_session(
-                session.as_ref(),
-                network_approval.clone(),
-            )
-            .await;
+            let finish_result = finish_network_approval(network_approval.clone());
             self.release_process(process_id, Some(locked_process)).await;
             if let Err(message) = finish_result {
                 return Err(fail_process_with_message(process.as_ref(), message));
@@ -1183,7 +1136,7 @@ impl UnifiedExecProcessManager {
             if retention == OutputRetention::UntilCollected
                 && output.drain_policy == OutputDrainPolicy::WaitForOutputClosure
                 && !entry.process.termination_requested.load(Ordering::Acquire)
-                && (!output.output_closed.load(Ordering::Acquire)
+                && (!output.output_closed.is_cancelled()
                     || output
                         .output_buffer
                         .try_lock()
@@ -1230,13 +1183,10 @@ impl UnifiedExecProcessManager {
             .session
             .upgrade()
             .map(|session| session.subscribe_elicitation_pause_state());
-        let session = entry.session.upgrade();
-
         Ok(PreparedProcessHandles {
             process: Arc::clone(&entry.process),
             output,
             pause_state,
-            session,
             network_approval: entry.network_approval.clone(),
             call_id: entry.call_id.clone(),
             hook_command: entry.hook_command.clone(),
@@ -1306,7 +1256,7 @@ impl UnifiedExecProcessManager {
         );
         // Install the watcher before cancellable cleanup, and outside the process-store lock.
         if let Some(pruned_entry) = pruned_entry {
-            unregister_network_approval_for_entry(&pruned_entry).await;
+            unregister_network_approval_for_entry(&pruned_entry);
             pruned_entry.process.terminate();
         }
     }
@@ -1316,7 +1266,7 @@ impl UnifiedExecProcessManager {
         &self,
         process_id: i32,
         tool_ctx: &ToolCtx,
-        request: ExecRequest,
+        mut request: ExecRequest,
         network: Option<&NetworkProxy>,
         exec_server_env_config: Option<ExecServerEnvConfig>,
         shell_snapshot: Option<codex_exec_server::ShellSnapshotRequest>,
@@ -1329,11 +1279,8 @@ impl UnifiedExecProcessManager {
             .as_ref()
             .filter(|launch| launch.policy_decision_timeout_ms.is_some())
             .and_then(|launch| network?.remote_policy_decider(launch.proxy.allow_local_binding));
-        let request = ExecRequest {
-            exec_server_env_config,
-            exec_server_shell_snapshot: shell_snapshot,
-            ..request
-        };
+        request.exec_server_env_config = exec_server_env_config;
+        request.exec_server_shell_snapshot = shell_snapshot;
         self.open_session_with_prepared_exec_env(
             process_id,
             &request,
@@ -1403,12 +1350,13 @@ impl UnifiedExecProcessManager {
         }
 
         // TODO(anp): Keep PathUri through the local PTY/process launch boundary.
-        let native_cwd = request
-            .cwd
-            .to_abs_path()
-            .map_err(|_| UnifiedExecError::ForeignPath {
-                path: request.cwd.clone(),
-            })?;
+        let native_cwd =
+            request
+                .cwd()
+                .to_abs_path()
+                .map_err(|_| UnifiedExecError::ForeignPath {
+                    path: request.cwd().clone(),
+                })?;
 
         let (program, args) = request
             .program_and_args()
@@ -1416,14 +1364,14 @@ impl UnifiedExecProcessManager {
         let network_proxy_restricting_sid = {
             #[cfg(target_os = "windows")]
             {
-                if request.sandbox == codex_sandboxing::SandboxType::WindowsRestrictedToken {
-                    request
+                if let Some(launch) = request.native_windows() {
+                    launch
                         .network
                         .as_ref()
                         .map(|network| {
                             network
                                 .network_proxy_restricting_sid(
-                                    request.network_environment_id.as_deref(),
+                                    launch.network_environment_id.as_deref(),
                                 )
                                 .ok_or_else(|| {
                                     UnifiedExecError::create_process(
@@ -1443,26 +1391,24 @@ impl UnifiedExecProcessManager {
             }
         };
         let windows_sandbox =
-            if request.sandbox == codex_sandboxing::SandboxType::WindowsRestrictedToken {
-                Some(codex_sandboxing::WindowsSandboxSpawnRequest {
-                    permission_profile: &request.permission_profile,
+            request
+                .native_windows()
+                .map(|launch| codex_sandboxing::WindowsSandboxSpawnRequest {
+                    permission_profile: &launch.permission_profile,
                     workspace_roots: &request.windows_sandbox_workspace_roots,
-                    windows_sandbox_level: request.windows_sandbox_level,
-                    proxy_enforced: request.network.is_some(),
+                    windows_sandbox_level: launch.windows_sandbox_level,
+                    proxy_enforced: request.has_network_proxy(),
                     network_proxy_restricting_sid: network_proxy_restricting_sid.as_deref(),
                     proxy_settings_mode: windows_sandbox_proxy_settings_mode,
                     filesystem_overrides: request.windows_sandbox_filesystem_overrides.as_ref(),
-                })
-            } else {
-                None
-            };
+                });
         let spawn_result = codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
             program,
             args,
             cwd: native_cwd.as_path(),
-            env: &request.env,
-            arg0: &request.arg0,
-            sandbox: request.sandbox,
+            env: request.env(),
+            arg0: request.arg0(),
+            sandbox: request.sandbox(),
             windows_sandbox,
             tty,
             stdin_open: tty,
@@ -1471,7 +1417,7 @@ impl UnifiedExecProcessManager {
         .await;
         let spawned =
             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
-        UnifiedExecProcess::from_spawned(spawned, request.sandbox).await
+        UnifiedExecProcess::from_spawned(spawned, request.sandbox()).await
     }
 
     #[tracing::instrument(
@@ -1588,12 +1534,10 @@ impl UnifiedExecProcessManager {
             output_buffer,
             output_notify,
             output_closed,
-            output_closed_notify,
             cancellation_token,
             ..
         } = output;
         let mut collected = HeadTailBuffer::default();
-        let mut exit_signal_received = cancellation_token.is_cancelled();
         let mut post_exit_deadline: Option<Instant> = None;
         let stop_reason = loop {
             Self::extend_deadlines_while_paused(
@@ -1602,22 +1546,14 @@ impl UnifiedExecProcessManager {
                 &mut post_exit_deadline,
             )
             .await;
-            let drained_output: HeadTailBuffer<MAX_BYTES>;
-            let has_drained_output: bool;
-            let mut wait_for_output = None;
-            {
-                let mut guard = output_buffer.lock().await;
-                drained_output = std::mem::take(&mut guard.pending);
-                has_drained_output =
-                    drained_output.retained_bytes() > 0 || drained_output.omitted_bytes() > 0;
-                if !has_drained_output {
-                    wait_for_output = Some(output_notify.notified());
-                }
-            }
-
-            if !has_drained_output {
-                exit_signal_received |= cancellation_token.is_cancelled();
-                if exit_signal_received && output_closed.load(Ordering::Acquire) {
+            // Subscribe before draining. If closure races the drain, wake and
+            // drain again so the last chunk cannot land between an empty read and exit.
+            let notified = output_notify.notified();
+            let closed = output_closed.is_cancelled();
+            let drained_output = std::mem::take(&mut output_buffer.lock().await.pending);
+            if drained_output.total_bytes() == 0 {
+                let exit_signal_received = cancellation_token.is_cancelled();
+                if exit_signal_received && closed {
                     break StopReason::OutputClosed;
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1633,26 +1569,18 @@ impl UnifiedExecProcessManager {
                     if close_wait_remaining == Duration::ZERO {
                         break StopReason::PostExitDeadline;
                     }
-                    let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
-                    let closed = output_closed_notify.notified();
-                    tokio::pin!(notified);
-                    tokio::pin!(closed);
                     tokio::select! {
-                        _ = &mut notified => {}
-                        _ = &mut closed => {}
+                        _ = notified => {}
+                        _ = output_closed.cancelled() => {}
                         _ = tokio::time::sleep(close_wait_remaining) => break StopReason::PostExitDeadline,
                         _ = Self::wait_for_pause_change(pause_state.as_ref()) => {}
                     }
                     continue;
                 }
 
-                let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
-                tokio::pin!(notified);
-                let exit_notified = cancellation_token.cancelled();
-                tokio::pin!(exit_notified);
                 tokio::select! {
-                    _ = &mut notified => {}
-                    _ = &mut exit_notified => exit_signal_received = true,
+                    _ = notified => {}
+                    _ = cancellation_token.cancelled() => {}
                     _ = tokio::time::sleep(remaining) => break StopReason::Deadline,
                     _ = Self::wait_for_pause_change(pause_state.as_ref()) => {}
                 }
@@ -1661,7 +1589,6 @@ impl UnifiedExecProcessManager {
 
             collected.push_buffer(drained_output);
 
-            exit_signal_received |= cancellation_token.is_cancelled();
             if Instant::now() >= deadline {
                 break StopReason::Deadline;
             }
@@ -1676,11 +1603,8 @@ impl UnifiedExecProcessManager {
                 StopReason::PostExitDeadline => "post_exit_deadline",
             },
         );
-        span.record(
-            "exit_signaled",
-            exit_signal_received || cancellation_token.is_cancelled(),
-        );
-        span.record("output_closed", output_closed.load(Ordering::Acquire));
+        span.record("exit_signaled", cancellation_token.is_cancelled());
+        span.record("output_closed", output_closed.is_cancelled());
         span.record("outcome", "completed");
         collected
     }
@@ -1807,7 +1731,7 @@ impl UnifiedExecProcessManager {
         };
 
         for entry in entries {
-            unregister_network_approval_for_entry(&entry).await;
+            unregister_network_approval_for_entry(&entry);
             entry.process.terminate();
         }
     }
@@ -1881,7 +1805,7 @@ impl UnifiedExecProcessManager {
             entry
         };
 
-        unregister_network_approval_for_entry(&entry).await;
+        unregister_network_approval_for_entry(&entry);
         true
     }
 }

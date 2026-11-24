@@ -58,7 +58,7 @@ pub(crate) fn append_additional_context(
     });
     additional_contexts_for_model.push(AdditionalContext {
         context: crate::HookContext {
-            text: additional_context,
+            payload: crate::HookContextPayload::Text(additional_context),
             metadata: metadata.clone(),
         },
         limit: handler.additional_context_limit,
@@ -69,6 +69,33 @@ pub(crate) fn flatten_additional_contexts<'a>(
     additional_contexts: impl IntoIterator<Item = &'a [AdditionalContext]>,
 ) -> Vec<AdditionalContext> {
     additional_contexts.into_iter().flatten().cloned().collect()
+}
+
+/// Preserve failure diagnostics while applying the handler's opt-in blocking policy.
+pub(crate) fn apply_failure_policy(
+    handler: &ConfiguredHandler,
+    status: &mut HookRunStatus,
+    entries: &mut Vec<HookOutputEntry>,
+) -> Option<String> {
+    if *status != HookRunStatus::Failed {
+        return None;
+    }
+    let reason = handler.failure_block_reason()?;
+    *status = HookRunStatus::Blocked;
+    entries.push(HookOutputEntry {
+        kind: HookOutputEntryKind::Feedback,
+        text: reason.clone(),
+    });
+    Some(reason)
+}
+
+pub(crate) fn failure_block_reason(hook_events: &[HookCompletedEvent]) -> Option<String> {
+    hook_events
+        .iter()
+        .filter(|event| event.run.status == HookRunStatus::Blocked)
+        .flat_map(|event| &event.run.entries)
+        .find(|entry| entry.kind == HookOutputEntryKind::Feedback)
+        .map(|entry| entry.text.clone())
 }
 
 pub(crate) fn serialization_failure_hook_events(
@@ -93,6 +120,7 @@ pub(crate) fn serialization_failure_hook_events(
                 kind: HookOutputEntryKind::Error,
                 text: error_message.clone(),
             }];
+            apply_failure_policy(&handler, &mut run.status, &mut run.entries);
             HookCompletedEvent {
                 turn_id: turn_id.clone(),
                 run,

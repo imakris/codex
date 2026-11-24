@@ -79,6 +79,25 @@ pub(super) fn start_configured_pet_load_if_needed(
 }
 
 impl ChatWidget {
+    pub(super) fn tick_ambient_pet(&mut self) {
+        use crate::pets::PetNotificationKind;
+        use crate::terminal_program_status::ProgramStatus;
+
+        if self.ambient_pet.is_none() {
+            return;
+        }
+        let kind = match self.desired_program_status() {
+            ProgramStatus::Idle => None,
+            ProgramStatus::Working => Some(PetNotificationKind::Running),
+            ProgramStatus::Blocked(_) => Some(PetNotificationKind::Waiting),
+            ProgramStatus::Done => Some(PetNotificationKind::Review),
+            ProgramStatus::Error => Some(PetNotificationKind::Failed),
+        };
+        if let Some(pet) = &mut self.ambient_pet {
+            pet.sync_notification(kind);
+        }
+    }
+
     pub(super) fn set_ambient_pet_notification(
         &mut self,
         kind: crate::pets::PetNotificationKind,
@@ -108,6 +127,7 @@ impl ChatWidget {
         &self,
         area: Rect,
         composer_bottom_y: u16,
+        shortcut_hud_area: Option<Rect>,
     ) -> Option<crate::pets::AmbientPetDraw> {
         let questions_expanded = self
             .bottom_pane
@@ -141,7 +161,12 @@ impl ChatWidget {
             height: area.bottom().saturating_sub(top),
             ..area
         };
-        pet.draw_request(area, anchor_bottom_y)
+        let draw = pet.draw_request(area, anchor_bottom_y)?;
+        if shortcut_hud_area.is_some_and(|hud| hud.intersects(draw.area())) {
+            return None;
+        }
+        pet.schedule_next_frame();
+        Some(draw)
     }
 
     pub(super) fn ambient_pet_wrap_reserved_cols(&self) -> u16 {

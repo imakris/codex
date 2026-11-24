@@ -17,7 +17,7 @@ fn thread_settings_for_test(
         thread_settings: codex_app_server_protocol::ThreadSettings {
             disabled_plugin_ids: Vec::new(),
             environments: None,
-            cwd: test_path_buf("/tmp/thread-settings").abs(),
+            cwd: test_path_buf("/tmp/thread-settings").abs().into(),
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
             sandbox_policy: codex_app_server_protocol::SandboxPolicy::ReadOnly {
@@ -65,8 +65,8 @@ pub(super) fn configured_thread_session(
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/tmp/thread-settings").abs(),
-        runtime_workspace_roots: vec![test_path_buf("/tmp/thread-settings").abs()],
+        cwd: test_path_buf("/tmp/thread-settings").abs().into(),
+        runtime_workspace_roots: vec![test_path_buf("/tmp/thread-settings").abs().into()],
         instruction_source_paths: Vec::new(),
         reasoning_effort: None,
         collaboration_mode: None,
@@ -88,9 +88,10 @@ async fn session_header_uses_catalog_display_name_without_changing_model() {
         let mut preset = get_available_model(&chat, "gpt-5.5");
         preset.model = slug.to_string();
         preset.display_name = display_name.unwrap_or_default().to_string();
-        chat.model_catalog = Arc::new(ModelCatalog::new(
+        set_test_model_catalog(
+            &mut chat,
             display_name.map(|_| preset).into_iter().collect(),
-        ));
+        );
         chat.show_welcome_banner = first_event;
         chat.local_settings.tui.show_tooltips = false;
         let mut session = configured_thread_session(ThreadId::new());
@@ -296,7 +297,7 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
     let mut preset = get_available_model(&chat, "gpt-5.5");
     preset.model = "faster-model".to_string();
     preset.display_name = "Faster Model".to_string();
-    chat.model_catalog = Arc::new(ModelCatalog::new(vec![preset]));
+    set_test_model_catalog(&mut chat, vec![preset]);
     let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
 
     let notification = safety_buffering_notification(thread_id, turn_id, Some("faster-model"));
@@ -693,7 +694,7 @@ async fn statusline_workspace_follows_primary_executor_and_legacy_settings() {
     let id = ThreadId::new();
     chat.handle_thread_session(configured_thread_session(id));
     let mut update = thread_settings_for_test("gpt-5.2", id);
-    let host = update.thread_settings.cwd.to_string_lossy().into_owned();
+    let host = update.thread_settings.cwd.to_string();
     let remote = r"C:\executor\checkout";
     let primary = codex_app_server_protocol::ThreadEnvironment {
         environment_id: "remote".into(),
@@ -763,7 +764,8 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
     chat.set_feature_enabled(Feature::Apps, /*enabled*/ true);
     let thread_id = ThreadId::new();
     let mut session = configured_thread_session(thread_id);
-    session.cwd = test_path_buf("/tmp/original-workspace").abs();
+    session.cwd = test_path_buf("/tmp/original-workspace").abs().into();
+    session.runtime_workspace_roots = vec![session.cwd.clone()];
     session.thread_settings_confirmed = false;
     chat.handle_thread_session(session);
     chat.config.permissions.approval_policy =
@@ -776,11 +778,25 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
     });
     let _ = drain_insert_history(&mut rx);
 
+    let remote_cwd = if cfg!(windows) {
+        "/home/alice/repo"
+    } else {
+        r"D:\repo"
+    };
+    let mut notification = thread_settings_for_test("gpt-5.4", thread_id);
+    notification.thread_settings.cwd =
+        codex_utils_path_uri::LegacyAppPathString::from_string(remote_cwd);
     chat.handle_server_notification(
-        ServerNotification::ThreadSettingsUpdated(thread_settings_for_test("gpt-5.4", thread_id)),
+        ServerNotification::ThreadSettingsUpdated(notification),
         /*replay_kind*/ None,
     );
 
+    assert_eq!(chat.session_cwd().inferred_native_path_string(), remote_cwd);
+    assert_eq!(
+        chat.current_workspace_roots.as_slice(),
+        std::slice::from_ref(chat.session_cwd())
+    );
+    assert!(chat.config_ref().workspace_roots.is_empty());
     assert_ne!(chat.connector_scope_generation(), previous_generation);
     assert!(chat.connectors_for_mentions().is_none());
     assert!(chat.connectors.mention_refresh_in_flight);
@@ -1306,7 +1322,7 @@ async fn startup_config_warning_is_not_repeated_by_thread() {
             chat.remote_connection =
                 Some(crate::status::remote_connection::RemoteConnectionStatus {
                     address: "local".into(),
-                    version: "v0.153.0".into(),
+                    version: Some("v0.153.0".into()),
                     is_local_daemon: true,
                     is_managed_daemon: managed_daemon,
                 });

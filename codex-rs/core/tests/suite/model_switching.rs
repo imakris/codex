@@ -153,7 +153,6 @@ fn test_model_info(
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        web_search_provider: None,
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_image_detail_original: false,
         context_window: Some(272_000),
@@ -413,7 +412,7 @@ async fn model_change_respects_personality_opt_out_updates(
                 .expect("test model should have instruction metadata")
                 .instructions_template = Some(
                 "Catalog instructions.\n# Personality\nCatalog style.\n# Rules\nKeep the rules."
-                    .to_string(),
+                    .into(),
             );
         })
         .with_model("gpt-5.5")
@@ -1301,7 +1300,6 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        web_search_provider: None,
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_image_detail_original: false,
         context_window: Some(large_context_window),

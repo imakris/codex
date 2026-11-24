@@ -104,10 +104,7 @@ impl App {
             }
         }
         if self.current_displayed_thread_id() != Some(review.thread_id)
-            || self
-                .active_thread_rx
-                .as_ref()
-                .is_some_and(|rx| !rx.is_empty())
+            || self.active_thread_rx().is_some_and(|rx| !rx.is_empty())
             || !self.chat_widget.is_current_misalignment_review(&review)
         {
             return;
@@ -120,7 +117,7 @@ impl App {
             && !self.side_threads.contains_key(&review.thread_id);
         let eligible_account = self.chat_widget.daybreak_account_eligible();
         let cyber_access_program = match crate::daybreak::program_for_turn(
-            &self.chat_widget.model_catalog().models,
+            self.chat_widget.model_catalog().models(),
             self.chat_widget.current_model(),
             eligible_account,
             enabled,
@@ -158,8 +155,9 @@ impl App {
                 explicit_profile
                     .and_then(RuntimePermissionProfileOverride::turn_permission_profile),
             );
+            let cwd = self.chat_widget.session_cwd().to_path_buf();
             let Ok((sandbox_policy, permissions)) =
-                turn_permissions_overrides(permissions_override, config.cwd.as_path())
+                turn_permissions_overrides(permissions_override, &cwd)
             else {
                 self.chat_widget.add_error_message(
                     "Couldn’t continue this chat. Review its latest status before trying again."
@@ -167,9 +165,11 @@ impl App {
                 );
                 return;
             };
-            params.cwd = Some(config.cwd.to_path_buf());
-            params.runtime_workspace_roots =
-                Some(config.permissions.user_visible_workspace_roots().to_vec());
+            params.cwd = Some(cwd);
+            params.runtime_workspace_roots = app_server
+                .thread_params_mode()
+                .local_workspace_roots(config.permissions.user_visible_workspace_roots())
+                .map(<[_]>::to_vec);
             params.approval_policy = Some(config.permissions.approval_policy.value().into());
             params.sandbox_policy = sandbox_policy;
             params.permissions = permissions;

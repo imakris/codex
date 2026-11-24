@@ -18,6 +18,7 @@ pub(crate) mod telemetry;
 /// Path of the Responses endpoint, relative to a provider's base URL.
 pub const RESPONSES_PATH: &str = "/responses";
 
+pub use crate::requests::headers::X_CODEX_TURN_METADATA_HEADER;
 pub use crate::requests::headers::build_realtime_thread_headers;
 pub use crate::requests::headers::build_session_headers;
 pub use codex_client::RequestTelemetry;
@@ -35,6 +36,7 @@ pub use crate::auth::AuthRefreshFuture;
 pub use crate::auth::SharedAuthProvider;
 pub use crate::auth::auth_header_telemetry;
 pub use crate::common::AccessPrograms;
+pub use crate::common::MAX_RESPONSE_MESSAGE_BYTES;
 pub use crate::common::MemorySummarizeInput;
 pub use crate::common::MemorySummarizeOutput;
 pub use crate::common::OpenAiVerbosity;

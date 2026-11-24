@@ -1001,7 +1001,10 @@ impl LocalThreadStore {
             if plan.is_none()
                 && matches!(
                     &line.item,
-                    RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ThreadRolledBack(_))
+                    RolloutItem::EventMsg {
+                        event: codex_protocol::protocol::EventMsg::ThreadRolledBack(_),
+                        ..
+                    }
                 )
             {
                 return Ok(CanonicalizationAttempt::NeedsRollbackPlan);
@@ -1220,11 +1223,10 @@ impl LocalThreadStore {
                     } else {
                         project_rollout_line(&line)
                     },
-                    realtime_item: match line.item {
-                        RolloutItem::RealtimeItem(item) if !is_inherited_subagent_history => {
-                            Some(item)
-                        }
-                        _ => None,
+                    realtime_item: if is_inherited_subagent_history {
+                        None
+                    } else {
+                        line.item.realtime_item().map(std::borrow::Cow::into_owned)
                     },
                 },
             )));
@@ -1234,6 +1236,7 @@ impl LocalThreadStore {
                 thread_history::apply_projection(
                     self,
                     thread_id,
+                    /*rollout_path*/ None,
                     batch_start,
                     offset,
                     /*initial_ordinal*/ 0,
@@ -1248,6 +1251,7 @@ impl LocalThreadStore {
             thread_history::apply_projection(
                 self,
                 thread_id,
+                /*rollout_path*/ None,
                 batch_start,
                 offset,
                 /*initial_ordinal*/ 0,

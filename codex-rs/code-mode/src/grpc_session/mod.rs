@@ -43,8 +43,6 @@ use self::state::ClosedCell;
 use self::state::SessionState;
 use self::transport::GrpcTransport;
 use self::transport::SharedTransport;
-use crate::remote_session::ShutdownResultReceiver;
-use crate::remote_session::wait_for_watch;
 
 mod callbacks;
 mod completion;
@@ -58,9 +56,34 @@ mod state;
 mod transport;
 
 type GrpcClient = CodeModeHostClient<GrpcTransport>;
+type ShutdownResultReceiver = watch::Receiver<Option<Result<(), String>>>;
 
-#[derive(Clone)]
-struct SessionAdmission;
+async fn wait_for_watch<T>(
+    mut result_rx: watch::Receiver<Option<Result<T, String>>>,
+) -> Result<T, String>
+where
+    T: Clone,
+{
+    loop {
+        if let Some(result) = result_rx.borrow().clone() {
+            return result;
+        }
+        result_rx
+            .changed()
+            .await
+            .map_err(|_| "code-mode session transition stopped".to_string())?;
+    }
+}
+
+/// Request extension for calls with special host lifecycle requirements.
+/// Untagged calls need a running host and keep it active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrpcCallKind {
+    /// Opens a session and may start or replace the host.
+    Admission,
+    /// Samples a running host without extending its lifetime.
+    Observation,
+}
 
 const SHUTDOWN_ERROR: &str = "code mode session is shutting down";
 const ROUTE_HEADER: &str = "x-code-mode-route";
@@ -188,7 +211,7 @@ impl GrpcCodeModeSessionProvider {
                         }
                     },
                 });
-                request.extensions_mut().insert(SessionAdmission);
+                request.extensions_mut().insert(GrpcCallKind::Admission);
                 inject_span_traceparent(&mut request, &open_session_span);
                 let result = async {
                     let response = client.as_ref().clone().open_session(request).await?;

@@ -114,6 +114,7 @@ pub use proxy::PROXY_ENV_KEYS;
 pub use proxy::PROXY_GIT_SSH_COMMAND_ENV_KEY;
 pub use proxy::PROXY_URL_ENV_KEYS;
 pub use proxy::PreparedManagedNetwork;
+pub use proxy::PreparedNetworkRoute;
 pub use proxy::has_proxy_url_env_vars;
 pub use proxy::is_managed_proxy_env_var;
 pub use proxy::proxy_url_env_value;

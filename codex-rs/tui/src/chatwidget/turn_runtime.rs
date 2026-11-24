@@ -152,19 +152,13 @@ impl ChatWidget {
         });
         // For desktop notifications: prefer the notification payload, fall back to
         // the item-level copy source if present, otherwise send an empty string.
+        let committed = self.transcript.committed_turn_response.take();
         let notification_response = sanitized_last_agent_message
             .as_ref()
             .filter(|message| !message.is_empty())
             .cloned()
-            .or_else(|| {
-                if self.transcript.saw_copy_source_this_turn {
-                    self.transcript.last_agent_markdown.clone()
-                } else {
-                    None
-                }
-            })
+            .or_else(|| committed.map(|(_, text)| text))
             .unwrap_or_default();
-        self.transcript.saw_copy_source_this_turn = false;
         // If a stream is currently active, finalize it.
         self.flush_answer_and_plan_streams();
         self.flush_interrupt_activity();
@@ -436,7 +430,7 @@ impl ChatWidget {
         let can_enable_daybreak =
             self.daybreak_account_eligible() && !self.side_conversation_active();
         crate::daybreak::notice_for_setting(
-            &self.model_catalog.models,
+            self.model_catalog.models(),
             self.current_model(),
             self.daybreak_enabled && can_enable_daybreak,
             can_enable_daybreak,

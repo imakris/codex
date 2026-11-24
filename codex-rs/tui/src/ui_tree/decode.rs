@@ -37,11 +37,13 @@ impl std::str::FromStr for UiTree {
                     }
                 }
                 UiNode::Text { children, .. }
+                | UiNode::Code { children }
                 | UiNode::Bold { children }
                 | UiNode::Italic { children }
                 | UiNode::Underline { children }
                 | UiNode::Link { children, .. }
-                | UiNode::Row { children, .. } => {
+                | UiNode::Row { children, .. }
+                | UiNode::Col { children, .. } => {
                     pending.extend(children.iter().flatten().map(|child| (child, depth + 1)));
                 }
             }
@@ -60,6 +62,13 @@ pub(super) fn optional_token<'de, D: Deserializer<'de>, T: DeserializeOwned>(
 
 pub(super) fn token<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<T, D::Error> {
     T::deserialize(String::deserialize(d)?.into_deserializer())
+}
+
+// A present token must be a string. Serde defaults an omitted property to `None`.
+pub(super) fn present_token<'de, D: Deserializer<'de>, T: DeserializeOwned>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    token(d).map(Some)
 }
 
 pub(super) fn gap<'de, D: Deserializer<'de>>(de: D) -> Result<u64, D::Error> {

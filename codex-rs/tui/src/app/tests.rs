@@ -94,12 +94,16 @@ mod recap_generation;
 #[path = "tests/resume_shutdown_tests.rs"]
 mod resume_shutdown_tests;
 mod safety_buffering;
+#[cfg(not(windows))]
+pub(super) use safety_buffering::wait_for_turn_completed;
 #[path = "tests/saved_chat_loading_tests.rs"]
 mod saved_chat_loading;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
 #[path = "tests/side_chat_policy_tests.rs"]
 mod side_chat_policy_tests;
+#[path = "tests/sidebar_chooser_hover_tests.rs"]
+mod sidebar_chooser_hover_tests;
 mod startup;
 #[path = "tests/startup_frame_tests.rs"]
 mod startup_frame_tests;
@@ -689,8 +693,7 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
     .await?;
 
     let rx = app
-        .active_thread_rx
-        .as_mut()
+        .active_thread_rx_mut()
         .expect("primary thread receiver should be active");
     let event = time::timeout(Duration::from_millis(50), rx.recv())
         .await
@@ -817,8 +820,7 @@ async fn resolved_buffered_approval_does_not_become_actionable_after_drain() -> 
     while app_event_rx.try_recv().is_ok() {}
 
     let rx = app
-        .active_thread_rx
-        .as_mut()
+        .active_thread_rx_mut()
         .expect("primary thread receiver should be active");
     let event = time::timeout(Duration::from_millis(50), rx.recv())
         .await
@@ -1164,13 +1166,11 @@ async fn enqueue_thread_event_does_not_block_when_channel_full() -> Result<()> {
     .await
     .expect("enqueue_thread_notification blocked on a full channel")?;
 
-    let mut rx = app
+    let rx = &mut app
         .thread_event_channels
         .get_mut(&thread_id)
         .expect("missing thread channel")
-        .receiver
-        .take()
-        .expect("missing receiver");
+        .receiver;
 
     time::timeout(Duration::from_millis(50), rx.recv())
         .await
@@ -1218,8 +1218,7 @@ async fn active_thread_drain_yields_after_frame_deadline_without_dropping_events
         }
     );
     assert!(
-        app.active_thread_rx
-            .as_ref()
+        app.active_thread_rx()
             .is_some_and(|receiver| !receiver.is_empty()),
         "an expired frame deadline should preserve queued notifications"
     );
@@ -1230,8 +1229,7 @@ async fn active_thread_drain_yields_after_frame_deadline_without_dropping_events
 
     app.drain_active_thread_events(&mut tui).await?;
     assert!(
-        app.active_thread_rx
-            .as_ref()
+        app.active_thread_rx()
             .is_some_and(tokio::sync::mpsc::Receiver::is_empty),
         "the next foreground frame should deliver the preserved notification"
     );
@@ -1308,8 +1306,7 @@ async fn selected_side_thread_close_is_handled_by_foreground_event_owner() -> Re
     assert_eq!(app.active_thread_id, Some(side_thread_id));
     drain_app_events(&mut app, &mut tui, &mut app_server, &mut events).await?;
     let event = app
-        .active_thread_rx
-        .as_mut()
+        .active_thread_rx_mut()
         .expect("selected side thread should retain its receiver")
         .try_recv()
         .expect("thread closure should remain queued for the foreground loop");
@@ -1319,7 +1316,7 @@ async fn selected_side_thread_close_is_handled_by_foreground_event_owner() -> Re
     assert_eq!(app.active_thread_id, Some(primary_thread_id));
     assert!(!app.side_threads.contains_key(&side_thread_id));
     assert!(!app.thread_event_channels.contains_key(&side_thread_id));
-    assert!(app.active_thread_rx.is_some());
+    assert!(app.active_thread_rx().is_some());
     drain_app_events(&mut app, &mut tui, &mut app_server, &mut events).await?;
     app.refresh_owned_transcript(&mut tui)?;
     assert!(buffer_text(tui.terminal.previous_buffer()).contains("parent-24"));
@@ -1355,8 +1352,7 @@ async fn active_history_batch_is_delivered_without_replay_buffering() -> Result<
         .get_mut(&thread_id)
         .expect("missing thread channel");
     assert!(channel.store.lock().await.buffer.is_empty());
-    let mut receiver = channel.receiver.take().expect("missing receiver");
-    let delivered = time::timeout(Duration::from_millis(50), receiver.recv())
+    let delivered = time::timeout(Duration::from_millis(50), channel.receiver.recv())
         .await
         .expect("timed out waiting for history batch")
         .expect("missing history batch");
@@ -1402,8 +1398,8 @@ async fn replay_thread_snapshot_renders_only_retained_agent_message_deltas() {
         }
     }
 
-    app.store_active_thread_receiver().await;
-    let (_receiver, snapshot) = app
+    app.save_active_thread_state().await;
+    let snapshot = app
         .activate_thread_for_replay(thread_id)
         .await
         .expect("detached thread should reactivate for replay");
@@ -1476,7 +1472,7 @@ async fn replay_thread_snapshot_restores_draft_and_queued_input() {
         .capture_thread_input_state()
         .expect("expected thread input state");
 
-    app.store_active_thread_receiver().await;
+    app.save_active_thread_state().await;
 
     let snapshot = {
         let channel = app
@@ -1554,7 +1550,7 @@ async fn replay_thread_snapshot_restores_the_matching_safety_buffer_prompt() {
         .capture_thread_input_state()
         .expect("expected thread input state");
 
-    app.store_active_thread_receiver().await;
+    app.save_active_thread_state().await;
     let snapshot = {
         let channel = app
             .thread_event_channels
@@ -1973,7 +1969,7 @@ async fn replay_thread_snapshot_restores_pending_pastes_for_submit() {
         .capture_thread_input_state()
         .expect("expected thread input state");
 
-    app.store_active_thread_receiver().await;
+    app.save_active_thread_state().await;
 
     let snapshot = {
         let channel = app
@@ -2244,8 +2240,7 @@ async fn token_usage_update_refreshes_status_line_with_runtime_context_window() 
         (false, 900_000, "900K window · 8 used"),
     ] {
         let before = render_bottom_popup(&app.chat_widget, /*width*/ 60);
-        app.chat_widget
-            .set_feature_enabled(Feature::TuiExtensionsStatusLine, extensions);
+        app.chat_widget.statusline_feature_enabled = extensions;
         app.refresh_status_line();
         assert_eq!(render_bottom_popup(&app.chat_widget, /*width*/ 60), before);
         app.handle_thread_event_now(ThreadBufferedEvent::Notification(Box::new(
@@ -2262,43 +2257,6 @@ async fn token_usage_update_refreshes_status_line_with_runtime_context_window() 
             "{rendered}"
         );
     }
-}
-
-#[tokio::test]
-async fn collab_receiver_notification_caches_thread_without_app_server_read() {
-    let mut app = make_test_app().await;
-    let receiver_thread_id =
-        ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
-
-    app.handle_thread_event_now(ThreadBufferedEvent::Notification(Box::new(
-        ServerNotification::ItemStarted(ItemStartedNotification::new(
-            ThreadId::new().to_string(),
-            "turn-1".to_string(),
-            ThreadItemPayload::CollabAgentToolCall {
-                id: "wait-1".to_string(),
-                tool: codex_app_server_protocol::CollabAgentTool::Wait,
-                status: codex_app_server_protocol::CollabAgentToolCallStatus::InProgress,
-                sender_thread_id: ThreadId::new().to_string(),
-                receiver_thread_ids: vec![receiver_thread_id.to_string()],
-                prompt: None,
-                model: None,
-                reasoning_effort: None,
-                agents_states: HashMap::new(),
-            },
-            /*started_at_ms*/ 0,
-        )),
-    )));
-
-    assert_eq!(
-        app.agent_navigation.get(&receiver_thread_id),
-        Some(&AgentPickerThreadEntry {
-            agent_nickname: None,
-            agent_role: None,
-            agent_path: None,
-            is_running: false,
-            is_closed: false,
-        })
-    );
 }
 
 #[tokio::test]
@@ -2394,19 +2352,31 @@ async fn archived_untracked_threads_do_not_appear_in_agent_picker() -> Result<()
     );
     app.thread_event_channels
         .insert(archived_thread_id, ThreadEventChannel::new(/*capacity*/ 1));
+    let unloaded = ThreadId::new();
+    let metadata = crate::multi_agents::AgentMetadata {
+        agent_nickname: Some("Kepler".into()),
+        agent_role: Some("explorer".into()),
+    };
     let request_id = app
         .agent_navigation
         .begin_picker_refresh(primary_thread_id)
         .expect("picker refresh after missed archive");
-    app.apply_agent_picker_thread_refresh(
-        &app_server,
-        primary_thread_id,
-        request_id,
-        Ok(crate::app_event::AgentPickerThreadRefresh {
-            threads: Vec::new(),
-            archived_thread_ids: std::collections::HashSet::from([archived_thread_id]),
-        }),
+    assert!(
+        app.apply_agent_picker_thread_refresh(
+            &app_server,
+            primary_thread_id,
+            request_id,
+            Ok(crate::app_event::AgentPickerThreadRefresh {
+                threads: Vec::new(),
+                archived_threads: HashMap::from([
+                    (archived_thread_id, Default::default()),
+                    (unloaded, metadata.clone()),
+                ]),
+            }),
+        )
+        .is_none()
     );
+    assert_eq!(app.chat_widget.collab_agent_metadata(unloaded), metadata);
     assert_eq!(
         app.thread_event_channels[&archived_thread_id].attachment(),
         ThreadEventAttachment::ReplayOnly
@@ -3231,7 +3201,10 @@ async fn docked_replay_finishes_while_skills_refresh_is_pending() -> Result<()> 
     app.chat_widget.sync_plugin_mentions_config(&app.config);
     let mut tui = crate::tui::test_support::make_test_tui()?;
     tui.set_owned_screen(/*owned*/ true)?;
-    let cwd = app.chat_widget.config_ref().cwd.to_path_buf();
+    let mut session = test_thread_session(parent, app.config.cwd.to_path_buf());
+    session.cwd = codex_utils_path_uri::PathUri::parse("file:///D:/Workspace")?;
+    app.chat_widget.handle_thread_session(session);
+    let cwd = codex_utils_path_uri::PathUri::parse("file:///D:/workspace")?;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?;
@@ -3265,7 +3238,7 @@ async fn docked_replay_finishes_while_skills_refresh_is_pending() -> Result<()> 
         app.pending_thread_switch_resets = 1;
         app.app_event_tx
             .send(AppEvent::CodexOp(AppCommand::list_skills(
-                vec![cwd.clone()],
+                cwd.clone(),
                 /*force_reload*/ true,
             )));
         app.app_event_tx
@@ -3281,7 +3254,7 @@ async fn docked_replay_finishes_while_skills_refresh_is_pending() -> Result<()> 
             .expect("skills/list should be requested");
         assert_eq!(
             params,
-            Some(serde_json::json!({"cwds": [cwd], "forceReload": true}))
+            Some(serde_json::json!({"cwds": [r"D:\workspace"], "forceReload": true}))
         );
         assert!(!app.awaiting_side_replay(&tui));
 
@@ -3355,6 +3328,7 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
         .fork_side_thread(
             &app.local_settings,
             config.clone(),
+            /*workspace_roots*/ None,
             parent,
             /*selected_profile*/ None,
             SideChatStorage::Attached,
@@ -3366,6 +3340,7 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
         .sidebar_fork(
             app.local_settings.clone(),
             config.clone(),
+            /*workspace_roots*/ None,
             parent,
             /*profile*/ None,
             SideChatStorage::Attached,
@@ -3376,6 +3351,7 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
         .fork_side_thread(
             &app.local_settings,
             config.clone(),
+            /*workspace_roots*/ None,
             parent,
             /*selected_profile*/ None,
             SideChatStorage::Attached,
@@ -4705,7 +4681,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         app.transcript_view.end_select_mode();
         let reopened = side_frame(&mut app, &mut tui, size)?;
         assert!(
-            reopened.contains(child_row) && reopened.contains("child draft!"),
+            reopened.contains("child-29") && reopened.contains("child draft!"),
             "{reopened}"
         );
         assert_eq!(
@@ -4991,8 +4967,10 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     }
     let zoom = KeyEvent::from(KeyCode::Char('z'));
     keys!(prefix, zoom);
+    assert!(app.conversation_frame.side_pane().is_none());
     let zoomed = side_frame(&mut app, &mut tui, wide)?;
     keys!(prefix, zoom);
+    assert!(app.conversation_frame.side_pane().is_some());
     let restored = side_frame(&mut app, &mut tui, wide)?;
     assert_eq!(divider_at(&tui, 0), 197);
     keys!(prefix, zoom);
@@ -5380,7 +5358,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     let header = frame.lines().next().unwrap().split_once('│').unwrap().1;
     insta::assert_snapshot!(
         header.split_inclusive('×').take(2).collect::<String>(),
-        @" ☁︎ Investigate …×  ☁︎ Fix cache    ×"
+        @" ☁️  Investigate… ×   ☁️  Fix cache    ×"
     );
     keys!(prefix, chooser_key);
     let frame = side_frame(&mut app, &mut tui, even)?;
@@ -5390,12 +5368,12 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         .filter_map(|line| line.split_once('│').map(|(_, pane)| pane))
         .filter(|pane| pane.contains("Investigate rendering") || pane.contains("Fix cache"))
         .map(|pane| pane.trim().trim_start_matches(['›', '○', ' ']))
-        .filter(|pane| pane.starts_with("☁︎"))
+        .filter(|pane| pane.starts_with("☁️"))
         .collect::<Vec<_>>()
         .join("\n");
     insta::assert_snapshot!(labels, @"
-    ☁︎ Investigate rendering
-    ☁︎ Fix cache
+    ☁️  Investigate rendering
+    ☁️  Fix cache
     ");
     keys!(KeyCode::Enter.into());
     app.backend_registry = local_registry;
@@ -5568,7 +5546,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
             .collect::<Vec<_>>()
             .try_into()
             .expect("both side-chat tabs are visible");
-        assert_eq!(selected.x, inactive.right() + 2);
+        assert_eq!(selected.x, inactive.right() + 4);
         assert_eq!(inactive.width, selected.width);
         let [inactive, selected] = [inactive, selected].map(|area| area.x + 1);
         for (state, column, row, palette, redraw) in [
@@ -5666,11 +5644,17 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     let close_x = (chooser.x..chooser.right())
         .rfind(|&x| tui.terminal.previous_buffer()[(x, chooser.y)].symbol() == "×")
         .expect("close button on the second tab");
+    let hover = mouse(MouseEventKind::Moved, close_x - 1, chooser.y);
+    boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, hover)).await?;
+    side_frame(&mut app, &mut tui, even)?;
+    let buffer = tui.terminal.previous_buffer();
+    let style = |x| buffer[(x, chooser.y)].style();
+    assert_eq!([close_x - 1, close_x + 1].map(style), [style(close_x); 2]);
     for kind in [down, release] {
         boxed_future!(app.handle_tui_event(
             &mut tui,
             &mut app_server,
-            mouse(kind, close_x, chooser.y)
+            mouse(kind, close_x + 1, chooser.y)
         ))
         .await?;
     }
@@ -5690,7 +5674,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         boxed_future!(app.handle_tui_event(
             &mut tui,
             &mut app_server,
-            mouse(kind, close_x - 1, chooser.y)
+            mouse(kind, close_x - 2, chooser.y)
         ))
         .await?;
     }
@@ -5716,7 +5700,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         boxed_future!(app.handle_tui_event(
             &mut tui,
             &mut app_server,
-            mouse(kind, close_x, chooser.y)
+            mouse(kind, close_x - 1, chooser.y)
         ))
         .await?;
     }
@@ -7554,6 +7538,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
     model.model = "gpt-agent".into();
     model.available_access_programs = Some(codex_protocol::openai_models::ModelAccessPrograms {
+        daybreak_availability: Default::default(),
         cyber: vec![codex_protocol::turn_input::CyberAccessProgram::DaybreakBlue],
     });
     crate::chatwidget::tests::helpers::set_test_model_catalog(&mut app.chat_widget, vec![model]);
@@ -7578,7 +7563,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
         windows_sandbox_host: WindowsSandboxHost::Local,
         approval_policy: AskForApproval::OnRequest,
         permission_profile: PermissionProfile::workspace_write(),
-        runtime_workspace_roots: vec![primary_cwd.clone(), shared_root.clone()],
+        runtime_workspace_roots: vec![primary_cwd.clone().into(), shared_root.clone().into()],
         ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
     };
 
@@ -7617,6 +7602,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
                 section_entered_at: None,
                 project_id: None,
                 daybreak_enabled: Some(true),
+                daybreak_program_propagation_enrolled: None,
                 history_mode: Default::default(),
                 model_provider: "openai".to_string(),
                 model: Some("gpt-agent".to_string()),
@@ -7626,7 +7612,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
                 recency_at: Some(2),
                 status: codex_app_server_protocol::ThreadStatus::Idle,
                 path: Some(rollout_path.clone()),
-                cwd: test_path_buf("/tmp/agent").abs(),
+                cwd: test_path_buf("/tmp/agent").abs().into(),
                 cli_version: "0.0.0".to_string(),
                 source: codex_app_server_protocol::SessionSource::Unknown,
                 can_accept_direct_input: None,
@@ -7660,10 +7646,10 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     assert_eq!(session.model, "gpt-agent");
     assert_eq!(session.model_provider_id, "openai");
     assert_eq!(session.approval_policy, primary_session.approval_policy);
-    assert_eq!(session.cwd.as_path(), test_path_buf("/tmp/agent").as_path());
+    assert_eq!(session.cwd.to_path_buf(), test_path_buf("/tmp/agent"));
     assert_eq!(
         session.runtime_workspace_roots,
-        vec![test_path_buf("/tmp/agent").abs(), shared_root]
+        vec![test_path_buf("/tmp/agent").abs().into(), shared_root.into()]
     );
     assert_eq!(session.rollout_path, Some(rollout_path));
     assert_eq!(
@@ -7703,7 +7689,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
     let primary_session = ThreadSessionState {
         approval_policy: AskForApproval::OnRequest,
         permission_profile: PermissionProfile::workspace_write(),
-        runtime_workspace_roots: vec![primary_cwd.clone()],
+        runtime_workspace_roots: vec![primary_cwd.clone().into()],
         ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
     };
 
@@ -7737,6 +7723,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
                 section_entered_at: None,
                 project_id: None,
                 daybreak_enabled: None,
+                daybreak_program_propagation_enrolled: None,
                 history_mode: Default::default(),
                 model_provider: "agent-provider".to_string(),
                 model: None,
@@ -7746,7 +7733,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
                 recency_at: Some(2),
                 status: codex_app_server_protocol::ThreadStatus::Idle,
                 path: None,
-                cwd: test_path_buf("/tmp/agent").abs(),
+                cwd: test_path_buf("/tmp/agent").abs().into(),
                 cli_version: "0.0.0".to_string(),
                 source: codex_app_server_protocol::SessionSource::Unknown,
                 can_accept_direct_input: None,
@@ -7793,7 +7780,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
     let primary_session = ThreadSessionState {
         approval_policy: AskForApproval::OnRequest,
         permission_profile: PermissionProfile::workspace_write(),
-        runtime_workspace_roots: vec![primary_cwd.clone()],
+        runtime_workspace_roots: vec![primary_cwd.clone().into()],
         ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
     };
 
@@ -7812,6 +7799,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
         section_entered_at: None,
         project_id: None,
         daybreak_enabled: None,
+        daybreak_program_propagation_enrolled: None,
         history_mode: Default::default(),
         model_provider: "read-provider".to_string(),
         model: Some("server-reported-model".to_string()),
@@ -7821,7 +7809,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
         recency_at: Some(2),
         status: codex_app_server_protocol::ThreadStatus::Idle,
         path: None,
-        cwd: test_path_buf("/tmp/read").abs(),
+        cwd: test_path_buf("/tmp/read").abs().into(),
         cli_version: "0.0.0".to_string(),
         source: codex_app_server_protocol::SessionSource::Unknown,
         can_accept_direct_input: None,
@@ -7834,22 +7822,22 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
     };
 
     let cold_session = app
-        .session_state_for_thread_read(read_thread_id, &thread)
+        .session_state_for_thread_read(read_thread_id, &thread, thread.cwd.to_inferred_path_uri())
         .await;
     assert!(cold_session.read_only_history);
 
     app.primary_session_configured = Some(primary_session);
     let session = app
-        .session_state_for_thread_read(read_thread_id, &thread)
+        .session_state_for_thread_read(read_thread_id, &thread, thread.cwd.to_inferred_path_uri())
         .await;
 
     assert!(session.read_only_history);
     assert_eq!(session.thread_id, read_thread_id);
     assert_eq!(session.model, "server-reported-model");
-    assert_eq!(session.cwd.as_path(), test_path_buf("/tmp/read").as_path());
+    assert_eq!(session.cwd.to_path_buf(), test_path_buf("/tmp/read"));
     assert_eq!(
         session.runtime_workspace_roots,
-        vec![test_path_buf("/tmp/read").abs()]
+        vec![test_path_buf("/tmp/read").abs().into()]
     );
     let expected_permission_profile = app
         .chat_widget
@@ -8420,6 +8408,7 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
                 thread_id: Some(child_thread_id.to_string()),
                 name: "sentry".to_string(),
                 status: McpServerStartupState::Failed,
+                duration_ms: None,
                 error: Some("sentry is not logged in".to_string()),
                 failure_reason: None,
             }),
@@ -8477,39 +8466,6 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
             .matches("MCP startup incomplete (failed: sentry)")
             .count(),
         1
-    );
-}
-
-#[tokio::test]
-async fn app_scoped_mcp_startup_notifications_do_not_render_in_active_thread() {
-    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-    while app_event_rx.try_recv().is_ok() {}
-    let app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
-        .await
-        .expect("embedded app server");
-    let thread_id = ThreadId::new();
-    app.primary_thread_id = Some(thread_id);
-    app.active_thread_id = Some(thread_id);
-
-    app.handle_app_server_event(
-        &app_server,
-        codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
-            ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
-                environment_id: None,
-                thread_id: None,
-                name: "sentry".to_string(),
-                status: McpServerStartupState::Failed,
-                error: Some("sentry is not logged in".to_string()),
-                failure_reason: None,
-            }),
-        )),
-    )
-    .await;
-
-    assert!(app_event_rx.try_recv().is_err());
-    assert_eq!(
-        app.chat_widget.active_cell_transcript_lines(/*width*/ 120),
-        None
     );
 }
 
@@ -8580,6 +8536,7 @@ async fn active_side_thread_renders_live_mcp_startup_notifications() {
                     thread_id: Some(side_thread_id.to_string()),
                     name: name.to_string(),
                     status,
+                    duration_ms: None,
                     error: matches!(status, McpServerStartupState::Failed)
                         .then(|| "sentry is not logged in".to_string()),
                     failure_reason: None,
@@ -8588,8 +8545,7 @@ async fn active_side_thread_renders_live_mcp_startup_notifications() {
         )
         .await;
         let event = app
-            .active_thread_rx
-            .as_mut()
+            .active_thread_rx_mut()
             .expect("side thread receiver")
             .try_recv()
             .expect("startup notification");
@@ -8970,7 +8926,7 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
             approvals_reviewer: ApprovalsReviewer::User,
             permission_profile: PermissionProfile::read_only(),
             active_permission_profile: None,
-            cwd: test_path_buf("/tmp/project").abs(),
+            cwd: test_path_buf("/tmp/project").abs().into(),
             runtime_workspace_roots: Vec::new(),
             instruction_source_paths: Vec::new(),
             reasoning_effort: Some(ReasoningEffortConfig::High),
@@ -9179,6 +9135,7 @@ async fn make_test_app() -> Box<App> {
         statusline_picker: None,
         statusline_metrics: Default::default(),
         provider_writes: HashMap::new(),
+        realtime_call_client: Arc::default(),
         feature_write_lock: Arc::default(),
         config_notification_test_generation: 0,
         config_notification_test_pending: None,
@@ -9220,6 +9177,7 @@ async fn make_test_app() -> Box<App> {
         transcript_reflow: TranscriptReflowState::default(),
         initial_history_replay_buffer: None,
         pending_thread_switch_resets: 0,
+        pending_input_drain: None,
         scrollback_has_older_history: false,
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
@@ -9248,6 +9206,7 @@ async fn make_test_app() -> Box<App> {
         daemon_cli_executable: None,
         pending_update_action: None,
         daemon_restart: None,
+        remote_control_pending: false,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
@@ -9267,6 +9226,7 @@ async fn make_test_app() -> Box<App> {
         side_threads: HashMap::new(),
         saved_openings: Default::default(),
         sidebars: HashMap::new(),
+        model_preview_load: None,
         side_companions: HashMap::new(),
         zoomed_thread: None,
         exact_sidebar_width: None,
@@ -9276,7 +9236,6 @@ async fn make_test_app() -> Box<App> {
         sidebar_press: None,
         abandoned_side_threads: HashSet::new(),
         active_thread_id: None,
-        active_thread_rx: None,
         primary_thread_id: None,
         last_subagent_backfill_attempt: None,
         primary_session_configured: None,
@@ -9325,6 +9284,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             statusline_picker: None,
             statusline_metrics: Default::default(),
             provider_writes: HashMap::new(),
+            realtime_call_client: Arc::default(),
             feature_write_lock: Arc::default(),
             config_notification_test_generation: 0,
             config_notification_test_pending: None,
@@ -9366,6 +9326,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             transcript_reflow: TranscriptReflowState::default(),
             initial_history_replay_buffer: None,
             pending_thread_switch_resets: 0,
+            pending_input_drain: None,
             scrollback_has_older_history: false,
             enhanced_keys_supported: false,
             keymap: crate::keymap::RuntimeKeymap::defaults(),
@@ -9394,6 +9355,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             daemon_cli_executable: None,
             pending_update_action: None,
             daemon_restart: None,
+            remote_control_pending: false,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
@@ -9413,6 +9375,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             side_threads: HashMap::new(),
             saved_openings: Default::default(),
             sidebars: HashMap::new(),
+            model_preview_load: None,
             side_companions: HashMap::new(),
             zoomed_thread: None,
             exact_sidebar_width: None,
@@ -9422,7 +9385,6 @@ pub(super) async fn make_test_app_with_channels() -> (
             sidebar_press: None,
             abandoned_side_threads: HashSet::new(),
             active_thread_id: None,
-            active_thread_rx: None,
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
             primary_session_configured: None,
@@ -9706,13 +9668,13 @@ pub(super) fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSe
         fork_parent_title: None,
         thread_name: None,
         model: "gpt-test".to_string(),
-        model_provider_id: "test-provider".to_string(),
+        model_provider_id: "openai".to_string(),
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: cwd.abs(),
+        cwd: cwd.abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: None,
@@ -10253,6 +10215,7 @@ async fn directive_only_completion_removes_streamed_directive() -> Result<()> {
     app.handle_consolidate_agent_message(
         &mut tui,
         AgentMarkdownCell::new(String::new(), Path::new("/tmp")),
+        /*emitted_cells*/ 1,
         ConsolidationScrollbackReflow::Required,
         /*deferred_history_cell*/ None,
     )?;
@@ -10300,6 +10263,7 @@ async fn required_stream_reflow_during_capped_initial_replay_survives_transcript
                 .into(),
             Path::new("/tmp"),
         ),
+        /*emitted_cells*/ 1,
         ConsolidationScrollbackReflow::Required,
         /*deferred_history_cell*/ None,
     )?;
@@ -10397,7 +10361,7 @@ async fn resizing_empty_transcript_schedules_settled_size_recheck() {
     );
 }
 
-fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItemPayload>) -> Turn {
+pub(super) fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItemPayload>) -> Turn {
     Turn {
         id: turn_id.to_string(),
         root_turn_id: None,
@@ -10983,7 +10947,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
             approvals_reviewer: ApprovalsReviewer::User,
             permission_profile: PermissionProfile::read_only(),
             active_permission_profile: None,
-            cwd: test_path_buf("/home/user/project").abs(),
+            cwd: test_path_buf("/home/user/project").abs().into(),
             runtime_workspace_roots: Vec::new(),
             instruction_source_paths: Vec::new(),
             reasoning_effort: None,
@@ -11059,7 +11023,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
             approvals_reviewer: ApprovalsReviewer::User,
             permission_profile: PermissionProfile::read_only(),
             active_permission_profile: None,
-            cwd: test_path_buf("/home/user/project").abs(),
+            cwd: test_path_buf("/home/user/project").abs().into(),
             runtime_workspace_roots: Vec::new(),
             instruction_source_paths: Vec::new(),
             reasoning_effort: None,
@@ -12386,7 +12350,7 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
         }],
     )];
     let resumed_session = ThreadSessionState {
-        cwd: test_path_buf("/tmp/refreshed").abs(),
+        cwd: test_path_buf("/tmp/refreshed").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         ..initial_session.clone()
@@ -12458,7 +12422,7 @@ async fn new_session_requests_shutdown_for_previous_conversation() {
             approvals_reviewer: ApprovalsReviewer::User,
             permission_profile: PermissionProfile::read_only(),
             active_permission_profile: None,
-            cwd: test_path_buf("/home/user/project").abs(),
+            cwd: test_path_buf("/home/user/project").abs().into(),
             runtime_workspace_roots: Vec::new(),
             instruction_source_paths: Vec::new(),
             reasoning_effort: None,
@@ -12715,7 +12679,10 @@ async fn selecting_cyber_model_defaults_active_thread_to_auto_review() {
             .find(|model| model.model == "gpt-5.5")
             .expect("gpt-5.5 model");
         model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
-        app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
+        app.model_catalog = Arc::new(ModelCatalog::new(
+            vec![model],
+            Some(app.config.model_provider_id.clone()),
+        ));
 
         let mut app_server =
             crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
@@ -12833,7 +12800,10 @@ async fn changing_cyber_model_reasoning_preserves_selected_permissions() {
             .find(|model| model.model == model_name)
             .expect("current model");
         model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
-        app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
+        app.model_catalog = Arc::new(ModelCatalog::new(
+            vec![model],
+            Some(app.config.model_provider_id.clone()),
+        ));
 
         assert!(
             app.apply_permission_profile_selection(PermissionProfileSelection {
@@ -12968,7 +12938,10 @@ async fn selecting_cyber_model_falls_back_to_user_when_auto_review_is_unavailabl
         .find(|model| model.model == "gpt-5.5")
         .expect("gpt-5.5 model");
     model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
-    app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
+    app.model_catalog = Arc::new(ModelCatalog::new(
+        vec![model],
+        Some(app.config.model_provider_id.clone()),
+    ));
     let _ = app.config.features.disable(Feature::GuardianApproval);
     app.chat_widget
         .set_feature_enabled(Feature::GuardianApproval, /*enabled*/ false);
@@ -13023,7 +12996,10 @@ async fn selecting_cyber_model_respects_auto_review_requirements() {
             .find(|model| model.model == "gpt-5.5")
             .expect("gpt-5.5 model");
         model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
-        app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
+        app.model_catalog = Arc::new(ModelCatalog::new(
+            vec![model],
+            Some(app.config.model_provider_id.clone()),
+        ));
 
         let mut app_server =
             crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
@@ -13160,7 +13136,7 @@ async fn inactive_thread_settings_notification_updates_cached_collaboration_mode
         thread_settings: ThreadSettings {
             disabled_plugin_ids: Vec::new(),
             environments: None,
-            cwd: test_absolute_path("/tmp/thread-settings"),
+            cwd: test_absolute_path("/tmp/thread-settings").into(),
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
             sandbox_policy: codex_app_server_protocol::SandboxPolicy::ReadOnly {
@@ -13240,7 +13216,7 @@ async fn clear_only_ui_reset_preserves_chat_session_state() {
             approvals_reviewer: ApprovalsReviewer::User,
             permission_profile: PermissionProfile::read_only(),
             active_permission_profile: None,
-            cwd: test_path_buf("/tmp/project").abs(),
+            cwd: test_path_buf("/tmp/project").abs().into(),
             runtime_workspace_roots: Vec::new(),
             instruction_source_paths: Vec::new(),
             reasoning_effort: None,

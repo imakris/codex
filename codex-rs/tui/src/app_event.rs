@@ -298,7 +298,8 @@ pub(crate) struct AgentsOverviewThreadRefresh {
 #[derive(Debug, Default)]
 pub(crate) struct AgentPickerThreadRefresh {
     pub(crate) threads: Vec<Thread>,
-    pub(crate) archived_thread_ids: std::collections::HashSet<ThreadId>,
+    pub(crate) archived_threads:
+        std::collections::HashMap<ThreadId, crate::multi_agents::AgentMetadata>,
 }
 
 /// Source-backed replacement for the outgoing widget's width-bound streaming rows.
@@ -322,7 +323,7 @@ pub(crate) struct CapturedSideDisplay {
     pub(crate) status_line: Option<crate::bottom_pane::StatusLine>,
     pub(crate) work: Option<CapturedSideWork>,
     pub(crate) last_completed_agent_message: Option<(String, String)>,
-    pub(crate) cwd: AbsolutePathBuf,
+    pub(crate) cwd: PathBuf,
     pub(crate) visualizations: Option<crate::inline_visualization::InlineVisualizationContext>,
 }
 
@@ -367,6 +368,15 @@ pub(crate) enum AppEvent {
         notice: crate::security_setup::Notice,
     },
     OpenDaemonMenu,
+    RemoteControl(crate::app::remote_control::Action),
+    RemoteControlForBackend {
+        backend_id: crate::backend_id::BackendId,
+        action: crate::app::remote_control::Action,
+    },
+    RemoteControlFinished {
+        backend_id: crate::backend_id::BackendId,
+        result: crate::app::remote_control::Outcome,
+    },
     ConfirmDaemonRestart,
     RunDaemonRestart,
     ConfirmDaemonUpdate(crate::update_action::DaemonUpdateSource),
@@ -393,7 +403,7 @@ pub(crate) enum AppEvent {
     /// Create an empty thread from the command center.
     NewAgentsOverviewSession {
         backend_id: Option<crate::backend_id::BackendId>,
-        cwd: Option<AbsolutePathBuf>,
+        cwd: Option<PathBuf>,
     },
     /// Update the agents overview after a background thread listing finishes.
     AgentsOverviewThreadsLoaded {
@@ -401,8 +411,17 @@ pub(crate) enum AppEvent {
         result: Result<AgentsOverviewThreadRefresh, String>,
     },
     /// Switch to a root session selected from the shared dashboard.
+    /// Open a linked conversation in its owning session tree.
+    OpenThreadLink {
+        thread_id: ThreadId,
+    },
     SelectAgentsOverviewThread {
         thread_id: ThreadId,
+    },
+    /// Refresh the resumed task's agent list after its transcript replay reaches the screen.
+    BackfillResumedSubagents {
+        thread_id: ThreadId,
+        backend_id: crate::backend_id::BackendId,
     },
     /// Create an empty session in a worktree from the selected project's default branch.
     NewAgentsOverviewWorktree {
@@ -480,6 +499,8 @@ pub(crate) enum AppEvent {
     },
     /// Open the agent picker for switching active threads.
     OpenAgentPicker,
+    /// Discover saved subagents on the owning backend after attaching a primary thread.
+    DiscoverSidebarAgents(ThreadId),
     /// Merge a completed root-scoped agent-picker refresh without blocking terminal input.
     AgentPickerThreadsLoaded {
         primary_thread_id: ThreadId,
@@ -525,10 +546,20 @@ pub(crate) enum AppEvent {
         request: uuid::Uuid,
     },
     StartQueuedSavedChat,
+    OpenSidebarAgent {
+        backend: crate::backend_id::BackendId,
+        source: ThreadId,
+        agent: ThreadId,
+    },
     OpenSidebarDocument {
         backend_id: crate::backend_id::BackendId,
         source: ThreadId,
         link: crate::markdown_render::FileLink,
+    },
+    OpenModelSidebarDocument {
+        backend: crate::backend_id::BackendId,
+        thread_id: ThreadId,
+        document: crate::open_in_codex::DocumentRequest,
     },
     SidebarDocumentResolved {
         backend_id: crate::backend_id::BackendId,
@@ -542,8 +573,9 @@ pub(crate) enum AppEvent {
     SidebarDocumentLoaded {
         backend_id: crate::backend_id::BackendId,
         parent: ThreadId,
+        tab: uuid::Uuid,
         request: uuid::Uuid,
-        result: Result<crate::sidebar_image::DocumentContent, String>,
+        result: color_eyre::Result<crate::sidebar_image::DocumentContent>,
     },
     SidebarFilesLoaded {
         backend_id: crate::backend_id::BackendId,
@@ -1066,7 +1098,11 @@ pub(crate) enum AppEvent {
     },
 
     /// Result of computing a `/diff` command.
-    DiffResult(PathBuf, String),
+    DiffResult {
+        thread_id: Option<ThreadId>,
+        cwd: PathUri,
+        text: String,
+    },
 
     /// Open the app link view in the bottom pane.
     OpenAppLink {
@@ -1359,7 +1395,7 @@ pub(crate) enum AppEvent {
     /// command path because those callers expect the visible skill state to be current when their command
     /// completes.
     SkillsListLoaded {
-        cwd: PathBuf,
+        cwd: PathUri,
         result: Result<SkillsListResponse, String>,
     },
 
@@ -1367,7 +1403,7 @@ pub(crate) enum AppEvent {
     SideReplaySkillsLoaded {
         request_id: Uuid,
         thread_id: ThreadId,
-        cwd: PathBuf,
+        cwd: PathUri,
         result: Result<SkillsListResponse, String>,
     },
 
@@ -1408,8 +1444,7 @@ pub(crate) enum AppEvent {
     /// Finish buffering initial resume replay after all replay events have been queued.
     EndInitialHistoryReplayBuffer,
 
-    /// Replace the contiguous run of streaming `AgentMessageCell`s at the end of
-    /// the transcript with a single `AgentMarkdownCell` that stores the raw
+    /// Replace this answer's streaming `AgentMessageCell`s with a single `AgentMarkdownCell` that stores the raw
     /// markdown source and re-renders from it on resize.
     ///
     /// Emitted by `ChatWidget::flush_answer_stream_with_separator` after stream
@@ -1421,6 +1456,8 @@ pub(crate) enum AppEvent {
     /// `deferred_history_cell` lets callers add the final stream tail to the
     /// transcript without first writing its provisional render to scrollback.
     ConsolidateAgentMessage {
+        /// Bounds the search across notices, including when the stream emitted no cells.
+        emitted_cells: usize,
         phase: Option<codex_protocol::models::MessagePhase>,
         interrupted_item: Option<(String, String)>,
         source: String,
@@ -1595,6 +1632,8 @@ pub(crate) enum AppEvent {
         model: String,
     },
 
+    /// Adopt the widget's active catalog without requesting another model list.
+    SyncModelCatalog,
     /// Fetch the current catalog even when cached models produce no picker.
     FetchModels {
         request_id: uuid::Uuid,
@@ -1949,6 +1988,15 @@ pub(crate) enum AppEvent {
 
     /// Requests saving a local `/config` preference and refreshing its effective value.
     SaveConfigPreference(crate::config_panel::ConfigPreference),
+
+    /// Save the connected server's reasoning-summary default for new chats.
+    SaveReasoningSummary {
+        backend: BackendId,
+        summary: codex_protocol::config_types::ReasoningSummary,
+    },
+
+    /// Refresh the connected server's reasoning-summary default without writing config.
+    RefreshConfigReasoningSummary,
 
     /// Save the transcript renderer preference for the next launch only.
     FullscreenTranscriptSelected {

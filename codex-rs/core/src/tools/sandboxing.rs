@@ -28,6 +28,7 @@ use codex_protocol::protocol::ReviewDecision;
 pub(crate) use codex_protocol::sandbox::SandboxOverride;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxExecRequest;
+use codex_sandboxing::SandboxExecutables;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxNetwork;
 use codex_sandboxing::SandboxSelection;
@@ -259,12 +260,12 @@ pub(crate) fn ensure_native_sandbox(
 pub(crate) fn sandbox_override_for_first_attempt(
     sandbox_permissions: SandboxPermissions,
     exec_approval_requirement: &ExecApprovalRequirement,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    has_denied_reads: bool,
     already_approved: bool,
 ) -> SandboxOverride {
     // Only actual approval of an explicit escalation may widen the filesystem;
     // a command allow rule does not authorize removing filesystem restrictions.
-    if !unsandboxed_execution_allowed(file_system_sandbox_policy) {
+    if has_denied_reads {
         return if sandbox_permissions.requires_escalated_permissions() && already_approved {
             SandboxOverride::EscalatedSandboxWithRestrictions
         } else {
@@ -291,25 +292,35 @@ pub(crate) fn sandbox_override_for_first_attempt(
     }
 }
 
-/// Returns true when the active filesystem policy can be represented by
-/// running without a filesystem sandbox.
-///
-/// Denied reads only exist inside the sandbox. If a policy contains any
-/// denied-read paths, bypassing the sandbox would silently grant those reads,
-/// so escalation must keep the command sandboxed with the denied reads intact.
-pub(crate) fn unsandboxed_execution_allowed(
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-) -> bool {
-    !file_system_sandbox_policy.has_denied_read_restrictions()
+pub(crate) async fn ensure_executor_can_escalate_with_denied_reads(
+    environment: &codex_exec_server::Environment,
+) -> Result<(), ToolError> {
+    if !environment.is_remote() {
+        return Ok(());
+    }
+    let info = environment.info().await.map_err(|err| {
+        ToolError::Rejected(format!(
+            "could not verify exec-server support for escalation with denied reads: {err}"
+        ))
+    })?;
+    if !matches!(info.platform_os.as_deref(), Some("windows" | "macos"))
+        && !info
+            .capabilities
+            .linux_approved_root_write_preserves_restrictions
+    {
+        return Err(ToolError::Rejected(
+            "this exec-server cannot safely escalate with denied reads; upgrade the exec-server and retry"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn sandbox_permissions_preserving_denied_reads(
     sandbox_permissions: SandboxPermissions,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    has_denied_reads: bool,
 ) -> SandboxPermissions {
-    if sandbox_permissions.requires_escalated_permissions()
-        && !unsandboxed_execution_allowed(file_system_sandbox_policy)
-    {
+    if sandbox_permissions.requires_escalated_permissions() && has_denied_reads {
         // `RequireEscalated` normally asks the executor to bypass the sandbox.
         // When denied reads are active, that would drop the only mechanism that
         // enforces them, so fall back to the default sandboxed attempt instead.
@@ -410,8 +421,8 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
 
 pub(crate) struct SandboxAttempt<'a> {
     pub sandbox_override: SandboxOverride,
-    pub sandbox: SandboxType,
-    /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
+    pub(crate) local_selection: SandboxSelection,
+    /// Whether this attempt requests a sandbox, after applying any approved bypass.
     pub sandbox_requested: bool,
     pub permissions: &'a codex_protocol::models::PermissionProfile,
     /// Canonical permissions before this host materializes workspace roots.
@@ -504,29 +515,25 @@ impl<'a> SandboxAttempt<'a> {
         network: Option<&NetworkProxy>,
         environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
-        let mut request = self
-            .manager
-            .transform(SandboxTransformRequest {
+        crate::sandboxing::ExecRequest::prepare_local_sandbox(
+            self.manager,
+            SandboxTransformRequest {
                 command,
                 permissions: self.permissions,
-                workspace_roots: None,
-                runtime_readable_paths: None,
-                selection: SandboxSelection::Explicit(self.sandbox),
+                workspace_roots: Some(self.workspace_roots),
+                selection: self.local_selection,
                 network: SandboxNetwork::new(self.enforce_managed_network, network, environment_id),
                 sandbox_policy_cwd: self.sandbox_cwd,
-                sandbox_exe: self.sandbox_exe.map(std::path::PathBuf::as_path),
+                executables: SandboxExecutables::Launcher(
+                    self.sandbox_exe.map(std::path::PathBuf::as_path),
+                ),
                 use_legacy_landlock: self.use_legacy_landlock,
                 windows_sandbox_level: self.windows_sandbox_level,
-            })?
-            .into_command_request()?;
-        request.sandbox_override = self.sandbox_override;
-        let workspace_roots = self
-            .workspace_roots
-            .iter()
-            .map(PathUri::to_abs_path)
-            .collect::<std::io::Result<Vec<_>>>()?;
-        crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, workspace_roots)
-            .await
+            },
+            options,
+            self.sandbox_override,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -557,7 +564,7 @@ impl<'a> SandboxAttempt<'a> {
             arg0: None,
         };
         let mut exec_request =
-            crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, Vec::new())
+            crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, &[])
                 .await?;
         exec_request.exec_server_managed_network = managed_network;
         // A controller-only proxy may be disabled on the executor. With no launch config,
@@ -574,7 +581,7 @@ impl<'a> SandboxAttempt<'a> {
             exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
                 permissions: exec_server_permissions,
                 sandbox_override: self.sandbox_override,
-                cwd: exec_request.windows_sandbox_policy_cwd.clone(),
+                cwd: exec_request.sandbox_policy_cwd().clone(),
                 workspace_roots: self.workspace_roots.to_vec(),
                 user_home_dir: None,
                 temporary_directories: None,

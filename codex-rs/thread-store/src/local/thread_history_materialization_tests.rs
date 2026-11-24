@@ -8,6 +8,7 @@ use std::time::Duration;
 use chrono::Utc;
 use codex_app_server_protocol::McpToolCallResult;
 use codex_app_server_protocol::ThreadItemPayload;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
@@ -41,6 +42,7 @@ use codex_protocol::realtime::RealtimeItem;
 use codex_protocol::realtime::RealtimeItemContent;
 use codex_protocol::realtime::RealtimeSessionOutcome;
 use codex_protocol::realtime::RealtimeTranscriptRole;
+use codex_rollout::ResponseItemEnvelope;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
@@ -619,6 +621,35 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
         .await
         .expect("persist thread metadata");
 
+    let mut handoff_input = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
+        id: Some(ResponseItemId::from_server("msg_input_handoff".to_string())),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "use the smaller logo".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    handoff_input.set_turn_id_if_missing("turn-1");
+    let handoff_input = RolloutItem::ResponseItem(ResponseItemEnvelope {
+        item: handoff_input,
+        metadata: Some(
+            serde_json::from_value(serde_json::json!({
+                "realtime_handoff": {
+                    "event_id": "voice:handoff",
+                    "realtime_session_id": "voice",
+                    "observed_at_ms": 42,
+                    "handoff_id": "handoff",
+                    "mode": "start",
+                    "source_event_ids": ["voice:transcript:0"]
+                }
+            }))
+            .expect("deserialize handoff provenance"),
+        ),
+    });
+
     store
         .append_items(AppendThreadItemsParams {
             thread_id,
@@ -639,6 +670,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
                     },
                 }),
                 turn_started("turn-1"),
+                handoff_input,
                 RolloutItem::RealtimeItem(RealtimeItem {
                     id: "voice:promoted:agent-1".to_string(),
                     realtime_session_id: "voice".to_string(),
@@ -669,6 +701,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
                     realtime_session_id: "voice".to_string(),
                     observed_at_ms: None,
                     content: RealtimeItemContent::RealtimeSessionClosed {
+                        final_frame_sequence: None,
                         outcome: RealtimeSessionOutcome::Ended,
                     },
                 }),
@@ -685,22 +718,23 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
         .expect("read canonical rollout")
         .lines()
         .map(|line| codex_rollout::parse_rollout_line(line).expect("parse rollout line"))
-        .filter_map(|line| match line.item {
-            RolloutItem::RealtimeItem(item) => Some((
-                item.id,
-                i64::try_from(line.ordinal.expect("paginated rollout ordinal"))
-                    .expect("ordinal fits SQLite integer"),
-                chrono::DateTime::parse_from_rfc3339(line.timestamp.as_str())
-                    .expect("valid rollout timestamp")
-                    .timestamp_millis(),
-                serde_json::to_value(item.content)
-                    .expect("serialize realtime content")
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .expect("realtime content discriminator")
-                    .to_string(),
-            )),
-            _ => None,
+        .filter_map(|line| {
+            line.item.realtime_item().map(|item| {
+                (
+                    item.id.clone(),
+                    i64::try_from(line.ordinal.expect("paginated rollout ordinal"))
+                        .expect("ordinal fits SQLite integer"),
+                    chrono::DateTime::parse_from_rfc3339(line.timestamp.as_str())
+                        .expect("valid rollout timestamp")
+                        .timestamp_millis(),
+                    serde_json::to_value(&item.content)
+                        .expect("serialize realtime content")
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("realtime content discriminator")
+                        .to_string(),
+                )
+            })
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -711,8 +745,9 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
         vec![
             ("voice:started", 1, "realtime_session_started"),
             ("voice:transcript:0", 2, "transcript_segment"),
-            ("voice:promoted:agent-1", 4, "bem_item_promoted"),
-            ("voice:closed", 6, "realtime_session_closed"),
+            ("voice:handoff", 4, "turn_input_accepted"),
+            ("voice:promoted:agent-1", 5, "bem_item_promoted"),
+            ("voice:closed", 7, "realtime_session_closed"),
         ]
     );
 
@@ -780,6 +815,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
             multi_agent_version: None,
             history_mode: ThreadHistoryMode::Legacy,
             history_base: None,
+            inherited_history_visibility: Default::default(),
             subagent_history_start_ordinal: None,
             initial_window_id: codex_protocol::ContextWindowId::new_uuid_v7(),
             runtime_workspace_roots: None,
@@ -1094,7 +1130,7 @@ async fn active_turn_stores_only_its_start_position() {
         })
     );
     assert!(prepared.model_context.iter().any(|item| {
-        matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(event)) if event.turn_id == "turn-1")
+        matches!(item, RolloutItem::EventMsg { event: EventMsg::TurnStarted(event), .. } if event.turn_id == "turn-1")
     }));
     // Another store may fork the persisted prefix while this store keeps the source writer open.
     let other_store = projection_store(home.path()).await;
@@ -2588,10 +2624,12 @@ async fn paused_projection_releases_writer_and_retains_progress_when_stopped() {
         )
         .expect("read batch");
         let consumer_store = Arc::clone(&store);
+        let consumer_path = rollout_path.clone();
         let consumer = tokio::spawn(async move {
             super::pipeline::apply_batches(
                 &consumer_store,
                 thread_id,
+                consumer_path.as_path(),
                 before.0 as u64,
                 /*initial_ordinal*/ 0,
                 receiver,
@@ -2695,7 +2733,7 @@ async fn sqlite_failure_does_not_fail_durable_jsonl_write() {
     assert!(items.iter().any(|item| {
         matches!(
             item,
-            RolloutItem::EventMsg(EventMsg::TurnStarted(event))
+            RolloutItem::EventMsg { event: EventMsg::TurnStarted(event), .. }
                 if event.turn_id == "turn-1"
         )
     }));
@@ -3132,6 +3170,7 @@ async fn create_paginated_subagent_thread(
             multi_agent_version: None,
             history_mode: ThreadHistoryMode::Paginated,
             history_base,
+            inherited_history_visibility: Default::default(),
             subagent_history_start_ordinal,
             initial_window_id: codex_protocol::ContextWindowId::new_uuid_v7(),
             runtime_workspace_roots: None,
@@ -3159,7 +3198,11 @@ fn turn_started(turn_id: &str) -> RolloutItem {
 
 fn turn_started_with_root(turn_id: &str, root_turn_id: &str) -> RolloutItem {
     let mut item = turn_started(turn_id);
-    if let RolloutItem::EventMsg(EventMsg::TurnStarted(event)) = &mut item {
+    if let RolloutItem::EventMsg {
+        event: EventMsg::TurnStarted(event),
+        ..
+    } = &mut item
+    {
         event.root_turn_id = Some(root_turn_id.to_string());
     }
     item

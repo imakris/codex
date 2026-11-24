@@ -22,6 +22,7 @@ use codex_code_mode_protocol::grpc as proto;
 use codex_code_mode_protocol::grpc::code_mode_host_server::CodeModeHost;
 use codex_code_mode_protocol::host::LEGACY_MAX_PENDING_DELEGATE_CALLS;
 use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
+use codex_code_mode_runtime::ToolPreload;
 use codex_protocol::protocol::W3cTraceContext;
 use futures::Stream;
 use futures::StreamExt;
@@ -70,6 +71,7 @@ fn trace_context_from_request<T>(request: &Request<T>) -> Option<W3cTraceContext
 #[derive(Clone)]
 pub struct GrpcCodeModeHost {
     state: Arc<GrpcHostState>,
+    tool_preloads: &'static [ToolPreload],
     process_metrics: Option<Arc<crate::process_metrics::ProcessMetrics>>,
 }
 
@@ -78,8 +80,15 @@ impl GrpcCodeModeHost {
     pub fn new() -> Self {
         Self {
             state: Arc::new(GrpcHostState::new()),
+            tool_preloads: &[],
             process_metrics: None,
         }
+    }
+
+    /// Sets the trusted helpers used when this host opens a session.
+    pub fn with_tool_preloads(mut self, tool_preloads: &'static [ToolPreload]) -> Self {
+        self.tool_preloads = tool_preloads;
+        self
     }
 
     /// Uses a collector whose resources were prepared before sandbox entry.
@@ -126,6 +135,7 @@ impl GrpcCodeModeHost {
                 ..Default::default()
             },
             max_pending_delegate_calls,
+            self.tool_preloads,
         )?;
         Ok(Response::new(with_heartbeats(
             events,
@@ -183,11 +193,9 @@ impl GrpcCodeModeHost {
         let session = self.state.session(&request.session_id)?;
         let invocation_id = validation::uuid(&request.invocation_id, "tool invocation ID")?;
         let result = match request.outcome {
-            Some(proto::complete_tool_call_request::Outcome::Succeeded(result)) => Ok(
-                serde_json::from_slice(&result.output_json).map_err(|error| {
-                    Status::invalid_argument(format!("invalid code-mode tool output JSON: {error}"))
-                })?,
-            ),
+            Some(proto::complete_tool_call_request::Outcome::Succeeded(result)) => {
+                Ok(conversions::tool_result(&result)?)
+            }
             Some(proto::complete_tool_call_request::Outcome::Failed(error)) => Err(error.message),
             None => {
                 return Err(Status::invalid_argument(

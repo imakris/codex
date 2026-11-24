@@ -60,7 +60,24 @@ required = true
 
 The executable prints its URL and shuts down on Ctrl-C. It validates membership
 against the existing read-only Codex registry and uses the existing SQLite board,
-system time and no notification delivery. Core delivery is a separate change.
+system time and no notification delivery by default.
+
+To deliver notices to native MAv2 agents through an existing local app-server,
+add `--app-server ws://127.0.0.1:PORT`. The app-server must serve that loopback
+WebSocket endpoint and use the same Codex registry. Notifications use its existing
+`thread/inject_items` RPC and ordinary queue-only mailbox/wake rules; this requires
+an app-server that supports agent-mail injection into native children. Delivery is
+best-effort: failed notices are not retried, and the post remains stored. The next
+notice reconnects after a failed connection. Without this option nothing changes.
+
+For the focused app-server integration test, build the board executable first.
+Package-scoped Cargo tests do not build another package's executable; Bazel supplies
+it through the test's `extra_binaries`. Run these commands from `codex-rs`:
+
+```sh
+cargo build -p codex-message-board-mcp --bin codex-message-board-mcp
+just test -p codex-app-server --test all board_tools_share_multi_agent_namespace
+```
 
 The library's `serve_http(listener, token, config, bind)` exposes the shared
 discussion tool contract at `/mcp`. Its async binding validates `(ThreadId, SessionId)`
@@ -102,7 +119,8 @@ existing launcher lifecycle; explicit host-supplied board connections are unchan
 
 A runner calls `launch_in_memory()`, then registers each tree with
 `server.add_board(session_id, host)`. It supplies the existing `MessageBoardHost`
-for membership, clocks and notification delivery. Configure the same MCP server
+for membership and notification delivery. Timestamps use the MCP backend's system
+clock, as in the standalone SQLite server. Configure the same MCP server
 with `server.url()` and the `Authorization` header from `server.authorization()`;
 this overrides the plugin endpoint through normal configuration.
 

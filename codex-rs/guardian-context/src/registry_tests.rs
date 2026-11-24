@@ -207,7 +207,7 @@ fn reused_registry_preserves_section_identity_and_source_roles() {
     ];
     let answers = ["assistant: Publish?\nuser: No.\n".to_string()];
     let reviews = super::PreviousReviews::try_from_fragments(vec![super::PreviousReview {
-        id: codex_protocol_test_support::uuid_v7_item_id_generator_for_test()("review"),
+        id: codex_thread_context_ids_test_support::thread_context_ids().next_item("review"),
         fragment: "<guardian_sync_review>debug-secret review</guardian_sync_review>".to_string(),
     }])
     .unwrap();
@@ -215,6 +215,7 @@ fn reused_registry_preserves_section_identity_and_source_roles() {
         environment_id: None,
         denied_paths: vec!["/private".into()],
         denied_globs: vec!["**/*.key".into()],
+        reviewing_escalated_exec: false,
     };
     let action = super::PlannedAction {
         tool_descriptions: None,

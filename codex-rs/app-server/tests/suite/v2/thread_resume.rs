@@ -13,6 +13,7 @@ use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use app_test_support::create_request_user_input_sse_response;
 use app_test_support::rollout_path;
 use app_test_support::test_absolute_path;
 use app_test_support::to_response;
@@ -82,6 +83,7 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
+use codex_core::test_support::all_model_presets;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_features::Feature;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
@@ -784,7 +786,7 @@ async fn thread_resume_restores_startup_and_updated_runtime_workspace_roots() ->
         .send_thread_start_request(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             cwd: Some(initial_cwd.to_string_lossy().into_owned()),
-            runtime_workspace_roots: Some(initial_roots.clone()),
+            runtime_workspace_roots: Some(LegacyAppPathString::from_abs_paths(&initial_roots)),
             environments: Some(explicit_environments.clone()),
             ..Default::default()
         })
@@ -828,7 +830,7 @@ async fn thread_resume_restores_startup_and_updated_runtime_workspace_roots() ->
         runtime_workspace_roots,
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
-    assert_eq!(runtime_workspace_roots, vec![explicit_cwd.clone()]);
+    assert_eq!(runtime_workspace_roots, vec![explicit_cwd.clone().into()]);
 
     // A cwd-only update must retain the fallback's additional folder, not the live roots.
     mcp.clear_message_buffer();
@@ -867,9 +869,10 @@ async fn thread_resume_restores_startup_and_updated_runtime_workspace_roots() ->
         .into_iter()
         .rev()
         .filter_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
-                Some(event.thread_settings.runtime_workspace_roots)
-            }
+            RolloutItem::EventMsg {
+                event: EventMsg::ThreadSettingsApplied(event),
+                ..
+            } => Some(event.thread_settings.runtime_workspace_roots),
             _ => None,
         })
         .take(/*n*/ 3)
@@ -901,7 +904,10 @@ async fn thread_resume_restores_startup_and_updated_runtime_workspace_roots() ->
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
     assert_eq!(
         (cwd, runtime_workspace_roots),
-        (initial_cwd.clone(), expected_roots)
+        (
+            initial_cwd.clone().into(),
+            LegacyAppPathString::from_abs_paths(&expected_roots)
+        )
     );
 
     Ok(())
@@ -1003,7 +1009,9 @@ sandbox = "unelevated"
             .send_thread_resume_request(ThreadResumeParams {
                 thread_id: thread_id.clone(),
                 cwd: cwd_override.map(|cwd| cwd.to_string_lossy().into_owned()),
-                runtime_workspace_roots: roots_override,
+                runtime_workspace_roots: roots_override
+                    .as_deref()
+                    .map(LegacyAppPathString::from_abs_paths),
                 service_tier: (index == 2).then_some(Some("priority".to_string())),
                 personality: (index == 2).then_some(Personality::None),
                 config: (index == 1).then(|| {
@@ -1019,7 +1027,10 @@ sandbox = "unelevated"
             timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
         assert_eq!(
             (resumed.cwd, resumed.runtime_workspace_roots),
-            (expected_cwd.clone(), expected_roots.clone())
+            (
+                expected_cwd.clone().into(),
+                LegacyAppPathString::from_abs_paths(&expected_roots)
+            )
         );
         if index < 3 {
             mcp.start_turn_and_wait_for_completion(TurnStartParams {
@@ -1046,15 +1057,14 @@ sandbox = "unelevated"
         let expected_thread_id = ThreadId::from_string(&thread_id)?;
         let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
         let persisted = items.into_iter().rev().find_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
-                if event.thread_id == Some(expected_thread_id) =>
-            {
-                Some((
-                    event.thread_settings.cwd,
-                    event.thread_settings.runtime_workspace_roots,
-                    event.thread_settings.permission_profile,
-                ))
-            }
+            RolloutItem::EventMsg {
+                event: EventMsg::ThreadSettingsApplied(event),
+                ..
+            } if event.thread_id == Some(expected_thread_id) => Some((
+                event.thread_settings.cwd,
+                event.thread_settings.runtime_workspace_roots,
+                event.thread_settings.permission_profile,
+            )),
             _ => None,
         });
         let (persisted_cwd, persisted_roots, permission_profile) =
@@ -1236,7 +1246,11 @@ async fn cold_resume_workspace_roots_validate_foreign_startup_paths() -> Result<
             } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
             assert_eq!(
                 (thread.id, cwd, runtime_workspace_roots),
-                (thread_id, local_cwd.clone(), expected_roots)
+                (
+                    thread_id,
+                    local_cwd.clone().into(),
+                    LegacyAppPathString::from_abs_paths(&expected_roots)
+                )
             );
         } else {
             let error = timeout(
@@ -1555,8 +1569,10 @@ async fn thread_resume_preserves_goal_first_and_fork_approvals_reviewer() -> Res
             items
                 .into_iter()
                 .filter_map(|item| match item {
-                    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) =>
-                        event.thread_id,
+                    RolloutItem::EventMsg {
+                        event: EventMsg::ThreadSettingsApplied(event),
+                        ..
+                    } => event.thread_id,
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -1830,10 +1846,12 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
     );
     let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
     let mode = items.iter().rev().find_map(|item| match item {
-        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
-            if event
-                .thread_id
-                .is_some_and(|id| id.to_string() == thread_id) =>
+        RolloutItem::EventMsg {
+            event: EventMsg::ThreadSettingsApplied(event),
+            ..
+        } if event
+            .thread_id
+            .is_some_and(|id| id.to_string() == thread_id) =>
         {
             Some(event.thread_settings.collaboration_mode.clone())
         }
@@ -1888,7 +1906,10 @@ async fn thread_resume_restores_collaboration_mode_from_legacy_turn_context() ->
     let (items, _, _) = RolloutRecorder::load_rollout_items(&fixture.rollout_file_path).await?;
     assert!(!items.iter().any(|item| matches!(
         item,
-        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+        RolloutItem::EventMsg {
+            event: EventMsg::ThreadSettingsApplied(_),
+            ..
+        }
     )));
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1983,14 +2004,14 @@ async fn cold_resume_reresolves_persisted_active_permission_profile() -> Result<
         );
         assert_eq!(
             runtime_workspace_roots,
-            vec![previous_workspace_root.path().abs()]
+            vec![previous_workspace_root.path().abs().into()]
         );
     }
     Ok(())
 }
 
 #[tokio::test]
-async fn cold_resume_with_removed_permission_profile_uses_configured_default() -> Result<()> {
+async fn cold_resume_with_removed_permission_profile_requires_explicit_selection() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
         let codex_home = TempDir::new()?;
@@ -2016,22 +2037,35 @@ async fn cold_resume_with_removed_permission_profile_uses_configured_default() -
             .await?;
         let resume_id = mcp
             .send_thread_resume_request(ThreadResumeParams {
-                thread_id,
+                thread_id: thread_id.clone(),
                 ..Default::default()
             })
             .await?;
-        let ThreadResumeResponse {
-            sandbox,
-            active_permission_profile,
-            ..
-        } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+        let error = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
+        )
+        .await??;
+        assert_eq!(error.error.code, -32600);
+        assert!(
+            error
+                .error
+                .message
+                .contains("saved permission profile `dev`")
+        );
 
-        assert!(matches!(sandbox, AppSandboxPolicy::DangerFullAccess));
+        let resume_id = mcp
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id,
+                permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let response: ThreadResumeResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
         assert_eq!(
-            active_permission_profile,
-            Some(ActivePermissionProfile::new(
-                BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
-            ))
+            response.active_permission_profile,
+            Some(ActivePermissionProfile::read_only())
         );
     }
     Ok(())
@@ -2917,7 +2951,7 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
     assert_eq!(thread.model_provider, "mock_provider");
     assert!(thread.path.as_ref().expect("thread path").is_absolute());
     assert_eq!(thread.cwd.as_path(), cwd.as_path());
-    assert_eq!(cwd, test_absolute_path("/"));
+    assert_eq!(cwd, test_absolute_path("/").into());
     assert_eq!(thread.cli_version, "0.0.0");
     assert_eq!(thread.source, SessionSource::Cli);
     assert_eq!(thread.git_info, None);
@@ -3184,6 +3218,7 @@ fn append_resume_redaction_history(
             saved_path: Some(test_absolute_path("/tmp/ig-1.png")),
             input_images: Vec::new(),
             generation_id: None,
+            image_metadata: Default::default(),
         }),
     ]
     .into_iter()
@@ -3371,6 +3406,7 @@ async fn thread_resume_rejects_archived_session_by_id() -> Result<()> {
 #[tokio::test]
 async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
     let server = create_mock_responses_server_sequence(vec![
+        create_request_user_input_sse_response("confirm-goal")?,
         responses::sse(vec![
             responses::ev_response_created("create-goal"),
             responses::ev_function_call(
@@ -3391,7 +3427,10 @@ async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri())
         .enable_feature(Feature::Goals)
+        .enable_feature(Feature::DefaultModeRequestUserInput)
+        .enable_feature(Feature::StepModelSwitching)
         .write(codex_home.path())?;
+    let collector = super::auth_storage_originator::configure_collector(codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -3399,19 +3438,39 @@ async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
         .build_initialized()
         .await?;
 
+    let model = all_model_presets()
+        .iter()
+        .find(|model| {
+            model.show_in_picker
+                && model.default_reasoning_effort == ReasoningEffort::Medium
+                && model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|level| level.effort == ReasoningEffort::High)
+        })
+        .expect("a bundled model defaults to medium and supports high effort");
     let start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("gpt-5.2-codex".to_string()),
+            model: Some(model.id.clone()),
             ..Default::default()
         })
         .await?;
     let ThreadStartResponse { thread, .. } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
 
-    let turn_id = mcp
+    // Before the first turn, /goal inherits the model default.
+    let set_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({"threadId": thread.id, "objective": "initial goal", "status": "complete"})),
+        )
+        .await?;
+    let _: ThreadGoalSetResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(set_id)).await??;
+
+    let start_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
-            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "Create a goal to keep polishing, then pause it.".to_string(),
                 text_elements: Vec::new(),
@@ -3419,11 +3478,32 @@ async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let _turn_resp: JSONRPCResponse = timeout(
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+    let request = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+        mcp.read_stream_until_request_message(),
     )
     .await??;
+    let ServerRequest::ToolRequestUserInput { request_id, .. } = request else {
+        anyhow::bail!("expected request_user_input, received {request:?}");
+    };
+    // Only the active turn changes. The next step calls create_goal at high
+    // while the thread still defaults to medium.
+    let update_id = mcp
+        .send_raw_request(
+            "turn/settings/update",
+            Some(json!({"threadId": thread.id, "turnId": turn.id, "effort": "high"})),
+        )
+        .await?;
+    let outcome: serde_json::Value =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(update_id)).await??;
+    assert_eq!(outcome, json!({"status": "applied"}));
+    mcp.send_response(
+        request_id,
+        json!({"answers": {"confirm_path": {"answers": ["Yes (Recommended)"]}}}),
+    )
+    .await?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -3465,6 +3545,40 @@ async fn thread_resume_keeps_tool_paused_goal_paused() -> Result<()> {
             .any(|method| method == "turn/started"),
         "paused goal should not continue after thread resume"
     );
+
+    assert!(
+        timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully())
+            .await??
+            .success()
+    );
+    let mut efforts = Vec::new();
+    for request in collector.received_requests().await.expect("OTLP requests") {
+        let payload: serde_json::Value = request.body_json()?;
+        let points = payload["resourceMetrics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|resource| resource["scopeMetrics"].as_array().into_iter().flatten())
+            .flat_map(|scope| scope["metrics"].as_array().into_iter().flatten())
+            .filter(|metric| metric["name"] == "codex.goal.created")
+            .flat_map(|metric| metric["sum"]["dataPoints"].as_array().into_iter().flatten());
+        for point in points {
+            let effort = point["attributes"]
+                .as_array()
+                .expect("attributes")
+                .iter()
+                .find(|tag| tag["key"] == "reasoning_effort")
+                .expect("goal creation should include reasoning effort");
+            efforts.push(
+                effort["value"]["stringValue"]
+                    .as_str()
+                    .expect("effort")
+                    .to_string(),
+            );
+        }
+    }
+    efforts.sort();
+    assert_eq!(efforts, ["high", "medium"]);
 
     Ok(())
 }
@@ -5173,7 +5287,7 @@ async fn thread_resume_checkpoints_settings_without_advancing_recency() -> Resul
     let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout.rollout_file_path).await?;
     assert!(items.iter().any(|item| matches!(
         item,
-        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+        RolloutItem::EventMsg { event: EventMsg::ThreadSettingsApplied(event), .. }
             if event.thread_id == Some(expected_thread_id)
     )));
 
@@ -5198,7 +5312,10 @@ async fn thread_resume_checkpoints_settings_without_advancing_recency() -> Resul
         .await?;
     let ThreadResumeResponse { cwd, .. } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
-    assert_eq!(cwd, AbsolutePathBuf::from_absolute_path(codex_home.path())?);
+    assert_eq!(
+        cwd,
+        AbsolutePathBuf::from_absolute_path(codex_home.path())?.into()
+    );
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
@@ -6333,9 +6450,10 @@ async fn thread_resume_with_overrides_preserves_recency_and_checkpoints_model() 
     let expected_thread_id = ThreadId::from_string(&resumed_thread.id)?;
     let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_file_path).await?;
     let persisted_model = items.iter().rev().find_map(|item| match item {
-        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
-            if event.thread_id == Some(expected_thread_id) =>
-        {
+        RolloutItem::EventMsg {
+            event: EventMsg::ThreadSettingsApplied(event),
+            ..
+        } if event.thread_id == Some(expected_thread_id) => {
             Some(event.thread_settings.model.as_str())
         }
         _ => None,
@@ -6384,7 +6502,10 @@ async fn thread_resume_does_not_checkpoint_unchanged_settings() -> Result<()> {
     let settings_before_resume = items
         .into_iter()
         .filter_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+            RolloutItem::EventMsg {
+                event: EventMsg::ThreadSettingsApplied(event),
+                ..
+            } => Some(event),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -6403,7 +6524,10 @@ async fn thread_resume_does_not_checkpoint_unchanged_settings() -> Result<()> {
     let settings_after_resume = items
         .into_iter()
         .filter_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+            RolloutItem::EventMsg {
+                event: EventMsg::ThreadSettingsApplied(event),
+                ..
+            } => Some(event),
             _ => None,
         })
         .collect::<Vec<_>>();

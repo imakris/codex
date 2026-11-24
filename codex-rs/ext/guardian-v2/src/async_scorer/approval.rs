@@ -18,6 +18,7 @@ use codex_extension_api::ApprovalReviewContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionMetrics;
+use codex_guardian_context::CachedApprovalContext;
 use codex_protocol::approvals::GuardianReviewReason;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::mcp::is_node_repl_backed_connector;
@@ -73,22 +74,45 @@ impl GuardianApprovalReviewer {
         let model = input
             .thread_store
             .get::<codex_protocol::openai_models::ModelInfo>();
+        let has_explicit_guardian_provider = config.guardian_model_provider.is_some();
+        let guardian_classifier_result =
+            GuardianV2Config::explicit_guardian_classifier_model(config, input.thread_store).await;
         let guardian_config = input
             .thread_store
             .get::<GuardianV2Config>()
             .map(|config| (*config).clone())
             .map_or_else(|| GuardianV2Config::resolve(config), Ok)
+            .and_then(|config| match &guardian_classifier_result {
+                Ok(Some(model)) => config.with_classifier_defaults(Some(model)),
+                Ok(None) => Ok(config),
+                Err(error) => Err(error.clone()),
+            })
             .ok();
+        let guardian_classifier_model = guardian_classifier_result.ok().flatten();
+        let review_scope_model = if has_explicit_guardian_provider {
+            guardian_classifier_model.as_deref()
+        } else {
+            model.as_deref()
+        };
         let requirements = config.config_layer_stack.requirements();
         let mut policy = guardian_config.as_ref().map_or_else(
             || {
                 codex_config::GuardianPolicyLoader::new(Some(
                     &codex_features::FeatureToml::Enabled(true),
                 ))
-                .resolve(model.as_deref(), requirements)
+                .resolve(review_scope_model, requirements)
             },
-            |config| config.policy_for_model(model.as_deref(), requirements),
+            |config| config.policy_for_model(review_scope_model, requirements),
         );
+        if has_explicit_guardian_provider {
+            if guardian_config.is_none() {
+                policy.disable_scoring();
+            }
+            requirements.constrain_guardian_policy(
+                &mut policy,
+                model.as_ref().map(|model| model.slug.as_str()),
+            );
+        }
         // Live mandatory restrictions may harden the turn's captured policy.
         thread
             .config()
@@ -150,17 +174,17 @@ impl GuardianApprovalReviewer {
                 // Subscribe before checking so a concurrently published score is not lost.
                 let mut updates = cache.progress.updates.subscribe();
                 loop {
-                    if let Ok(true) =
+                    if let Ok(Some(scored)) =
                         cached_evidence(thread, input, config, &policy, /*metrics*/ None).await
                     {
-                        return;
+                        return scored;
                     }
                     if updates.changed().await.is_err() {
                         break;
                     }
                 }
             }
-            std::future::pending::<()>().await;
+            std::future::pending().await
         };
         if let Some(metrics) = input.metrics.as_deref() {
             metrics.counter(
@@ -199,14 +223,15 @@ impl GuardianApprovalReviewer {
     }
 }
 
-/// Checks score reuse; the success value says whether it can also release a pending review.
+/// Any success permits initial approval. Only a matching score at or before the action
+/// supplies context for cancelling a pending review.
 async fn cached_evidence(
     thread: &CodexThread,
     input: &ApprovalDecisionInput<'_>,
     config: &GuardianV2Config,
     policy: &GuardianModelPolicy,
     metrics: Option<&dyn ExtensionMetrics>,
-) -> Result<bool, GuardianReviewReason> {
+) -> Result<Option<CachedApprovalContext>, GuardianReviewReason> {
     let store = input.thread_store;
     let Some(cache) = ConversationBackend::for_turn(store, input.turn_store) else {
         if let Some(metrics) = metrics {
@@ -287,13 +312,16 @@ async fn cached_evidence(
             return Err(GuardianReviewReason::Policy);
         }
         record_fast_decision(metrics, "approved", "initial_cua_call");
-        return Ok(false);
+        return Ok(None);
     }
     let Some(permissions) = input.permissions else {
         record_fast_decision(metrics, "deferred", "permission_resolution_error");
         return Err(GuardianReviewReason::AuthorizationChanged);
     };
-    let current = ScoreAuthorization::current(thread, permissions).await;
+    let Ok(current) = ScoreAuthorization::current(thread, permissions).await else {
+        record_fast_decision(metrics, "deferred", "root_evidence_unavailable");
+        return Err(GuardianReviewReason::AuthorizationChanged);
+    };
     // Classification may publish or fail while authorization and live policy are collected.
     let permitted = constrained_live_policy(thread, store, policy).await;
     let cached = cache.progress.inspect(input.tool_call_id);
@@ -363,7 +391,13 @@ async fn cached_evidence(
                     return Err(GuardianReviewReason::Policy);
                 }
                 record_fast_decision(metrics, "approved", "low_risk");
-                return Ok(cached.score_at_or_before_action);
+                return Ok(cached
+                    .score_at_or_before_action
+                    .then_some(CachedApprovalContext {
+                        user_message_revision: current.local.user_message_revision,
+                        review_context_revision: current.review_context_revision,
+                        root_versions: current.root.zip(current.root_review_context_revision),
+                    }));
             }
         }
         Some(score) if score >= config.review_threshold => {

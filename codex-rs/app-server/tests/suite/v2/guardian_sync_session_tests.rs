@@ -14,6 +14,7 @@ use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadGuardianReviewParams;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadInjectItemsResponse;
 use codex_app_server_protocol::ThreadListResponse;
@@ -36,7 +37,7 @@ use tokio::sync::oneshot;
 
 const ALLOW: &str = r#"{"outcome":"allow","rationale":"completed seed assessment"}"#;
 
-fn sync_config(responses_url: &str) -> MockResponsesConfig {
+pub(super) fn sync_config(responses_url: &str) -> MockResponsesConfig {
     MockResponsesConfig::new(responses_url)
         .with_provider_config("supports_websockets = false")
         .with_approval_policy("on-request")
@@ -64,6 +65,85 @@ fn tool_response(server: &str, tool: &str, calls: &[&str]) -> String {
 enum ReviewEnding {
     Complete,
     Interrupt,
+}
+
+#[tokio::test]
+async fn unavailable_guardian_board_reports_why_review_preparation_failed() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            tool_response(TEST_SERVER_NAME, TEST_TOOL_NAME, &["check"]),
+            assistant_response("Done.")?,
+        ],
+    )
+    .await;
+    let (mcp_url, mcp_server) = start_mcp_server(/*sensitive_action*/ None).await?;
+    let home = TempDir::new()?;
+    // A directory at the database path prevents SQLite from opening the board.
+    std::fs::create_dir(home.path().join("message_board_guardian_1.sqlite"))?;
+    sync_config(&server.uri())
+        .with_root_config(&format!("sqlite_home = {}", serde_json::to_string(home.path())?))
+        .with_extra_config("[features.guardianv3]\nenabled = true")
+        .with_extra_config(&format!(
+            "[mcp_servers.{TEST_SERVER_NAME}]\nurl = \"{mcp_url}/mcp\"\ndefault_tools_approval_mode = \"prompt\""
+        ))
+        .write(home.path())?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .with_json_logging("warn,codex_core::guardian=info")
+        .build_initialized_with_timeout(TIMEOUT)
+        .await?;
+    let thread = app
+        .start_thread(ThreadStartParams {
+            history_mode: Some(ThreadHistoryMode::Paginated),
+            ..Default::default()
+        })
+        .await?
+        .thread;
+    app.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: thread.id,
+        input: vec![UserInput::Text {
+            text: "Run the check.".into(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].function_call_output("check")["output"]
+            .to_string()
+            .contains("Guardian V3 could not prepare the evidence for this action: Guardian board evidence is unavailable")
+    );
+    let started = app
+        .wait_for_matching_json_log_event(
+            "preparation started",
+            |event| event["fields"]["message"] == "Guardian V3 review preparation started",
+            TIMEOUT,
+        )
+        .await?;
+    let finished = app
+        .wait_for_matching_json_log_event(
+            "preparation finished",
+            |event| event["fields"]["message"] == "Guardian V3 review preparation finished",
+            TIMEOUT,
+        )
+        .await?;
+    let review_id = started["fields"]["review_id"].as_str().expect("review ID");
+    assert_eq!(finished["fields"]["review_id"], review_id);
+    assert_eq!(finished["fields"]["ready"], false);
+    assert_eq!(
+        finished["fields"]["failure_reason"],
+        "Guardian board evidence is unavailable"
+    );
+    app.shutdown_gracefully().await?;
+    mcp_server.abort();
+    Ok(())
 }
 
 #[tokio::test]
@@ -703,8 +783,9 @@ async fn inline_review_delegate_runs_strict_guardian_assessment() -> Result<()> 
 }
 
 #[tokio::test]
-async fn guardian_review_reuses_private_recorded_call_history_per_parent() -> Result<()> {
-    let rationale = "Guardian approved the recorded file write.";
+async fn guardian_review_assesses_allowlisted_calls_and_reuses_private_history_per_parent()
+-> Result<()> {
+    let rationale = "Guardian approved the recorded listing.";
     let verdict = assistant_response(
         &json!({
             "outcome": "allow",
@@ -718,6 +799,12 @@ async fn guardian_review_reuses_private_recorded_call_history_per_parent() -> Re
     let requests = responses::mount_sse_sequence(&server, vec![verdict; 3]).await;
     let codex_home = TempDir::new()?;
     sync_config(&server.uri()).write(codex_home.path())?;
+    let rules = codex_home.path().join("rules");
+    std::fs::create_dir_all(&rules)?;
+    std::fs::write(
+        rules.join("default.rules"),
+        r#"prefix_rule(pattern=["git", "ls-files"], decision="allow")"#,
+    )?;
     let mut app = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .build_initialized()
@@ -725,43 +812,56 @@ async fn guardian_review_reuses_private_recorded_call_history_per_parent() -> Re
     let parent = app.start_thread(ThreadStartParams::default()).await?.thread;
     let other = app.start_thread(ThreadStartParams::default()).await?.thread;
 
-    for (thread, call_id) in [(&parent, "a"), (&parent, "b"), (&other, "c")] {
-        let evidence = if call_id == "b" {
-            json!({
-                "type": "function_call_output",
-                "call_id": "a",
-                "output": "Recorded success.",
-            })
-        } else {
-            json!({
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Create the requested file."}],
-            })
-        };
-        let items = vec![
-            evidence,
-            json!({
-                "type": "function_call",
-                "name": "exec_command",
-                "call_id": call_id,
-                "arguments": r#"{"cmd":"echo reviewed > guardian-direct.txt","sandbox_permissions":"require_escalated","justification":"Create the requested file."}"#,
-            }),
-        ];
+    let script = r#"for (const path of ["a", "b"]) await tools.exec_command({cmd: "git ls-files " + path});"#;
+    let command = |id: &str| {
+        json!({
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": id,
+            "arguments": json!({"cmd": format!("git ls-files {id}")}).to_string(),
+        })
+    };
+    for (thread, last) in [
+        (
+            &parent,
+            json!({"type":"custom_tool_call", "name":"exec", "call_id":"outer", "input":script}),
+        ),
+        (&other, command("c")),
+    ] {
         let _: ThreadInjectItemsResponse = app
             .request(|request_id| ClientRequest::ThreadInjectItems {
                 request_id,
                 params: ThreadInjectItemsParams {
                     thread_id: thread.id.clone(),
-                    items,
+                    items: vec![
+                        json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "List tracked files."}],
+                        }),
+                        last,
+                    ],
                 },
             })
             .await?;
+    }
+
+    let id = app
+        .send_raw_request("thread/guardianReview", Some(json!({"threadId":other.id})))
+        .await?;
+    let error = app
+        .read_stream_until_error_message(RequestId::Integer(id))
+        .await?;
+    assert!(error.error.message.contains("toolCall"));
+
+    for (thread, call_id) in [(&parent, "a"), (&parent, "b"), (&other, "c")] {
+        let tool_call = serde_json::from_value(command(call_id))?;
         let result: Value = app
             .request(|request_id| ClientRequest::ThreadGuardianReview {
                 request_id,
                 params: ThreadGuardianReviewParams {
                     thread_id: thread.id.clone(),
+                    tool_call,
                 },
             })
             .await?;
@@ -783,6 +883,23 @@ async fn guardian_review_reuses_private_recorded_call_history_per_parent() -> Re
     let [a, b, c] = requests.as_slice() else {
         anyhow::bail!("expected three Guardian requests, got {}", requests.len());
     };
+    for (request, id) in [(a, "a"), (b, "b")] {
+        let input = request.input();
+        let texts = input
+            .iter()
+            .filter_map(|item| item["content"].as_array())
+            .flatten()
+            .filter_map(|part| part["text"].as_str());
+        assert!(texts.clone().any(|text| text.contains(script)));
+        let action = texts
+            .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+            .rfind(|action| action["tool"] == "exec_command")
+            .expect("planned command");
+        assert_eq!(
+            action["command"].as_array().unwrap().last().unwrap(),
+            &json!(format!("git ls-files {id}"))
+        );
+    }
     for request in [a, b, c] {
         assert_eq!(
             request.body_json()["client_metadata"]["x-openai-subagent"],
@@ -805,6 +922,15 @@ async fn guardian_review_reuses_private_recorded_call_history_per_parent() -> Re
     );
 
     app.shutdown_gracefully().await?;
+    let rollout = std::fs::read_to_string(parent.path.expect("parent rollout"))?;
+    let mut calls = Vec::new();
+    for line in rollout.lines() {
+        let entry: Value = serde_json::from_str(line)?;
+        if entry["type"] == "response_item" && entry["payload"]["call_id"].is_string() {
+            calls.push(entry["payload"]["call_id"].clone());
+        }
+    }
+    assert_eq!(calls, vec![json!("outer")]);
     Ok(())
 }
 
@@ -819,7 +945,7 @@ async fn v3_routes_the_first_live_message_while_the_actor_is_still_sampling(
     let (first, first_gate) = oneshot::channel();
     let (second, second_gate) = oneshot::channel();
     let response = assistant_response(
-        r#"{"routes":[["release"]],"descriptions":{"release":"Release policy"}}"#,
+        r#"{"routes":[["release"]],"descriptions":[{"channel":"release","description":"Release policy"}]}"#,
     )?;
     let (server, _) = start_streaming_sse_server(
         [first_gate, second_gate]

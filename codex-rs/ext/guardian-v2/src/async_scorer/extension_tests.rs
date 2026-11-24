@@ -2,9 +2,14 @@ use crate::async_scorer::conversation::ConversationBackend;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::Result;
+use codex_config::CloudConfigBundleLoader;
+use codex_config::GuardianPolicySnapshot;
+use codex_config::loader::load_guardian_policy_snapshot;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::LoaderOverrides;
@@ -24,6 +29,7 @@ use codex_extension_api::ToolName;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolStartInput;
 use codex_features::Feature;
+use codex_guardian_context::CachedApprovalContext;
 use codex_guardian_context::truncate_text as truncate_entry;
 use codex_history::RolloutItem;
 use codex_login::AuthManager;
@@ -58,7 +64,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::security_risk::SecurityRiskScore;
-use codex_protocol_test_support::uuid_v7_item_id_generator_for_test;
+use codex_thread_context_ids_test_support::thread_context_ids;
 use core_test_support::ThreadIdle;
 use core_test_support::apps_test_server::HostedMessagingServer;
 use core_test_support::responses;
@@ -67,6 +73,7 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::TestEnv;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -362,7 +369,9 @@ async fn installed_extension_keeps_parent_program_out_of_websocket_and_http_revi
         }
         registry.tool_lifecycle_contributors()[0]
             .on_tool_start(ToolStartInput {
+                sampling_model: "gpt-5.5",
                 serving_assessment: None,
+                guardian_probe: None,
                 permissions: Box::pin(async { Some(Default::default()) }),
                 session_store: &session_store,
                 thread_store,
@@ -499,7 +508,7 @@ fn user_instruction(text: &str) -> ResponseItem {
     ResponseItem::Message {
         status: None,
         encrypted_content: None,
-        id: Some(uuid_v7_item_id_generator_for_test()("msg")),
+        id: Some(thread_context_ids().next_item("msg")),
         role: "user".to_owned(),
         content: vec![ContentItem::InputText {
             text: text.to_owned(),
@@ -645,7 +654,9 @@ async fn sandboxed_shell_classification_respects_review_scope() -> Result<()> {
     ] {
         fixture.registry.tool_lifecycle_contributors()[0]
             .on_tool_start(ToolStartInput {
+                sampling_model: "gpt-5.5",
                 serving_assessment: None,
+                guardian_probe: None,
                 permissions: Box::pin(async { panic!("unexpected permission resolution") }),
                 session_store: &fixture.session_store,
                 thread_store,
@@ -738,7 +749,9 @@ async fn computer_use_only_scores_cannot_approve_other_actions() -> Result<()> {
         .map(|cache| Arc::clone(&cache.progress))
         .expect("Guardian v2 should track score progress per thread");
     // The seeded low score belongs to the model selected above.
-    let authorization = ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await;
+    let authorization = ScoreAuthorization::current(&fixture.test.codex, &Default::default())
+        .await
+        .expect("read Guardian authorization");
     seed_cached_score(&progress, thread_store, /*index*/ 1, authorization);
     let cached = progress.inspect(/*call_id*/ None);
     let turn_store = ExtensionData::new("turn-1");
@@ -749,7 +762,9 @@ async fn computer_use_only_scores_cannot_approve_other_actions() -> Result<()> {
     };
     fixture.registry.tool_lifecycle_contributors()[0]
         .on_tool_start(ToolStartInput {
+            sampling_model: "gpt-5.5",
             serving_assessment: None,
+            guardian_probe: None,
             permissions: Box::pin(async { Some(Default::default()) }),
             session_store: &fixture.session_store,
             thread_store,
@@ -958,7 +973,9 @@ async fn computer_use_only_scores_cannot_approve_other_actions() -> Result<()> {
         &current.progress,
         thread_store,
         index,
-        ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await,
+        ScoreAuthorization::current(&fixture.test.codex, &Default::default())
+            .await
+            .expect("read Guardian authorization"),
     );
     assert_eq!(
         cached_approval(
@@ -974,7 +991,9 @@ async fn computer_use_only_scores_cannot_approve_other_actions() -> Result<()> {
     for _ in 0..ignored_calls {
         fixture.registry.tool_lifecycle_contributors()[0]
             .on_tool_start(ToolStartInput {
+                sampling_model: "gpt-5.5",
                 serving_assessment: None,
+                guardian_probe: None,
                 permissions: Box::pin(async { Some(Default::default()) }),
                 session_store: &fixture.session_store,
                 thread_store,
@@ -1109,7 +1128,7 @@ async fn sample_configured_conversation_history_with_delivery(
                 .auto_review
                 .as_mut()
                 .expect("reviewer model should have Guardian policy")
-                .policy = Some(TEST_CATALOG_GUARDIAN_POLICY.to_owned());
+                .policy = Some(TEST_CATALOG_GUARDIAN_POLICY.into());
         })
         .with_model("gpt-5.5")
         .with_config(move |config| {
@@ -1257,7 +1276,9 @@ async fn sample_configured_conversation_history_with_delivery(
 
     registry.tool_lifecycle_contributors()[0]
         .on_tool_start(ToolStartInput {
+            sampling_model: "gpt-5.5",
             serving_assessment: None,
+            guardian_probe: None,
             permissions: Box::pin(async { Some(Default::default()) }),
             session_store: &session_store,
             thread_store,
@@ -1337,7 +1358,9 @@ async fn unscored_tools_invalidate_cached_scores() -> Result<()> {
         assert_eq!(progress.inspect(/*call_id*/ None), expected);
     }
     // A classifier started before these actions may still publish, but cannot approve later CUA.
-    let authorization = ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await;
+    let authorization = ScoreAuthorization::current(&fixture.test.codex, &Default::default())
+        .await
+        .expect("read Guardian authorization");
     seed_cached_score(&progress, thread_store, /*index*/ 0, authorization);
     assert!(progress.inspect(/*call_id*/ None).has_unscored_failure);
     assert_eq!(
@@ -1408,7 +1431,9 @@ impl GuardianFailureFixture {
         };
         self.registry.tool_lifecycle_contributors()[0]
             .on_tool_start(ToolStartInput {
+                sampling_model: "gpt-5.5",
                 serving_assessment: None,
+                guardian_probe: None,
                 permissions: Box::pin(async { Some(Default::default()) }),
                 session_store: &self.session_store,
                 thread_store,
@@ -1568,7 +1593,7 @@ async fn contributor_fails_closed_when_luna_classification_fails() -> Result<()>
 #[tokio::test(flavor = "multi_thread")]
 async fn late_turn_actions_invalidate_the_current_policy_score() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    let fixture = GuardianFailureFixture::new().await?;
+    let fixture = GuardianFailureFixture::with_config("").await?;
     let server = responses::start_mock_server().await;
     let responses = ["low", "high", "invalid"].map(|risk| {
         responses::sse(vec![
@@ -1612,21 +1637,30 @@ async fn late_turn_actions_invalidate_the_current_policy_score() -> Result<()> {
         executions + 1
     );
     let mut expected: Option<crate::async_scorer::score::CachedScore> = None;
-    for (turn, call_id, risk, expected_approval) in [
-        (&new_turn, "new-score", 0.0, Some(ReviewDecision::Approved)),
+    for (turn, call_id, guardian_probe, risk, expected_approval) in [
+        (
+            &new_turn,
+            "new-score",
+            Some(true),
+            0.0,
+            Some(ReviewDecision::Approved),
+        ),
         (
             &old_turn,
             "late-old-score",
+            Some(false),
             1.0,
             Some(ReviewDecision::Approved),
         ),
-        (&old_turn, "late-old-failure", 1.0, None),
+        (&old_turn, "late-old-failure", None, 1.0, None),
     ] {
         let backend = ConversationBackend::for_turn(store, turn).unwrap();
         let mut updates = backend.progress.updates.subscribe();
         fixture.registry.tool_lifecycle_contributors()[0]
             .on_tool_start(ToolStartInput {
+                sampling_model: "gpt-5.5",
                 serving_assessment: None,
+                guardian_probe,
                 permissions: Box::pin(async { Some(Default::default()) }),
                 session_store: &fixture.session_store,
                 thread_store: store,
@@ -1750,6 +1784,49 @@ classifier_instructions = "Predict future violations.\n# Security Policy\n{{ ten
         .await,
         Some(ReviewDecision::Approved)
     );
+    // Tightening while a review is pending must prevent a late low-risk score from releasing it.
+    const TIGHTENED_REVISION: u64 = 1;
+    const RELAXED_REVISION: u64 = TIGHTENED_REVISION + 1;
+    let fs = TestEnv::local().await?.environment().get_filesystem();
+    let overrides = LoaderOverrides::without_managed_config_for_tests();
+    let load = |loader, revision| {
+        load_guardian_policy_snapshot(
+            fs.as_ref(),
+            test.codex_home_path(),
+            &overrides,
+            loader,
+            revision,
+        )
+    };
+    let tightened = CloudConfigBundleFixture::loader_with_enterprise_requirement(
+        "allowed_approvals_reviewers = ['auto_review']",
+    );
+    store.insert(vec![
+        load(&tightened, TIGHTENED_REVISION).await?,
+        load(&CloudConfigBundleLoader::default(), RELAXED_REVISION).await?,
+    ]);
+    store.insert_arc(Arc::clone(&test.codex));
+    let mut score = cached_score(&turn_store).unwrap();
+    score.scores.insert("action_risk".to_owned(), 1.0);
+    set_cached_score(&turn_store, score);
+    let scored_action = r#"{"id":"call-1","tool":"read_file"}"#;
+    assert_eq!(
+        cached_approval(
+            &registry,
+            store,
+            &turn_store,
+            scored_action,
+            /*metrics*/ None,
+        )
+        .await,
+        None
+    );
+    assert_eq!(
+        test.codex.config().await.guardian_policy_revision,
+        RELAXED_REVISION
+    );
+    store.remove::<Vec<GuardianPolicySnapshot>>();
+    store.remove::<codex_core::CodexThread>();
     Ok(())
 }
 
@@ -2049,7 +2126,9 @@ max_recent_non_user_entries = 8
         &score_progress,
         thread_store,
         first_unscored,
-        ScoreAuthorization::current(&test.codex, &Default::default()).await,
+        ScoreAuthorization::current(&test.codex, &Default::default())
+            .await
+            .expect("read Guardian authorization"),
     );
     assert_eq!(
         cached_approval(
@@ -2270,12 +2349,12 @@ async fn contributor_uses_model_defaults_and_preserves_local_overrides() -> Resu
     let model_defaults = GuardianV2ModelConfig {
         async_classifier_mode: Some(codex_protocol::openai_models::AsyncClassifierMode::Snapshot),
         async_classifier_conversation_token_limit: None,
-        classifier_instructions: Some("Use the experimental model-owned prompt.".to_owned()),
+        classifier_instructions: Some("Use the experimental model-owned prompt.".into()),
         review_threshold_basis_points: Some(6_000),
         max_tool_call_lag: Some(2),
         reasoning_effort: Some(ReasoningEffort::Minimal),
         transcript: Some(GuardianV2TranscriptModelConfig {
-            sources: Some(vec!["reasoning".to_owned()]),
+            sources: Some(vec!["reasoning".into()]),
             include_images: Some(true),
             max_message_entry_tokens: Some(128),
             max_message_transcript_tokens: Some(256),
@@ -2420,7 +2499,7 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
         ResponseItem::Message {
             status: None,
             encrypted_content: None,
-            id: Some(uuid_v7_item_id_generator_for_test()("assistant")),
+            id: Some(thread_context_ids().next_item("assistant")),
             role: "assistant".to_owned(),
             content: vec![ContentItem::OutputText {
                 annotations: None,
@@ -2666,7 +2745,9 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
             &progress,
             thread_store,
             /*index*/ 1,
-            ScoreAuthorization::current(&test.codex, &permissions).await,
+            ScoreAuthorization::current(&test.codex, &permissions)
+                .await
+                .expect("read Guardian authorization"),
         );
         assert_eq!(
             cached_approval(
@@ -2839,8 +2920,14 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
     model_info.slug = "protected-model".to_owned();
     thread_store.insert_arc(model_info.model);
     // A late prewarm preview must leave the active model's review requirements intact.
-    let _ = codex_core::guardian_review::prepare_review_prewarm(&test.codex).await?;
-    let authorization = ScoreAuthorization::current(&test.codex, &Default::default()).await;
+    let _ = codex_core::guardian_review::prepare_review_prewarm(
+        &test.codex,
+        codex_core::guardian_review::ReviewRetrieval::ConversationHistory,
+    )
+    .await?;
+    let authorization = ScoreAuthorization::current(&test.codex, &Default::default())
+        .await
+        .expect("read Guardian authorization");
     let progress = ConversationBackend::for_turn(thread_store, thread_store)
         .map(|cache| Arc::clone(&cache.progress))
         .expect("Guardian v2 should track score progress per thread");
@@ -2881,7 +2968,9 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
     let previous_score = cached_score(thread_store);
     registry.tool_lifecycle_contributors()[0]
         .on_tool_start(ToolStartInput {
+            sampling_model: "gpt-5.5",
             serving_assessment: None,
+            guardian_probe: None,
             permissions: Box::pin(async { panic!("unexpected permission resolution") }),
             session_store: &session_store,
             thread_store,
@@ -2923,7 +3012,9 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
     };
     fixture.score_tool(ToolName::plain("read_file")).await;
     let store = fixture.test.codex.thread_extension_data();
-    let authorization = ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await;
+    let authorization = ScoreAuthorization::current(&fixture.test.codex, &Default::default())
+        .await
+        .expect("read Guardian authorization");
     seed_cached_score(&progress, store, /*index*/ 0, authorization);
     assert!(progress.inspect(/*call_id*/ None).has_unscored_failure);
 
@@ -3033,7 +3124,9 @@ async fn stale_review_context_blocks_cached_approval_without_changing_authorizat
     let mut score = cached_score(store).unwrap();
     score.scores.insert("action_risk".to_owned(), 0.25);
     set_cached_score(store, score);
-    let current = ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await;
+    let current = ScoreAuthorization::current(&fixture.test.codex, &Default::default())
+        .await
+        .expect("read Guardian authorization");
     let mut stale_local = current.clone();
     stale_local.review_context_revision += 1;
     let mut stale_root = current.clone();
@@ -3131,8 +3224,9 @@ async fn incompatible_compaction_blocks_cached_score_and_initial_cua_allowance()
         fixture.test.codex.guardian_authorization_version().await,
         authorization
     );
-    let score_authorization =
-        ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await;
+    let score_authorization = ScoreAuthorization::current(&fixture.test.codex, &Default::default())
+        .await
+        .expect("read Guardian authorization");
     let progress = ConversationBackend::for_turn(thread_store, thread_store)
         .map(|cache| Arc::clone(&cache.progress))
         .expect("score progress");
@@ -3237,7 +3331,9 @@ async fn contributor_counts_failed_thread_lookups_toward_score_lag() -> Result<(
     };
     registry.tool_lifecycle_contributors()[0]
         .on_tool_start(ToolStartInput {
+            sampling_model: "gpt-5.5",
             serving_assessment: None,
+            guardian_probe: None,
             permissions: Box::pin(async { Some(Default::default()) }),
             session_store: &session_store,
             thread_store,
@@ -3773,7 +3869,9 @@ async fn assert_parent_compaction_reuse(parent_context_for_review: bool) -> Resu
 
     registry.tool_lifecycle_contributors()[0]
         .on_tool_start(ToolStartInput {
+            sampling_model: "gpt-5.5",
             serving_assessment: None,
+            guardian_probe: None,
             permissions: Box::pin(async { Some(Default::default()) }),
             session_store: &session_store,
             thread_store,
@@ -3869,7 +3967,9 @@ async fn assert_parent_compaction_reuse(parent_context_for_review: bool) -> Resu
         let call_id = format!("call-{}", index + 2);
         registry.tool_lifecycle_contributors()[0]
             .on_tool_start(ToolStartInput {
+                sampling_model: "gpt-5.5",
                 serving_assessment: None,
+                guardian_probe: None,
                 permissions: Box::pin(async { Some(Default::default()) }),
                 session_store: &session_store,
                 thread_store,
@@ -3942,14 +4042,54 @@ async fn assert_parent_compaction_reuse(parent_context_for_review: bool) -> Resu
     Ok(())
 }
 
-struct CacheMiss;
-impl codex_extension_api::SynchronousApprovalReviewer for CacheMiss {
+struct CacheMiss<'a> {
+    thread_store: &'a ExtensionData,
+    turn_store: &'a ExtensionData,
+}
+impl codex_extension_api::SynchronousApprovalReviewer for CacheMiss<'_> {
     fn review<'a>(
         &'a self,
         _reason: codex_protocol::approvals::GuardianReviewReason,
-        _async_approval: Option<codex_extension_api::ExtensionFuture<'a, ()>>,
+        async_approval: Option<codex_extension_api::ExtensionFuture<'a, CachedApprovalContext>>,
     ) -> codex_extension_api::ExtensionFuture<'a, Option<ReviewDecision>> {
-        Box::pin(async { Some(ReviewDecision::denied("cache miss")) })
+        Box::pin(async move {
+            if let Some(snapshots) = self.thread_store.get::<Vec<GuardianPolicySnapshot>>() {
+                let mut pending = async_approval.expect("adaptive review should be pending");
+                assert!(
+                    std::future::poll_fn(|context| Poll::Ready(pending.as_mut().poll(context)))
+                        .await
+                        .is_pending()
+                );
+                let thread = self.thread_store.get::<codex_core::CodexThread>().unwrap();
+                let cache =
+                    ConversationBackend::for_turn(self.thread_store, self.turn_store).unwrap();
+                let progress = &cache.progress;
+                let history = thread.conversation_history_snapshot().await;
+                for (snapshot, expected) in snapshots.iter().zip([
+                    Poll::Pending,
+                    Poll::Ready(CachedApprovalContext {
+                        user_message_revision: history.user_message_revision(),
+                        review_context_revision: history.guardian_review_context_revision(),
+                        root_versions: None,
+                    }),
+                ]) {
+                    assert_eq!(
+                        thread.refresh_guardian_policy(snapshot).await,
+                        codex_core::ConfigRefreshOutcome::Published
+                    );
+                    let mut score = cached_score(self.turn_store).unwrap();
+                    score.scores.insert("action_risk".to_owned(), 0.0);
+                    set_cached_score(self.turn_store, score);
+                    progress.updates.send_replace(());
+                    assert_eq!(
+                        std::future::poll_fn(|context| Poll::Ready(pending.as_mut().poll(context)))
+                            .await,
+                        expected
+                    );
+                }
+            }
+            Some(ReviewDecision::denied("cache miss"))
+        })
     }
 }
 
@@ -3981,7 +4121,9 @@ async fn cached_approval_respects_action_order_and_wrapper_lag() -> Result<()> {
             },
         };
         progress.observe(&ToolStartInput {
+            sampling_model: "gpt-5.5",
             serving_assessment: None,
+            guardian_probe: None,
             permissions: Box::pin(async { Some(Default::default()) }),
             session_store: &fixture.session_store,
             thread_store: store,
@@ -4018,6 +4160,10 @@ async fn cached_approval_respects_action_order_and_wrapper_lag() -> Result<()> {
         index: wrapper - 1,
         max_lag: 2,
     };
+    // Changing classifier instructions does not invalidate an already-published LOW.
+    let mut config = store.get::<GuardianV2Config>().unwrap().as_ref().clone();
+    config.classifier_instructions = "Reject every read.".to_owned();
+    store.insert(config);
     for (call_id, expected) in [
         ("first", Some(ReviewDecision::Approved)),
         ("second", Some(ReviewDecision::Approved)),
@@ -4052,14 +4198,18 @@ async fn cached_approval_respects_action_order_and_wrapper_lag() -> Result<()> {
         &progress,
         store,
         wrapper,
-        ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await,
+        ScoreAuthorization::current(&fixture.test.codex, &Default::default())
+            .await
+            .expect("read Guardian authorization"),
     );
     assert_eq!(approve("third").await, None);
     seed_cached_score(
         &progress,
         store,
         wrapper + 3,
-        ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await,
+        ScoreAuthorization::current(&fixture.test.codex, &Default::default())
+            .await
+            .expect("read Guardian authorization"),
     );
     // A later LOW may already be cached before an earlier action reaches its
     // initial approval check. It must not approve that action or unknown provenance.
@@ -4084,7 +4234,9 @@ async fn cached_approval_respects_action_order_and_wrapper_lag() -> Result<()> {
         &progress,
         store,
         output,
-        ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await,
+        ScoreAuthorization::current(&fixture.test.codex, &Default::default())
+            .await
+            .expect("read Guardian authorization"),
     );
     assert_eq!(
         approve("other-second").await,
@@ -4150,7 +4302,10 @@ async fn cached_approval(
         require_fresh_review: false,
         full_access: false,
         metrics,
-        synchronous_reviewer: &CacheMiss,
+        synchronous_reviewer: &CacheMiss {
+            thread_store,
+            turn_store,
+        },
     };
     match registry.decide_approval(&input).await {
         Some(codex_extension_api::ApprovalDecision::Allow) => Some(ReviewDecision::Approved),
@@ -4190,7 +4345,9 @@ fn seed_cached_score(
 
 fn observe_unscored_call(progress: &GuardianV2ScoreProgress, store: &ExtensionData) -> usize {
     progress.observe(&ToolStartInput {
+        sampling_model: "gpt-5.5",
         serving_assessment: None,
+        guardian_probe: None,
         permissions: Box::pin(async { Some(Default::default()) }),
         session_store: store,
         thread_store: store,
@@ -4218,7 +4375,9 @@ async fn cached_score_publication_rejects_delayed_results_without_changing_cover
     let progress = ConversationBackend::for_turn(store, store)
         .map(|cache| Arc::clone(&cache.progress))
         .unwrap();
-    let authorization = ScoreAuthorization::current(&fixture.test.codex, &Default::default()).await;
+    let authorization = ScoreAuthorization::current(&fixture.test.codex, &Default::default())
+        .await
+        .expect("read Guardian authorization");
     seed_cached_score(&progress, store, /*index*/ 1, authorization.clone());
     let score = cached_score(store).unwrap();
     observe_unscored_call(&progress, store);

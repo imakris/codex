@@ -132,6 +132,7 @@ pub fn generate_ts_with_options(
     ensure_dir(out_dir)?;
     ensure_dir(&v2_out_dir)?;
 
+    crate::StartupGatewayOAuthChangedNotification::export_all_to(out_dir)?;
     ClientRequest::export_all_to(out_dir)?;
     export_client_responses(out_dir)?;
     ClientNotification::export_all_to(out_dir)?;
@@ -238,6 +239,9 @@ pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -
         out_dir,
         "v2::UserVerificationRpcError",
     )?);
+    schemas.push(write_json_schema::<
+        crate::StartupGatewayOAuthChangedNotification,
+    >(out_dir, "v2::StartupGatewayOAuthChangedNotification")?);
     schemas.push(write_json_schema::<crate::ModelProviderError>(
         out_dir,
         "v2::ModelProviderError",
@@ -2229,6 +2233,12 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("missing MCP login completion fixture"))?,
         )?;
         assert!(mcp_login_completion_ts.contains("loginId?: string | null"));
+        let mcp_status_update_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/McpServerStatusUpdatedNotification.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing MCP status update fixture"))?,
+        )?;
+        assert!(mcp_status_update_ts.contains("durationMs?: number | null"));
         let typescript_index = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("index.ts"))
@@ -2414,14 +2424,18 @@ mod tests {
                 // These are only allowed in *Params types, except additive stable fields
                 // that older servers omit and newer servers may return as null.
                 let legacy_optional_nullable_field = (path
-                    == Path::new("v2/GetAccountTokenUsageResponse.ts")
-                    && field_prefix.trim() == "threadUsage?")
+                    == Path::new("v2/FsGetMetadataResponse.ts")
+                    && field_prefix.trim() == "sizeBytes?")
+                    || (path == Path::new("v2/GetAccountTokenUsageResponse.ts")
+                        && field_prefix.trim() == "threadUsage?")
                     || (path == Path::new("v2/ThreadUsage.ts")
                         && field_prefix.trim() == "nativeUsageUsdMicros?")
                     || (path == Path::new("v2/ThreadItem.ts")
                         && matches!(field_prefix.trim(), "startedAtMs?" | "completedAtMs?"))
                     || (path == Path::new("v2/McpServerOauthLoginCompletedNotification.ts")
                         && field_prefix.trim() == "loginId?")
+                    || (path == Path::new("v2/McpServerStatusUpdatedNotification.ts")
+                        && field_prefix.trim() == "durationMs?")
                     || (path == Path::new("v2/McpServerStatus.ts")
                         && field_prefix.trim() == "environmentId?")
                     || (path == Path::new("v2/ProcessExitedNotification.ts")

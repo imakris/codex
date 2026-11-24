@@ -60,24 +60,12 @@ impl<const MAX_BYTES: usize> OutputBuffers<MAX_BYTES> {
 pub(crate) struct OutputHandles<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES> {
     pub(crate) output_buffer: Arc<Mutex<OutputBuffers<MAX_BYTES>>>,
     pub(crate) output_notify: Arc<Notify>,
-    pub(crate) output_closed: Arc<AtomicBool>,
-    pub(crate) output_closed_notify: Arc<Notify>,
+    /// Cancelled once the producer can no longer append or broadcast output.
+    pub(crate) output_closed: CancellationToken,
     pub(crate) cancellation_token: CancellationToken,
     pub(super) drain_policy: OutputDrainPolicy,
     /// The initial exec call returned or was cancelled, so background draining may begin.
     pub(crate) collection_finished: CancellationToken,
-}
-
-struct OutputTaskGuard {
-    output_closed: Arc<AtomicBool>,
-    output_closed_notify: Arc<Notify>,
-}
-
-impl Drop for OutputTaskGuard {
-    fn drop(&mut self) {
-        self.output_closed.store(true, Ordering::Release);
-        self.output_closed_notify.notify_waiters();
-    }
 }
 
 /// Controls whether process exit can start the collectors' bounded output drain.
@@ -133,8 +121,7 @@ impl UnifiedExecProcess {
         let output = OutputHandles {
             output_buffer: Arc::new(Mutex::new(OutputBuffers::default())),
             output_notify: Arc::new(Notify::new()),
-            output_closed: Arc::new(AtomicBool::new(false)),
-            output_closed_notify: Arc::new(Notify::new()),
+            output_closed: CancellationToken::new(),
             cancellation_token: CancellationToken::new(),
             drain_policy,
             collection_finished: CancellationToken::new(),
@@ -171,8 +158,7 @@ impl UnifiedExecProcess {
                     Ok(response) => match response.status {
                         WriteStatus::Accepted => Ok(()),
                         WriteStatus::UnknownProcess | WriteStatus::StdinClosed => {
-                            let state = self.state_rx.borrow().clone();
-                            let _ = self.state_tx.send_replace(state.exited(state.exit_code));
+                            self.state_tx.send_modify(|state| state.has_exited = true);
                             self.output.cancellation_token.cancel();
                             Err(UnifiedExecError::WriteToStdin)
                         }
@@ -205,10 +191,10 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn has_exited(&self) -> bool {
-        let state = self.state_rx.borrow().clone();
+        let has_exited = self.state_rx.borrow().has_exited;
         match &self.process_handle {
-            ProcessHandle::Local(process_handle) => state.has_exited || process_handle.has_exited(),
-            ProcessHandle::ExecServer(_) => state.has_exited,
+            ProcessHandle::Local(process_handle) => has_exited || process_handle.has_exited(),
+            ProcessHandle::ExecServer(_) => has_exited,
         }
     }
 
@@ -216,12 +202,12 @@ impl UnifiedExecProcess {
         if self.timed_out() {
             return Some(124);
         }
-        let state = self.state_rx.borrow().clone();
+        let exit_code = self.state_rx.borrow().exit_code;
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => {
-                state.exit_code.or_else(|| process_handle.exit_code())
+                exit_code.or_else(|| process_handle.exit_code())
             }
-            ProcessHandle::ExecServer(_) => state.exit_code,
+            ProcessHandle::ExecServer(_) => exit_code,
         }
     }
 
@@ -264,7 +250,9 @@ impl UnifiedExecProcess {
                     .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
             }
         }
-        self.signal_exit(self.exit_code());
+        // Termination confirms exit without reporting a new exit code. Keep any
+        // status the output collector published while the request was in flight.
+        self.state_tx.send_modify(|state| state.has_exited = true);
         self.finish_termination();
         Ok(())
     }
@@ -282,10 +270,13 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn fail_and_terminate(&self, message: String) {
-        let state = self.state_rx.borrow().clone();
-        if state.failure_message.is_none() {
-            let _ = self.state_tx.send_replace(state.failed(message));
-        }
+        self.state_tx.send_if_modified(|state| {
+            if state.failure_message.is_some() {
+                return false;
+            }
+            state.failed(message);
+            true
+        });
         self.terminate();
     }
 
@@ -303,11 +294,11 @@ impl UnifiedExecProcess {
     }
 
     pub(super) async fn check_for_sandbox_denial(&self) -> Result<(), UnifiedExecError> {
-        let _ = tokio::time::timeout(
-            Duration::from_millis(20),
-            self.output.output_notify.notified(),
-        )
-        .await;
+        tokio::select! {
+            _ = self.output.output_closed.cancelled() => {}
+            _ = self.output.output_notify.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
 
         let aggregated = self.snapshot_output().await;
         let aggregated_text = String::from_utf8_lossy(&aggregated);
@@ -400,8 +391,7 @@ impl UnifiedExecProcess {
             let cancellation_token = managed.output.cancellation_token.clone();
             async move {
                 let exit_code = exit_rx.await.ok();
-                let state = state_tx.borrow().clone();
-                let _ = state_tx.send_replace(state.exited(exit_code));
+                state_tx.send_modify(|state| state.exited(exit_code));
                 cancellation_token.cancel();
             }
         });
@@ -431,8 +421,11 @@ impl UnifiedExecProcess {
         let mut state_rx = managed.state_rx.clone();
         if tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, async {
             loop {
-                let state = state_rx.borrow().clone();
-                if state.has_exited || state.failure_message.is_some() {
+                let has_exited = {
+                    let state = state_rx.borrow();
+                    state.has_exited || state.failure_message.is_some()
+                };
+                if has_exited {
                     break;
                 }
                 if state_rx.changed().await.is_err() {
@@ -461,7 +454,6 @@ impl UnifiedExecProcess {
             output_buffer,
             output_notify,
             output_closed,
-            output_closed_notify,
             cancellation_token,
             collection_finished,
             ..
@@ -469,11 +461,8 @@ impl UnifiedExecProcess {
         let process = started.process;
         let mut events = process.subscribe_events();
         let mut state_rx = state_tx.subscribe();
+        let close_output = output_closed.drop_guard();
         tokio::spawn(async move {
-            let _output_task_guard = OutputTaskGuard {
-                output_closed: Arc::clone(&output_closed),
-                output_closed_notify: Arc::clone(&output_closed_notify),
-            };
             let drain = async {
                 collection_finished.cancelled().await;
                 let _ = state_rx.wait_for(|state| state.has_exited).await;
@@ -499,13 +488,9 @@ impl UnifiedExecProcess {
                     Some(Ok(event)) => Some(event),
                     Some(Err(broadcast::error::RecvError::Lagged(_))) | None => None,
                     Some(Err(broadcast::error::RecvError::Closed)) => {
-                        let state = state_tx.borrow().clone();
-                        let _ = state_tx.send_replace(
-                            state.failed("exec-server process event stream closed".to_string()),
-                        );
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        cancellation_token.cancel();
+                        state_tx.send_modify(|state| {
+                            state.failed("exec-server process event stream closed".to_string());
+                        });
                         break;
                     }
                 };
@@ -539,11 +524,7 @@ impl UnifiedExecProcess {
                     {
                         Ok(response) => response,
                         Err(err) => {
-                            let state = state_tx.borrow().clone();
-                            let _ = state_tx.send_replace(state.failed(err.to_string()));
-                            output_closed.store(true, Ordering::Release);
-                            output_closed_notify.notify_waiters();
-                            cancellation_token.cancel();
+                            state_tx.send_modify(|state| state.failed(err.to_string()));
                             break;
                         }
                     };
@@ -566,30 +547,22 @@ impl UnifiedExecProcess {
                     }
                     last_seq = last_seq.max(next_seq.saturating_sub(1));
                     if let Some(message) = failure {
-                        let state = state_tx.borrow().clone();
-                        let _ = state_tx.send_replace(state.failed(message));
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        cancellation_token.cancel();
+                        state_tx.send_modify(|state| state.failed(message));
                         break;
                     }
                     if sandbox_denied || exited {
-                        let mut state = state_tx.borrow().clone();
-                        state.sandbox_denied |= sandbox_denied;
-                        let _ = state_tx.send_replace(if exited {
-                            state.exited(exit_code)
-                        } else {
-                            state
+                        state_tx.send_modify(|state| {
+                            state.sandbox_denied |= sandbox_denied;
+                            if exited {
+                                state.exited(exit_code);
+                            }
                         });
+                    }
+                    if closed || final_drain {
+                        break;
                     }
                     if exited && output_drain_policy == OutputDrainPolicy::BoundedAfterExit {
                         cancellation_token.cancel();
-                    }
-                    if closed || final_drain {
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        cancellation_token.cancel();
-                        break;
                     }
                     continue;
                 }
@@ -619,9 +592,10 @@ impl UnifiedExecProcess {
                             continue;
                         }
                         last_seq = seq;
-                        let mut state = state_tx.borrow().clone();
-                        state.sandbox_denied |= sandbox_denied.unwrap_or(false);
-                        let _ = state_tx.send_replace(state.exited(Some(exit_code)));
+                        state_tx.send_modify(|state| {
+                            state.sandbox_denied |= sandbox_denied.unwrap_or(false);
+                            state.exited(Some(exit_code));
+                        });
                         if output_drain_policy == OutputDrainPolicy::BoundedAfterExit {
                             cancellation_token.cancel();
                         }
@@ -630,27 +604,21 @@ impl UnifiedExecProcess {
                         if seq <= last_seq {
                             continue;
                         }
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        cancellation_token.cancel();
                         break;
                     }
                     ExecProcessEvent::Failed(message) => {
-                        let state = state_tx.borrow().clone();
-                        let _ = state_tx.send_replace(state.failed(message));
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        cancellation_token.cancel();
+                        state_tx.send_modify(|state| state.failed(message));
                         break;
                     }
                 }
             }
+            drop(close_output);
+            cancellation_token.cancel();
             if final_drain {
                 tokio::spawn(async move {
                     let _ = process.terminate().await;
                 });
             }
-            cancellation_token.cancel();
         })
     }
 
@@ -664,14 +632,11 @@ impl UnifiedExecProcess {
             output_buffer,
             output_notify,
             output_closed,
-            output_closed_notify,
             ..
         } = output_handles;
+        let close_output = output_closed.drop_guard();
         tokio::spawn(async move {
-            let _output_task_guard = OutputTaskGuard {
-                output_closed: Arc::clone(&output_closed),
-                output_closed_notify: Arc::clone(&output_closed_notify),
-            };
+            let _close_output = close_output;
             let mut stdout_open = true;
             let mut stderr_open = true;
             while stdout_open || stderr_open {
@@ -693,8 +658,7 @@ impl UnifiedExecProcess {
     }
 
     fn signal_exit(&self, exit_code: Option<i32>) {
-        let state = self.state_rx.borrow().clone();
-        let _ = self.state_tx.send_replace(state.exited(exit_code));
+        self.state_tx.send_modify(|state| state.exited(exit_code));
         self.output.cancellation_token.cancel();
     }
 }

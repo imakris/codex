@@ -242,13 +242,16 @@ impl McpManager {
         if let McpEnvironmentScope::Selected(environments) = &identity.environments {
             context = context.with_selected_environments(environments);
         }
-        self.runtime_config_with_context(
-            context,
-            Some(identity.originator),
-            identity.environments,
-            identity.disabled_plugin_ids,
-        )
-        .await
+        let mut projection = self
+            .runtime_config_with_context(
+                context,
+                Some(identity.originator),
+                identity.environments,
+                identity.disabled_plugin_ids,
+            )
+            .await;
+        projection.config.executor_discovery_v2 = executor_capability_discovery_v2.map(Arc::from);
+        projection
     }
 
     /// Resolves only plugins from this step's ready roots, independent of shared MCP refresh.
@@ -424,6 +427,21 @@ impl McpManager {
                                 *config,
                             )
                             .with_protocol_mode(protocol_mode),
+                        )));
+                    }
+                    McpServerContribution::SetWithAuthProvider {
+                        name,
+                        config,
+                        auth_provider,
+                    } => {
+                        overlays.push(OrderedMcpOverlay::Set(Box::new(
+                            McpServerRegistration::from_extension(
+                                name,
+                                contributor.id(),
+                                contribution_order,
+                                *config,
+                            )
+                            .with_request_auth_provider(auth_provider),
                         )));
                     }
                     McpServerContribution::HostedApps {

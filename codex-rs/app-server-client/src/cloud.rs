@@ -11,6 +11,7 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSetNameParams;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStartParams;
@@ -20,8 +21,17 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+
+/// Rejection from the original network policy during Cloud recovery.
+pub const CLOUD_RECOVERY_NETWORK_BLOCKED: &str =
+    "The current network policy blocks cloud reconnection.";
+
+pub(super) const MAX_RECOVERY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Operations the cloud worker must handle without forwarding to another backend.
 /// Unsupported operations must return an explicit error; they must not claim success.
@@ -44,6 +54,13 @@ pub enum CloudOperation {
     SubmitUserMessage(Box<TurnStartParams>),
     /// Apply the result of a name write that already succeeded outside the command queue.
     ThreadNameSaved(ThreadSetNameParams),
+    ResumeDisconnectedThread {
+        thread_id: String,
+        require_history: bool,
+        timeout: Duration,
+        dispatched: oneshot::Sender<()>,
+        release: oneshot::Receiver<oneshot::Sender<io::Result<()>>>,
+    },
     Notify(ClientNotification),
     Resolve {
         request_id: RequestId,
@@ -72,6 +89,29 @@ pub struct CloudCommand {
     pub response: oneshot::Sender<io::Result<RequestResult>>,
 }
 
+/// Allows the worker to install a held stream after the caller reads its history.
+/// Dropping the token cancels that replacement.
+pub struct CloudRecoveryRelease {
+    release: oneshot::Sender<oneshot::Sender<io::Result<()>>>,
+    timeout: Duration,
+}
+
+impl CloudRecoveryRelease {
+    pub async fn install(self) -> io::Result<()> {
+        let (ack, mut installed) = oneshot::channel();
+        let closed = || io::Error::new(io::ErrorKind::BrokenPipe, "Cloud reconnection expired.");
+        self.release.send(ack).map_err(|_| closed())?;
+        let response = match tokio::time::timeout(self.timeout, &mut installed).await {
+            Ok(result) => return result.map_err(|_| closed())?,
+            Err(_) => {
+                installed.close();
+                installed.try_recv().ok()
+            }
+        };
+        response.unwrap_or_else(|| Err(io::ErrorKind::TimedOut.into()))
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) enum IdleReconnect {
     #[default]
@@ -84,6 +124,7 @@ pub(super) enum IdleReconnect {
 #[derive(Clone)]
 pub struct CloudRequestHandle {
     pub(super) reconnect: tokio::sync::watch::Sender<IdleReconnect>,
+    pub(super) attached: Arc<AtomicBool>,
     commands: mpsc::Sender<CloudCommand>,
     native: Option<Arc<codex_cloud_client::Client>>,
     title_client: Option<Arc<CloudTitleClient>>,
@@ -172,6 +213,7 @@ impl CloudClient {
                 handle: CloudRequestHandle {
                     commands,
                     reconnect: Default::default(),
+                    attached: Default::default(),
                     native: native.map(Arc::new),
                     title_client: title_client.map(Arc::new),
                 },
@@ -244,6 +286,11 @@ impl CloudClient {
 }
 
 impl CloudRequestHandle {
+    /// Whether the worker has an installed reply stream that can deliver inventory updates.
+    pub fn has_attachment(&self) -> bool {
+        self.attached.load(Ordering::Relaxed) && !self.commands.is_closed()
+    }
+
     /// Generate metadata with Cloud's own account, outside its conversation command queue.
     pub async fn generate_thread_title(
         &self,
@@ -296,6 +343,38 @@ impl CloudRequestHandle {
             }
             false
         })
+    }
+
+    pub async fn resume_disconnected_thread(
+        &self,
+        thread_id: String,
+        require_history: bool,
+        timeout: Duration,
+    ) -> Result<(Option<ThreadResumeResponse>, CloudRecoveryRelease), TypedRequestError> {
+        let (release, held) = oneshot::channel();
+        let (dispatched, dispatch) = oneshot::channel();
+        let request = self.send(CloudOperation::ResumeDisconnectedThread {
+            thread_id,
+            require_history,
+            timeout,
+            dispatched,
+            release: held,
+        });
+        // Bound time in the queue separately so it cannot eat into the
+        // worker's backoff and Attach budget. Prefer a ready response on expiry.
+        let watchdog = async {
+            if tokio::time::timeout(timeout, dispatch).await.is_ok() {
+                tokio::time::sleep(timeout.saturating_add(MAX_RECOVERY_BACKOFF)).await;
+            }
+        };
+        let response = tokio::select! {
+            biased;
+            result = request => result,
+            () = watchdog => Err(io::ErrorKind::TimedOut.into()),
+        };
+        let settings: Option<ThreadResumeResponse> =
+            crate::decode_typed_response("thread/resume", response)?;
+        Ok((settings, CloudRecoveryRelease { release, timeout }))
     }
 
     /// Whether a completed model read still belongs to the bound Cloud account.
@@ -401,6 +480,7 @@ impl CloudRequestHandle {
             Self {
                 commands,
                 reconnect: self.reconnect.clone(),
+                attached: self.attached.clone(),
                 native: None,
                 title_client: None,
             },

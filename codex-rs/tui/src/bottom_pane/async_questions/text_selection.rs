@@ -94,13 +94,14 @@ impl QuestionTextSelection {
         self.rows.clear();
     }
 
-    pub(super) fn block_row_count(&self, block: usize) -> usize {
-        self.block_rows[block].len()
-    }
-
-    pub(super) fn push_block(&mut self, area: Rect, block: usize) {
-        for index in 0..self.block_row_count(block).min(usize::from(area.height)) {
-            let row = self.block_rows[block][index].clone();
+    /// Map a block's rows, starting at `first_row`, onto the screen rows in `area`.
+    pub(super) fn push_block(&mut self, area: Rect, block: usize, first_row: usize) {
+        let count = self.block_rows[block]
+            .len()
+            .saturating_sub(first_row)
+            .min(usize::from(area.height));
+        for index in 0..count {
+            let row = self.block_rows[block][first_row + index].clone();
             let columns = row.prefix_columns.min(area.width);
             self.push_row(
                 Rect::new(

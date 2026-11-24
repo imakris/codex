@@ -7,7 +7,6 @@ mod spec;
 use self::selection::MessageBoardTool;
 use crate::AgentMessageBoard;
 use crate::AppendRequest;
-use crate::BoardReadView;
 use crate::ChannelQuery;
 use crate::CreateChannelRequest;
 use crate::PageRequest;
@@ -35,6 +34,7 @@ use codex_tools::ToolExecutor;
 use codex_tools::ToolExecutorFuture;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use codex_utils_cached_str::CodexCachedStr;
 use futures::future::BoxFuture;
 use serde::Serialize;
 use serde_json::Value;
@@ -59,46 +59,6 @@ pub fn message_board_tools(
     namespace_description: &str,
     tool_messages: Option<&MultiAgentToolMessages>,
 ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
-    bind_tools(
-        tools,
-        ToolTarget::Live(board),
-        caller,
-        caller_path,
-        namespace,
-        namespace_description,
-        tool_messages,
-    )
-}
-
-/// Creates the channel, thread, search and post read tools for one captured view.
-pub fn message_board_read_tools(
-    view: Arc<dyn BoardReadView>,
-    caller: ThreadId,
-    caller_path: AgentPath,
-    namespace: Option<&str>,
-    namespace_description: &str,
-    tool_messages: Option<&MultiAgentToolMessages>,
-) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
-    bind_tools(
-        &MessageBoardTool::READ_ONLY,
-        ToolTarget::Fixed(view),
-        caller,
-        caller_path,
-        namespace,
-        namespace_description,
-        tool_messages,
-    )
-}
-
-fn bind_tools(
-    tools: &[MessageBoardTool],
-    target: ToolTarget,
-    caller: ThreadId,
-    caller_path: AgentPath,
-    namespace: Option<&str>,
-    namespace_description: &str,
-    tool_messages: Option<&MultiAgentToolMessages>,
-) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
     tools
         .iter()
         .map(|&tool| {
@@ -114,7 +74,7 @@ fn bind_tools(
                 caller,
                 caller_path: caller_path.clone(),
                 tool,
-                target: target.clone(),
+                board: Arc::clone(&board),
                 namespace: namespace.map(str::to_owned),
                 namespace_description: namespace_description.to_owned(),
                 description: tool_message.and_then(|tool| tool.description.clone()),
@@ -123,20 +83,14 @@ fn bind_tools(
         .collect()
 }
 
-#[derive(Clone)]
-enum ToolTarget {
-    Live(Arc<dyn AgentMessageBoard>),
-    Fixed(Arc<dyn BoardReadView>),
-}
-
 struct BoardTool {
     caller: ThreadId,
     caller_path: AgentPath,
     tool: MessageBoardTool,
-    target: ToolTarget,
+    board: Arc<dyn AgentMessageBoard>,
     namespace: Option<String>,
     namespace_description: String,
-    description: Option<String>,
+    description: Option<CodexCachedStr>,
 }
 
 impl<'call> ToolExecutor<ToolCall<'call>> for BoardTool {
@@ -210,13 +164,14 @@ impl BoardTool {
                 SortDirection::OldestFirst
             }
         };
-        match (self.tool, &self.target) {
-            (MessageBoardTool::UpsertChannel, ToolTarget::Live(board)) => {
+        let board = &self.board;
+        match self.tool {
+            MessageBoardTool::UpsertChannel => {
                 let request = serde_json::from_str(raw).map_err(model_error)?;
                 self.check_mutation_budget(budget, /*target_path_bytes*/ 0)?;
                 encode(board.upsert_channel(caller, request).await)
             }
-            (MessageBoardTool::CreateChannel, ToolTarget::Live(board)) => {
+            MessageBoardTool::CreateChannel => {
                 let arguments::CreateChannel {
                     channel_name,
                     description,
@@ -247,7 +202,7 @@ impl BoardTool {
                         .await,
                 )
             }
-            (MessageBoardTool::GetChannels, target) => {
+            MessageBoardTool::GetChannels => {
                 let arguments::GetChannels {
                     query,
                     recent_first,
@@ -261,14 +216,11 @@ impl BoardTool {
                         direction: direction(recent_first),
                         page: page(limit, cursor.clone(), scale),
                     };
-                    match target {
-                        ToolTarget::Live(board) => board.list_channels(caller, request),
-                        ToolTarget::Fixed(view) => view.list_channels(caller, request),
-                    }
+                    board.list_channels(caller, request)
                 })
                 .await
             }
-            (MessageBoardTool::ListThreads, target) => {
+            MessageBoardTool::ListThreads => {
                 let arguments::ListThreads {
                     channel_name,
                     sort,
@@ -287,14 +239,11 @@ impl BoardTool {
                         max_chars_per_post: nonzero(max_chars_per_post / scale),
                         page: page(limit, cursor.clone(), scale),
                     };
-                    match target {
-                        ToolTarget::Live(board) => board.list_threads(caller, request),
-                        ToolTarget::Fixed(view) => view.list_threads(caller, request),
-                    }
+                    board.list_threads(caller, request)
                 })
                 .await
             }
-            (MessageBoardTool::SearchPosts, target) => {
+            MessageBoardTool::SearchPosts => {
                 let arguments::SearchPosts {
                     channel_name,
                     query,
@@ -319,14 +268,11 @@ impl BoardTool {
                         max_chars_per_post: nonzero(max_chars_per_post / scale),
                         page: page(limit, cursor.clone(), scale),
                     };
-                    match target {
-                        ToolTarget::Live(board) => board.search_posts(caller, request),
-                        ToolTarget::Fixed(view) => view.search_posts(caller, request),
-                    }
+                    board.search_posts(caller, request)
                 })
                 .await
             }
-            (MessageBoardTool::ReadThread, target) => {
+            MessageBoardTool::ReadThread => {
                 let arguments::ReadThread {
                     thread_id,
                     limit,
@@ -341,14 +287,11 @@ impl BoardTool {
                         max_chars_per_post: nonzero(max_chars_per_post / scale),
                         page: page(limit, cursor.clone(), scale),
                     };
-                    match target {
-                        ToolTarget::Live(board) => board.read_thread(caller, request),
-                        ToolTarget::Fixed(view) => view.read_thread(caller, request),
-                    }
+                    board.read_thread(caller, request)
                 })
                 .await
             }
-            (MessageBoardTool::ReadPost, target) => {
+            MessageBoardTool::ReadPost => {
                 let arguments::ReadPost {
                     message_id,
                     offset_chars,
@@ -361,17 +304,11 @@ impl BoardTool {
                         offset_chars: offset_chars.unwrap_or_default(),
                         limit_chars: nonzero(limit_chars / scale),
                     };
-                    match target {
-                        ToolTarget::Live(board) => board.read_post(caller, request),
-                        ToolTarget::Fixed(view) => view.read_post(caller, request),
-                    }
+                    board.read_post(caller, request)
                 })
                 .await
             }
-            (
-                MessageBoardTool::Subscribe | MessageBoardTool::Unsubscribe,
-                ToolTarget::Live(board),
-            ) => {
+            MessageBoardTool::Subscribe | MessageBoardTool::Unsubscribe => {
                 let arguments::Subscription {
                     channel_name,
                     thread_id,
@@ -407,7 +344,7 @@ impl BoardTool {
                         .await,
                 )
             }
-            (MessageBoardTool::Post | MessageBoardTool::Append, ToolTarget::Live(board)) => {
+            MessageBoardTool::Post | MessageBoardTool::Append => {
                 let arguments::Post {
                     text,
                     channel_name,
@@ -476,10 +413,6 @@ impl BoardTool {
                         .await
                 })
             }
-            (_, ToolTarget::Fixed(_)) => Err(FunctionCallError::Fatal(
-                "A board mutation was bound to a read-only view".to_string(),
-            )
-            .into()),
         }
     }
 

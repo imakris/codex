@@ -330,7 +330,7 @@ async fn disabled_update_plan_preserves_custom_catalog_instructions() -> Result<
         .model_messages
         .as_mut()
         .expect("model prompt templates");
-    messages.instructions_template = Some(INSTRUCTIONS.to_string());
+    messages.instructions_template = Some(INSTRUCTIONS.into());
     let test = test_codex()
         .with_model("gpt-5.5")
         .with_config(move |config| {
@@ -401,7 +401,7 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
     let specific = ModelInfo {
         display_name: "GPT 5.3 Codex".to_string(),
         model_messages: Some(ModelMessages {
-            instructions_template: Some("use specific prefix".to_string()),
+            instructions_template: Some("use specific prefix".into()),
             ..Default::default()
         }),
         ..specific
@@ -409,7 +409,7 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
     let generic = ModelInfo {
         display_name: "GPT 5.3".to_string(),
         model_messages: Some(ModelMessages {
-            instructions_template: Some("use generic prefix".to_string()),
+            instructions_template: Some("use generic prefix".into()),
             ..Default::default()
         }),
         ..generic
@@ -675,8 +675,8 @@ async fn remote_models_long_model_slug_is_sent_with_supported_reasoning(
     ];
     remote_model.default_reasoning_summary = ReasoningSummary::Detailed;
     remote_model.model_messages = Some(ModelMessages {
-        persistent_instructions: catalog_instructions.map(str::to_string),
-        instructions_template: Some(base_instructions.to_string()),
+        persistent_instructions: catalog_instructions.map(Into::into),
+        instructions_template: Some(base_instructions.into()),
         ..Default::default()
     });
     mount_models_once(
@@ -855,7 +855,6 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        web_search_provider: None,
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_image_detail_original: false,
         context_window: Some(272_000),
@@ -1121,7 +1120,7 @@ async fn remote_models_apply_legacy_instructions(auth: CodexAuth) -> Result<()> 
         available_access_programs: None,
         upgrade: None,
         model_messages: Some(ModelMessages {
-            instructions_template: Some(remote_instructions.to_string()),
+            instructions_template: Some(remote_instructions.into()),
             ..Default::default()
         }),
         include_skills_usage_instructions: false,
@@ -1134,7 +1133,6 @@ async fn remote_models_apply_legacy_instructions(auth: CodexAuth) -> Result<()> 
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        web_search_provider: None,
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_image_detail_original: false,
         context_window: Some(272_000),
@@ -1721,7 +1719,6 @@ fn test_remote_model_with_policy(
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        web_search_provider: None,
         truncation_policy,
         supports_image_detail_original: false,
         context_window: Some(272_000),
@@ -1792,7 +1789,7 @@ async fn model_catalog_url_supplies_conversation_model_and_instructions() -> Res
         .model_messages
         .as_mut()
         .expect("fallback instructions")
-        .instructions_template = Some(instructions.to_string());
+        .instructions_template = Some(instructions.into());
     let catalog = ModelsResponse {
         models: vec![model],
     };

@@ -73,9 +73,9 @@ fn model_token_budget_config() -> ModelTokenBudgetConfig {
         enabled: false,
         use_history_notes_extension: false,
         reminder_threshold_tokens: 6_144,
-        reminder_message_template: "Model reminder: {n_remaining} tokens remain.".to_string(),
-        guidance_message: "Use the model-owned context-window guidance.".to_string(),
-        auto_compact_fallback_prompt: AUTO_COMPACT_FALLBACK_PROMPT.to_string(),
+        reminder_message_template: "Model reminder: {n_remaining} tokens remain.".into(),
+        guidance_message: "Use the model-owned context-window guidance.".into(),
+        auto_compact_fallback_prompt: AUTO_COMPACT_FALLBACK_PROMPT.into(),
         auto_compact_fallback_buffer_tokens: 16_384,
     }
 }
@@ -579,7 +579,7 @@ async fn token_budget_defaults_follow_the_active_model(activation: Feature) -> R
         .with_model_info_override("gpt-5.2", |model_info| {
             model_info.supports_experimental_context = true;
             let mut defaults = model_token_budget_config();
-            defaults.guidance_message = "Use first-model context-window guidance.".to_string();
+            defaults.guidance_message = "Use first-model context-window guidance.".into();
             model_info
                 .model_messages
                 .as_mut()
@@ -588,7 +588,7 @@ async fn token_budget_defaults_follow_the_active_model(activation: Feature) -> R
         })
         .with_model_info_override("gpt-5.4", |model_info| {
             let mut defaults = model_token_budget_config();
-            defaults.guidance_message = "Use second-model context-window guidance.".to_string();
+            defaults.guidance_message = "Use second-model context-window guidance.".into();
             model_info
                 .model_messages
                 .as_mut()
@@ -666,11 +666,11 @@ async fn token_budget_ignores_invalid_model_message_defaults() -> Result<()> {
     let mut negative_fallback_buffer = model_token_budget_config();
     negative_fallback_buffer.auto_compact_fallback_buffer_tokens = -1;
     let mut oversized_reminder = model_token_budget_config();
-    oversized_reminder.reminder_message_template = "x".repeat(2_001);
+    oversized_reminder.reminder_message_template = "x".repeat(2_001).into();
     let mut oversized_guidance = model_token_budget_config();
-    oversized_guidance.guidance_message = "x".repeat(2_001);
+    oversized_guidance.guidance_message = "x".repeat(2_001).into();
     let mut oversized_fallback = model_token_budget_config();
-    oversized_fallback.auto_compact_fallback_prompt = "x".repeat(2_001);
+    oversized_fallback.auto_compact_fallback_prompt = "x".repeat(2_001).into();
 
     for model_defaults in [
         zero_reminder_threshold,
@@ -764,6 +764,10 @@ async fn token_budget_context_injects_plain_thread_hint_text(cached_subagent: bo
     let test = test_codex()
         .with_model_info_override("gpt-5.5", |model| model.use_responses_lite = true)
         .with_config(move |config| {
+            config
+                .features
+                .set_enabled(Feature::McpConnectionSharing, !cached_subagent)
+                .expect("use a cacheable legacy catalog for the subagent");
             config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
             config
                 .features
@@ -1502,6 +1506,7 @@ async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> R
 
     let server = start_mock_server().await;
     let trigger_call_id = "trigger-call";
+    let remaining_call_id = "remaining-in-fallback";
     let fallback_call_id = "fallback-call";
     let new_context_call_id = "new-context-call";
     let responses = mount_sse_sequence(
@@ -1514,6 +1519,7 @@ async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> R
             ]),
             sse(vec![
                 ev_response_created("fallback-tool-resp"),
+                ev_function_call(remaining_call_id, "get_context_remaining", "{}"),
                 ev_exec_command_call(fallback_call_id, "echo fallback-note > fallback-note.txt"),
                 ev_completed_with_tokens("fallback-tool-resp", /*total_tokens*/ 10_000),
             ]),
@@ -1566,8 +1572,10 @@ async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> R
             .any(|name| name == "get_context_remaining"),
         "fallback should preserve the normal tool surface"
     );
+    // Streaming tools can start before their own response.completed usage arrives.
+    // The fallback step always observes the preceding response's 9,500 tokens.
     assert_eq!(
-        fallback_request.function_call_output_text(trigger_call_id),
+        requests[2].function_call_output_text(remaining_call_id),
         Some("You have 0 tokens left in this context window.".to_string())
     );
     let initial_context = token_budget_contexts(&requests[0]);

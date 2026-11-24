@@ -172,7 +172,12 @@ pub(super) fn app_server_rate_limit_error_kind(
         | AppServerCodexErrorInfo::PolicyCapacityUnavailable => {
             Some(RateLimitErrorKind::ServerOverloaded)
         }
-        AppServerCodexErrorInfo::UsageLimitExceeded => Some(RateLimitErrorKind::UsageLimit),
+        AppServerCodexErrorInfo::UsageLimitExceeded
+        | AppServerCodexErrorInfo::ApiKeySpendLimitExceeded
+        | AppServerCodexErrorInfo::ProjectSpendLimitExceeded
+        | AppServerCodexErrorInfo::OrganizationSpendLimitExceeded => {
+            Some(RateLimitErrorKind::UsageLimit)
+        }
         AppServerCodexErrorInfo::ResponseTooManyFailedAttempts {
             http_status_code: Some(429),
         } => Some(RateLimitErrorKind::Generic),
@@ -450,13 +455,6 @@ impl ChatWidget {
             self.request_redraw();
         }
         self.refresh_status_line();
-    }
-
-    pub(super) fn stop_rate_limit_poller(&mut self) {}
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn prefetch_rate_limits(&mut self) {
-        self.stop_rate_limit_poller();
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
